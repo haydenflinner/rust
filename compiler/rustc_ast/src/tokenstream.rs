@@ -975,11 +975,32 @@ impl TokenCursor {
         TokenCursor { curr: TokenTreeCursor::new(stream), parent: None, stack: vec![] }
     }
 
-    /// Clone the cursor while keeping only its immediate parent (if present).
-    /// This can be used as a faster clone for situations where you only want to continue parsing
-    /// the currently delimited sequence or its children, but not return back to its parents.
-    pub fn clone_without_stack(&self) -> Self {
-        Self { curr: self.curr.clone(), parent: self.parent.clone(), stack: vec![] }
+    /// Clones the cursor for replaying the tokens of a captured AST node, keeping only the
+    /// enclosing token streams that such a replay can ever return to.
+    ///
+    /// A captured node has balanced delimiters, except that its start token (which the parser
+    /// has already taken out of the cursor) may be an open delimiter whose close delimiter the
+    /// replay produces. So the replay ends at the latest when leaving an enclosing stream emits
+    /// a close delimiter, which happens unless the delimiters are skipped (proc-macro invisible
+    /// delimiters). We therefore keep enclosing cursors outwards up to and including the first
+    /// non-skipped delimiter. In the common case that is just `parent`, and no `Vec` is
+    /// allocated.
+    pub fn clone_for_capture(&self) -> Self {
+        let is_skipped = |c: &TokenTreeCursor| match c.curr() {
+            Some(TokenTree::Delimited(_, _, delim, _)) => delim.skip(),
+            _ => panic!("enclosing cursor should point to a `Delimited`"),
+        };
+        let stack = match &self.parent {
+            Some(parent) if is_skipped(parent) => {
+                let keep = match self.stack.iter().rev().position(|c| !is_skipped(c)) {
+                    Some(i) => i + 1,
+                    None => self.stack.len(),
+                };
+                self.stack[self.stack.len() - keep..].to_vec()
+            }
+            _ => vec![],
+        };
+        Self { curr: self.curr.clone(), parent: self.parent.clone(), stack }
     }
 
     /// Gets the next token and advances the cursor by one.
