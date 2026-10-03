@@ -373,11 +373,41 @@ impl ArenaTokenStreamBuilder {
         self.tokens.len()
     }
 
+    /// Appends the remaining trees of `iter`. Since the flat layout of a sequence of trees is
+    /// contiguous, this is a bulk copy that only rebases the indices of delimited sequences,
+    /// instead of rebuilding every nested sequence tree by tree.
     fn fill_stream(&mut self, iter: ArenaTokenTreeIter<'_>) {
-        let stream = iter.stream().clone();
-        self.tokens.reserve(iter.length());
-        for tt in iter {
-            self.push_token_tree(tt, &stream);
+        let end = iter.end.min(iter.stream.range.end);
+        if iter.index >= end {
+            return;
+        }
+        let (src_start, dst_start) = (iter.index.0, self.tokens.len() as u32);
+        let outer = self.current_delimited_sequence;
+        self.tokens.extend_from_slice(&iter.stream.tokens[iter.index.as_usize()..end.as_usize()]);
+        // `DelimitedBounds::last_push_was_token` of the copied sequences stays valid, as it only
+        // depends on their (unchanged) contents. For `self`, it depends on the last top-level tree.
+        let mut next_top_level = dst_start;
+        for (i, tt) in self.tokens[dst_start as usize..].iter_mut().enumerate() {
+            let idx = dst_start + i as u32;
+            let is_top_level = idx == next_top_level;
+            match tt {
+                ArenaTokenTree::Token(..) => {
+                    if is_top_level {
+                        next_top_level += 1;
+                        self.last_push_was_token = true;
+                    }
+                }
+                ArenaTokenTree::DelimitedStart(bounds, _) => {
+                    bounds.start = AbsoluteTokenTreeIndex(idx);
+                    if is_top_level {
+                        next_top_level += bounds.length.get();
+                        self.last_push_was_token = false;
+                        bounds.parent = outer;
+                    } else if let Some(p) = &mut bounds.parent {
+                        p.0 = p.0 - src_start + dst_start;
+                    }
+                }
+            }
         }
     }
 }
@@ -912,10 +942,6 @@ impl<'a> ArenaTokenTreeIter<'a> {
             return false;
         }
         iter.next().is_none()
-    }
-
-    fn length(&self) -> usize {
-        self.end.as_usize().saturating_sub(self.index.as_usize())
     }
 }
 
