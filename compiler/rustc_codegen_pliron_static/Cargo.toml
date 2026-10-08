@@ -36,3 +36,4 @@ target-lexicon = "0.13"
 object = { version = "0.39", default-features = false, features = ["std", "read_core", "write", "elf"] }
 smallvec = "1"
 waffle = "0.3.2"
+egg = "0.10"
