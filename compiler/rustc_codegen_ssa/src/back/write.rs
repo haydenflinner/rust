@@ -1210,7 +1210,7 @@ fn start_executing_work<B: WriteBackendMethods>(
     allocator_config: Arc<ModuleConfig>,
     mut allocator_module: Option<ModuleCodegen<B::Module>>,
     coordinator_send: Sender<Message<B>>,
-) -> thread::JoinHandle<Result<MaybeLtoModules<B>, ()>> {
+) -> CoordinatorHandle<Result<MaybeLtoModules<B>, ()>> {
     let sess = tcx.sess;
     let prof = sess.prof.clone();
 
@@ -1227,7 +1227,7 @@ fn start_executing_work<B: WriteBackendMethods>(
     // tokens before releasing them, so we can never accidentally release the last token
     // permanently held by rustc process.
     let parallel = match sess.opts.jobs.backend {
-        Some(n) if backend.supports_parallel() => Some(n),
+        Some(n) if backend.supports_parallel() && !cfg!(target_family = "wasm") => Some(n),
         _ => None,
     };
     let jobserver_helper = parallel.map(|_| {
@@ -1642,7 +1642,9 @@ fn start_executing_work<B: WriteBackendMethods>(
                     {
                         helper.request_token();
                     }
-                    assert_eq!(main_thread_state, MainThreadState::Codegenning);
+                    if !cfg!(target_family = "wasm") {
+                        assert_eq!(main_thread_state, MainThreadState::Codegenning);
+                    }
                     main_thread_state = MainThreadState::Idle;
                 }
 
@@ -1650,7 +1652,9 @@ fn start_executing_work<B: WriteBackendMethods>(
                     if codegen_state != Aborted {
                         codegen_state = Completed;
                     }
-                    assert_eq!(main_thread_state, MainThreadState::Codegenning);
+                    if !cfg!(target_family = "wasm") {
+                        assert_eq!(main_thread_state, MainThreadState::Codegenning);
+                    }
                     main_thread_state = MainThreadState::Idle;
                 }
 
@@ -1706,7 +1710,9 @@ fn start_executing_work<B: WriteBackendMethods>(
 
                 Message::AddImportOnlyModule { bitcode_path, work_product } => {
                     assert_eq!(codegen_state, Ongoing);
-                    assert_eq!(main_thread_state, MainThreadState::Codegenning);
+                    if !cfg!(target_family = "wasm") {
+                        assert_eq!(main_thread_state, MainThreadState::Codegenning);
+                    }
                     lto_import_only_modules.push((bitcode_path, work_product));
                     main_thread_state = MainThreadState::Idle;
                 }
@@ -1777,6 +1783,9 @@ fn start_executing_work<B: WriteBackendMethods>(
             }),
         }))
     };
+    #[cfg(target_family = "wasm")]
+    return CoordinatorHandle(Box::new(f));
+    #[cfg(not(target_family = "wasm"))]
     return std::thread::Builder::new()
         .name("coordinator".to_owned())
         .spawn(f)
@@ -1885,11 +1894,7 @@ fn spawn_work<'a, B: WriteBackendMethods>(
         };
         drop(coordinator_send.send(msg));
     };
-    std::thread::Builder::new()
-        .name(name)
-        .stack_size(stack_size)
-        .spawn(f)
-        .expect("failed to spawn work thread");
+    spawn_worker_thread(name, stack_size, f);
 }
 
 fn spawn_thin_lto_work<B: WriteBackendMethods>(
@@ -1932,11 +1937,7 @@ fn spawn_thin_lto_work<B: WriteBackendMethods>(
         };
         drop(coordinator_send.send(msg));
     };
-    std::thread::Builder::new()
-        .name(name)
-        .stack_size(stack_size)
-        .spawn(f)
-        .expect("failed to spawn work thread");
+    spawn_worker_thread(name, stack_size, f);
 }
 
 enum SharedEmitterMessage {
@@ -2051,9 +2052,38 @@ impl SharedEmitterMain {
     }
 }
 
+/// wasm hosts have no threads: run workers inline, and defer the coordinator until it is
+/// joined. Its channels are unbounded, so the main thread can queue all its work first.
+#[cfg(target_family = "wasm")]
+fn spawn_worker_thread(_name: String, _stack_size: usize, f: impl FnOnce() + Send + 'static) {
+    f()
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn spawn_worker_thread(name: String, stack_size: usize, f: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .name(name)
+        .stack_size(stack_size)
+        .spawn(f)
+        .expect("failed to spawn work thread");
+}
+
+#[cfg(not(target_family = "wasm"))]
+type CoordinatorHandle<T> = thread::JoinHandle<T>;
+
+#[cfg(target_family = "wasm")]
+struct CoordinatorHandle<T>(Box<dyn FnOnce() -> T + Send>);
+
+#[cfg(target_family = "wasm")]
+impl<T> CoordinatorHandle<T> {
+    fn join(self) -> thread::Result<T> {
+        Ok((self.0)())
+    }
+}
+
 pub struct Coordinator<B: WriteBackendMethods> {
     sender: Sender<Message<B>>,
-    future: Option<thread::JoinHandle<Result<MaybeLtoModules<B>, ()>>>,
+    future: Option<CoordinatorHandle<Result<MaybeLtoModules<B>, ()>>>,
     // Only used for the Message type.
     phantom: PhantomData<B>,
 }
@@ -2093,9 +2123,14 @@ impl<B: WriteBackendMethods> OngoingCodegen<B> {
         incr_comp_session: Option<&IncrCompSession>,
         crate_info: &CrateInfo,
     ) -> (CompiledModules, WorkProductMap) {
+        // On wasm the coordinator only runs inside `join`, and it holds the emitter's senders.
+        #[cfg(target_family = "wasm")]
+        let joined = self.coordinator.join();
         self.shared_emitter_main.check(sess, true);
+        #[cfg(not(target_family = "wasm"))]
+        let joined = self.coordinator.join();
 
-        let maybe_lto_modules = sess.time("join_worker_thread", || match self.coordinator.join() {
+        let maybe_lto_modules = sess.time("join_worker_thread", || match joined {
             Ok(Ok(maybe_lto_modules)) => maybe_lto_modules,
             Ok(Err(())) => {
                 sess.dcx().abort_if_errors();
@@ -2184,6 +2219,9 @@ impl<B: WriteBackendMethods> OngoingCodegen<B> {
     }
 
     pub(crate) fn wait_for_signal_to_codegen_item(&self) {
+        if cfg!(target_family = "wasm") {
+            return;
+        }
         match self.codegen_worker_receive.recv() {
             Ok(CguMessage) => {
                 // Ok to proceed.
