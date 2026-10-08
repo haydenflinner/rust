@@ -1817,6 +1817,38 @@ impl CommandLineStep for CraneliftCodegenBackend {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PlironCodegenBackend {
+    pub compilers: RustcPrivateCompilers,
+}
+
+impl Step for PlironCodegenBackend {
+    type Output = BuildStamp;
+
+    fn run(self, builder: &Builder<'_>) -> Self::Output {
+        let target = self.compilers.target();
+        let build_compiler = self.compilers.build_compiler();
+        let kind = CodegenBackendKind::Custom("pliron".to_string());
+        let stamp = build_stamp::codegen_backend_stamp(builder, build_compiler, target, &kind);
+        if builder.config.keep_stage.contains(&build_compiler.stage) {
+            return stamp;
+        }
+        let mut cargo = builder::Cargo::new(
+            builder,
+            build_compiler,
+            Mode::Codegen,
+            SourceType::InTree,
+            target,
+            Kind::Build,
+        );
+        cargo.arg("--manifest-path").arg(builder.src.join("compiler/rustc_codegen_pliron/Cargo.toml"));
+        let _guard =
+            builder.msg(Kind::Build, "codegen backend pliron", Mode::Codegen, build_compiler, target);
+        let files = run_cargo(builder, cargo, vec![], &stamp, vec![], ArtifactKeepMode::OnlyDylib);
+        write_codegen_backend_stamp(stamp, files, builder.config.dry_run())
+    }
+}
+
 /// Write filtered `files` into the passed build stamp and returns it.
 fn write_codegen_backend_stamp(
     mut stamp: BuildStamp,
@@ -2490,6 +2522,16 @@ impl CommandLineStep for Assemble {
                         // And then copy all the dylibs to the corresponding
                         // library sysroots, so that they are available for cg_gcc.
                         dylib_set.install_to(builder, target_compiler);
+                    }
+                    CodegenBackendKind::Custom(name)
+                        if name == "pliron" && target_compiler.host.contains("wasm") =>
+                    {
+                        continue;
+                    }
+                    CodegenBackendKind::Custom(name) if name == "pliron" => {
+                        let stamp =
+                            builder.ensure(PlironCodegenBackend { compilers: prepare_compilers() });
+                        copy_codegen_backends_to_sysroot(builder, stamp, target_compiler);
                     }
                     CodegenBackendKind::Llvm | CodegenBackendKind::Custom(_) => continue,
                 }

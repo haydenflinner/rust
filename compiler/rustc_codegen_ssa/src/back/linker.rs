@@ -132,7 +132,10 @@ pub(crate) fn get_linker<'a>(
     if !msvc_changed_path && let Some(path) = env::var_os("PATH") {
         new_path.extend(env::split_paths(&path));
     }
-    cmd.env("PATH", env::join_paths(new_path).unwrap());
+    // WASI has no PATH separator (join_paths errors); wasm-hosted rustc links in-process anyway.
+    if let Ok(path) = env::join_paths(new_path) {
+        cmd.env("PATH", path);
+    }
 
     // FIXME: Move `/LIBPATH` addition for uwp targets from the linker construction
     // to the linker args construction.

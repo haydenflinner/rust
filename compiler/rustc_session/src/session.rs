@@ -447,6 +447,9 @@ pub struct CodegenBackendInit {
 
     /// See `Session::thin_lto_supported`.
     pub thin_lto_supported: bool = true,
+
+    /// See `Session::fat_lto_supported`.
+    pub fat_lto_supported: bool = true,
 }
 
 /// Represents the data associated with a compilation
@@ -542,6 +545,9 @@ pub struct Session {
 
     /// Does the codegen backend support ThinLTO?
     pub thin_lto_supported: bool,
+
+    /// Does the codegen backend support fat LTO? If not, LTO requests are ignored.
+    pub fat_lto_supported: bool,
 
     /// Global per-session counter for MIR optimization pass applications.
     ///
@@ -993,6 +999,10 @@ impl Session {
         // If the user specified something, return that. If they only said `-C
         // lto` and we've for whatever reason forced off ThinLTO via the CLI,
         // then ensure we can't use a ThinLTO.
+        if !self.fat_lto_supported && !self.thin_lto_supported {
+            return config::Lto::No;
+        }
+
         match self.opts.cg.lto {
             config::LtoCli::Unspecified => {
                 // The compiler was invoked without the `-Clto` flag. Fall
@@ -1489,6 +1499,7 @@ pub fn build_session(
         replaced_intrinsics,
         fallback_intrinsics,
         thin_lto_supported,
+        fat_lto_supported,
     } = codegen_backend_init;
 
     let sess = Session {
@@ -1521,6 +1532,7 @@ pub fn build_session(
         replaced_intrinsics: FxHashSet::from_iter(replaced_intrinsics),
         fallback_intrinsics: FxHashSet::from_iter(fallback_intrinsics),
         thin_lto_supported,
+        fat_lto_supported,
         mir_opt_bisect_eval_count: AtomicUsize::new(0),
         removed_rustc_main_attr: AtomicBool::new(false),
         pointer_auth_config,

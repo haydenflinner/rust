@@ -1,0 +1,27 @@
+# Example bootstrap.toml for the pliron (LLVM-free) build; copy to bootstrap.toml and fix the paths.
+change-id = "ignore"
+[build]
+docs = false
+extended = false
+optimized-compiler-builtins = false
+# stage2 std is built by the pliron-compiled stage2 rustc, not uplifted from stage1
+full-bootstrap = true
+[llvm]
+download-ci-llvm = false
+[rust]
+codegen-backends = ["pliron"]
+deny-warnings = false
+debug-assertions = false
+channel = "nightly"
+lld = false
+incremental = false
+[target.x86_64-unknown-linux-gnu]
+# cc for crt/libc paths; wild does the linking
+linker = "/home/ubuntu/work/rustc_codegen_pliron/selfhost/cc-wild"
+[target.wasm32-wasip1]
+linker = "/home/ubuntu/work/rustc_codegen_pliron/tools/pliron-wasm-ld/target/release/pliron-wasm-ld"
+wasi-root = "/home/ubuntu/work/scratch/wasi-root"
+cc = "/home/ubuntu/work/scratch/nocc/wasm-nocc"
+cxx = "/home/ubuntu/work/scratch/nocc/wasm-nocc"
+ar = "/home/ubuntu/work/scratch/nocc/wasm-nocc"
+ranlib = "/home/ubuntu/work/scratch/nocc/wasm-nocc"

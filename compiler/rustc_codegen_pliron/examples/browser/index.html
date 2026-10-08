@@ -1,0 +1,69 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rustc in the browser (pliron, no LLVM)</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 16px; max-width: 900px; }
+  textarea, pre { width: 100%; box-sizing: border-box; font: 13px ui-monospace, monospace; }
+  textarea { height: 300px; }
+  pre { background: #f4f4f4; padding: 8px; min-height: 80px; white-space: pre-wrap; }
+</style>
+<h3>rustc → wasm, running in your browser</h3>
+<p>rustc itself is compiled to wasm by the pliron backend; it compiles this crate to wasm with the same backend and links it with pliron-wasm-ld. A crate with <code>fn main</code> is built against std for <code>wasm32-wasip1</code> and run on WASI; a <code>#![no_std]</code> crate without <code>main</code> targets <code>wasm32-unknown-unknown</code>, its zero-argument <code>extern "C"</code> exports are called, and <code>print(ptr, len)</code> writes to the output.</p>
+<textarea id="src" spellcheck="false">use std::collections::HashMap;
+
+fn main() {
+    let text = "the quick brown fox jumps over the lazy dog and the cat";
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for w in text.split_whitespace() {
+        *counts.entry(w).or_default() += 1;
+    }
+    let mut v: Vec<_> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    println!("top words: {:?}", &v[..3]);
+
+    let primes: Vec<u32> = (2..60).filter(|n| (2..*n).all(|d| n % d != 0)).collect();
+    println!("primes: {primes:?}");
+    println!("sqrt(2) = {:.6}, e = {:.6}", 2f64.sqrt(), 1f64.exp());
+    let s: String = "wasm".chars().rev().collect();
+    println!("{s} <- reversed, {} bytes on the heap", s.capacity());
+}
+</textarea>
+<p><button id="go" disabled>Loading…</button></p>
+<h4>Compiler</h4><pre id="log"></pre>
+<h4>Program</h4><pre id="out"></pre>
+<script type="module">
+const $ = id => document.getElementById(id);
+const worker = new Worker('worker.js', { type: 'module' });
+const log = s => { $('log').textContent += s + '\n'; };
+let first = true;
+worker.onmessage = async ({ data }) => {
+  if (data.log !== undefined) {
+    log(data.log);
+    if (first && data.log.startsWith('loaded')) { first = false; $('go').disabled = false; $('go').textContent = 'Compile & run'; }
+  }
+  if (data.out !== undefined) $('out').textContent += data.out + '\n';
+  if (!data.done) return;
+  $('go').disabled = false;
+  if (!data.wasm) { window.__done = true; return; }
+  const out = $('out');
+  let mem;
+  const dec = new TextDecoder();
+  const { instance } = await WebAssembly.instantiate(data.wasm, {
+    env: { print: (p, n) => { out.textContent += dec.decode(new Uint8Array(mem.buffer, p, n)); } },
+  });
+  mem = instance.exports.memory;
+  for (const [name, f] of Object.entries(instance.exports)) {
+    if (typeof f === 'function' && f.length === 0) {
+      try { const r = f(); out.textContent += `${name}() = ${r}\n`; } catch (e) { out.textContent += `${name}() trapped: ${e}\n`; }
+    }
+  }
+  window.__done = true;
+};
+$('go').onclick = () => {
+  const src = $('src').value;
+  const exports = [...src.matchAll(/#\[(?:unsafe\()?no_mangle\)?\]\s*pub\s+(?:unsafe\s+)?extern\s+"C"\s+fn\s+(\w+)/g)].map(m => m[1]);
+  $('log').textContent = ''; $('out').textContent = ''; window.__done = false;
+  $('go').disabled = true;
+  worker.postMessage({ src, exports });
+};
+</script>

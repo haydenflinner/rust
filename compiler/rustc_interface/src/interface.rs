@@ -504,7 +504,14 @@ pub fn run_compiler<R: Send>(config: Config, f: impl FnOnce(&Compiler) -> R + Se
             // - Panic, e.g. triggered by `abort_if_errors` or a fatal error.
             //
             // We must run `finish_diagnostics` in both cases.
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&compiler)));
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                rustc_span::fatal_error::with_fatal_exit_hook(
+                    &|| {
+                        compiler.sess.finish_diagnostics();
+                    },
+                    || f(&compiler),
+                )
+            }));
 
             compiler.sess.finish_diagnostics();
 
