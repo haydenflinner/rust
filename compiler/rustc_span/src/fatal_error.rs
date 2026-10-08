@@ -13,6 +13,14 @@ impl !Send for FatalError {}
 
 impl FatalError {
     pub fn raise(self) -> ! {
+        // Without unwinding (wasm-hosted rustc) the marker would abort with a trap; the
+        // diagnostics are already emitted, so exit the way `catch_with_exit_code` would.
+        #[cfg(all(target_family = "wasm", panic = "abort"))]
+        {
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            std::process::exit(1);
+        }
+        #[allow(unreachable_code)]
         std::panic::resume_unwind(Box::new(FatalErrorMarker))
     }
 }
