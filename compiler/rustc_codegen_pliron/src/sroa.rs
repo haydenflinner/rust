@@ -218,7 +218,7 @@ fn access_ty(ctx: &Context, a: &Access) -> Option<TypeHandle> {
 
 /// Partition the alloca into slices; None if typed accesses overlap
 /// inconsistently or a copy/set cuts through a typed slice.
-fn slices(ctx: &mut Context, acc: &[Access]) -> Option<Vec<Slice>> {
+fn slices(ctx: &mut Context, acc: &[Access]) -> Result<Vec<Slice>, &'static str> {
     let mut typed: Vec<Slice> = Vec::new();
     for a in acc {
         let Some(ty) = access_ty(ctx, a) else {
@@ -226,14 +226,14 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Option<Vec<Slice>> {
         };
         let size = size_align(ctx, ty).0;
         if size == 0 {
-            return None;
+            return Err("zero-size access");
         }
         match typed
             .iter()
             .find(|s| s.off < a.off + size && a.off < s.off + s.size)
         {
             Some(s) if s.off == a.off && s.size == size && leaf_compatible(ctx, s.ty, ty) => {}
-            Some(_) => return None,
+            Some(_) => return Err("typed accesses overlap"),
             None => typed.push(Slice {
                 off: a.off,
                 size,
@@ -253,7 +253,7 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Option<Vec<Slice>> {
                 .iter()
                 .any(|t| (t.off < s && s < t.off + t.size) || (t.off < e && e < t.off + t.size))
             {
-                return None;
+                return Err("copy/set cuts a typed slice");
             }
             cuts.extend([s, e]);
             ranges.push((s, e));
@@ -284,7 +284,13 @@ fn slices(ctx: &mut Context, acc: &[Access]) -> Option<Vec<Slice>> {
         typed.push(Slice { off, size: k, ty });
     }
     typed.sort_by_key(|s| s.off);
-    (!typed.is_empty() && typed.len() <= MAX_SLICES).then_some(typed)
+    if typed.is_empty() {
+        return Err("no typed slices");
+    }
+    if typed.len() > MAX_SLICES {
+        return Err("too many slices");
+    }
+    Ok(typed)
 }
 
 pub(crate) fn mk_const(
@@ -382,7 +388,7 @@ fn split(ctx: &mut Context, st: &mut State<'_>, alloca: Ptr<Operation>) -> bool 
         st.promoted.insert(a, t);
         return true;
     }
-    let Some(sl) = slices(ctx, &acc) else {
+    let Ok(sl) = slices(ctx, &acc) else {
         return false;
     };
 
@@ -507,6 +513,11 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
         .filter(|&f| has_body(ctx, f))
         .collect();
     for f in funcs {
+        // Again after `phisimp`: loads that went through trivial block args
+        // now name the slot directly.
+        if crate::pass_enabled("PLIRON_SROA_FWD") {
+            forward_single_store(ctx, st, f);
+        }
         for _round in 0..3 {
             let allocas = allocas(ctx, f);
             let mut changed = false;
@@ -516,6 +527,10 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
             if !changed {
                 break;
             }
+        }
+        // And after splitting: a slice left holding one stored value.
+        if crate::pass_enabled("PLIRON_SROA_FWD") {
+            forward_single_store(ctx, st, f);
         }
         for op in allocas(ctx, f) {
             let a = op.deref(ctx).get_result(0);
@@ -611,11 +626,17 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
         }
         if std::env::var_os("PLIRON_STATS_WHY").is_some() {
             let mut h: std::collections::BTreeMap<String, usize> = Default::default();
-            for f in st.funcs.values().filter(|f| has_body(ctx, f.op)) {
-                for op in allocas(ctx, f.op) {
+            let fs: Vec<_> = st
+                .funcs
+                .values()
+                .map(|f| f.op)
+                .filter(|&f| has_body(ctx, f))
+                .collect();
+            for f in fs {
+                for op in allocas(ctx, f) {
                     let a = op.deref(ctx).get_result(0);
                     if !st.promoted.contains_key(&a) {
-                        *h.entry(why(ctx, st, a)).or_default() += 1;
+                        *h.entry(why2(ctx, st, a)).or_default() += 1;
                     }
                 }
             }
@@ -662,6 +683,13 @@ fn why(ctx: &Context, st: &State<'_>, a: Value) -> String {
                 uses.push("load");
             } else if Operation::is_op::<StoreOp>(op, ctx) && idx == 1 {
                 uses.push("store");
+            } else if matches!(
+                intrinsic(st, op),
+                Some("llvm.memcpy" | "llvm.memmove" | "llvm.memset")
+            ) && (idx == 0 || (idx == 1 && intrinsic(st, op) != Some("llvm.memset")))
+                && const_int(ctx, st, op.deref(ctx).get_operand(2)).is_some()
+            {
+                uses.push("mem");
             } else {
                 let n = st
                     .intrinsics
@@ -673,4 +701,118 @@ fn why(ctx: &Context, st: &State<'_>, a: Value) -> String {
         }
     }
     format!("layout ({} accesses)", uses.len().min(10))
+}
+
+/// `why`, refined with the accesses/slices verdict (PLIRON_STATS_WHY).
+fn why2(ctx: &mut Context, st: &State<'_>, a: Value) -> String {
+    let w = why(ctx, st, a);
+    if !w.starts_with("layout") {
+        return w;
+    }
+    let Some(&(size, _)) = st.allocas.get(&a) else {
+        return "not in st.allocas".into();
+    };
+    if size == 0 || size > MAX_SIZE {
+        return format!("size {}", if size == 0 { "0" } else { "> MAX_SIZE" });
+    }
+    let Some((acc, _)) = accesses(ctx, st, a, size) else {
+        return "accesses: out of range / self-copy".into();
+    };
+    if acc.is_empty() {
+        return "no accesses".into();
+    }
+    match slices(ctx, &acc) {
+        Err(e) => e.into(),
+        Ok(_) => "splittable (round limit?)".into(),
+    }
+}
+
+/// `forward_single_store` on every body; run before `phisimp` so block args
+/// that only ever carry the forwarded value collapse before `split`.
+pub fn forward(ctx: &mut Context, st: &State<'_>) {
+    let funcs: Vec<Ptr<Operation>> = st
+        .funcs
+        .values()
+        .map(|f| f.op)
+        .filter(|&f| has_body(ctx, f))
+        .collect();
+    let n: usize = funcs
+        .into_iter()
+        .map(|f| forward_single_store(ctx, st, f))
+        .sum();
+    if std::env::var_os("PLIRON_STATS").is_some() {
+        eprintln!("sroa-fwd {}: {n} single-store allocas forwarded", st.cgu);
+    }
+}
+
+/// mem2reg's single-store case: an alloca whose only uses are one store and
+/// same-typed loads that the store dominates (directly or through zero-offset
+/// GEPs) is replaced by the stored value. This frees allocas whose address
+/// was parked in such a slot (e.g. a closure's captured `&&K`), so `split`
+/// can promote them too.
+fn forward_single_store(ctx: &mut Context, st: &State<'_>, f: Ptr<Operation>) -> usize {
+    let Some(dom) = crate::domcheck::Dom::new(ctx, st, f) else {
+        return 0;
+    };
+    let pos = |ctx: &Context, o: Ptr<Operation>| {
+        let b = o.deref(ctx).get_parent_block().unwrap();
+        crate::inline::ops(ctx, b).iter().position(|&x| x == o)
+    };
+    let mut n = 0;
+    for op in allocas(ctx, f) {
+        let (mut store, mut loads, mut geps, mut ok) = (None, Vec::new(), Vec::new(), true);
+        let mut work = vec![op.deref(ctx).get_result(0)];
+        while let Some(p) = work.pop() {
+            for u in p.uses(ctx) {
+                let o = u.user_op();
+                ok &= !st.volatile.contains(&o)
+                    && if Operation::is_op::<StoreOp>(o, ctx) && u.find_index(ctx) == 1 {
+                        store.replace(o).is_none()
+                    } else if Operation::is_op::<LoadOp>(o, ctx) {
+                        loads.push(o);
+                        true
+                    } else if Operation::is_op::<GetElementPtrOp>(o, ctx)
+                        && u.find_index(ctx) == 0
+                        && (gep_offset(ctx, st, o) == Some(0)
+                            || o.deref(ctx).get_result(0).uses(ctx).is_empty())
+                    {
+                        geps.push(o);
+                        work.push(o.deref(ctx).get_result(0));
+                        true
+                    } else {
+                        false
+                    };
+            }
+        }
+        let Some(s) = store.filter(|_| ok && !loads.is_empty()) else {
+            continue;
+        };
+        let v = s.deref(ctx).get_operand(0);
+        let vt = v.get_type(ctx);
+        let sb = s.deref(ctx).get_parent_block().unwrap();
+        let fwd = dom.idx.contains_key(&sb)
+            && loads.iter().all(|&l| {
+                let lb = l.deref(ctx).get_parent_block().unwrap();
+                // Unreachable loads never run (lowering traps those blocks).
+                l.deref(ctx).get_result(0).get_type(ctx) == vt
+                    && (!dom.idx.contains_key(&lb)
+                        || if lb == sb {
+                            pos(ctx, s) < pos(ctx, l)
+                        } else {
+                            dom.dominates(sb, lb)
+                        })
+            });
+        if !fwd {
+            continue;
+        }
+        for l in loads {
+            let r = l.deref(ctx).get_result(0);
+            r.replace_all_uses_with(ctx, &v);
+            Operation::erase(l, ctx);
+        }
+        Operation::erase(s, ctx);
+        erase_dead(ctx, geps);
+        n += 1;
+    }
+    n
 }
