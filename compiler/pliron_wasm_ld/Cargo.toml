@@ -1,0 +1,15 @@
+[package]
+name = "pliron-wasm-ld"
+version = "0.1.0"
+edition = "2024"
+
+# In-process wasm linker for wasm-hosted rustc, which cannot spawn one.
+[lib]
+name = "pliron_wasm_ld"
+path = "../rustc_codegen_pliron/tools/pliron-wasm-ld/src/lib.rs"
+doctest = false
+
+[dependencies]
+wasmparser = "0.248"
+wasm-encoder = { version = "0.248", features = ["wasmparser"] }
+object = { version = "0.39", default-features = false, features = ["std", "read_core", "archive"] }

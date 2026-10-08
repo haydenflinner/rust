@@ -2109,6 +2109,13 @@ fn exec_linker(
     flavor: LinkerFlavor,
     tmpdir: &Path,
 ) -> io::Result<Output> {
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = (sess, flavor, tmpdir);
+        let args = cmd.get_args().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        pliron_wasm_ld::link(args).map_err(io::Error::other)?;
+        return Ok(Output { status: Default::default(), stdout: Vec::new(), stderr: Vec::new() });
+    }
     // When attempting to spawn the linker we run a risk of blowing out the
     // size limits for spawning a new process with respect to the arguments
     // we pass on the command line.

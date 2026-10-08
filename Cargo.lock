@@ -3489,6 +3489,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pliron-wasm-ld"
+version = "0.1.0"
+dependencies = [
+ "object 0.39.1",
+ "wasm-encoder 0.248.0",
+ "wasmparser 0.248.0",
+]
+
+[[package]]
 name = "polonius-engine"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4356,6 +4365,7 @@ dependencies = [
  "libc",
  "object 0.39.1",
  "pathdiff",
+ "pliron-wasm-ld",
  "regex",
  "rustc_abi",
  "rustc_arena",
@@ -7079,6 +7089,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac92cf547bc18d27ecc521015c08c353b4f18b84ab388bb6d1b6b682c620d9b6"
 dependencies = [
  "leb128fmt",
+ "wasmparser 0.248.0",
 ]
 
 [[package]]
@@ -7121,7 +7132,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa4439c5eee9df71ee0c6efb37f63b1fcb1fec38f85f5142c54e7ed05d33091a"
 dependencies = [
  "bitflags",
+ "hashbrown 0.17.1",
  "indexmap",
+ "semver",
+ "serde",
 ]
 
 [[package]]
