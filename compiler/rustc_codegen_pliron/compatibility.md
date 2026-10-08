@@ -8,6 +8,7 @@ Crate test suites built with the pliron backend (out-of-tree `.so` on nightly-20
 | coretests (stage1, fork) | `./x test library/coretests --skip _max_range` | 2,722 + 596 bench-tests pass, 0 fail |
 | coretests `split_off*_max_range*` (6) | as above | hang: comparing `usize::MAX` ZSTs is an unremoved loop (no loop deletion yet; upstream notes the same for unoptimized rustc) |
 | alloctests (stage1, fork) | `./x test library/alloctests` | 335 + 1,490 + 573 + 2 pass, 0 fail |
+| std (stage1, fork) | `./x test library/std` | 2,349 pass, 0 fail, 93 ignored |
 | burn-ndarray 0.22 | native, `--lib` | 41/41 |
 | burn-backend-tests | native, ndarray | 694 + 1,801 pass, 18 ignored |
 | polars-core 0.55.1 | native, `--features object` | 107 pass, 2 fail (same under LLVM: proptest `unreachable!`) |
@@ -15,6 +16,9 @@ Crate test suites built with the pliron backend (out-of-tree `.so` on nightly-20
 | naga `recursion_depth_template` | native, debug | stack overflow at 2 MB; passes with `RUST_MIN_STACK=16777216` (frames larger than LLVM's) |
 | wgpu-core 30 | native | 64/64 |
 | wgpu-examples 30 | wasm32-unknown-unknown, `webgpu`, wasm-bindgen 0.2.129, headless Chrome + SwiftShader | page boots, all 30 examples listed; `hello_synchronization` GPU readback identical to LLVM build |
+| serde_json, regex, hashbrown, itertools, rand, memchr (git HEAD) | native, `cargo test` | 236 / 319 / 389 / 655 / 164 / 166 pass, 0 fail |
+| memchr, rand, serde_json, regex (wasm32-wasip1, node 22) | `ct-wasi.sh test` (in-process panic=abort tests; doctests via `RUSTDOCFLAGS`) | memchr 107/107, rand 159/159, serde_json 160/160 (its TCP test aborts: no sockets on WASI), regex integration 62/62 (2 tests that build huge regexes segfault node on exit, same with stock LLVM) |
+| hashbrown, itertools (wasm32-wasip1) | as above | not run: dev-dep `criterion` refuses to build on WASI |
 | wasm-bindgen 0.2.129 | minimal lib + bin | exports, strings, `console.log` from `fn main` all work |
 
 Fixes made for these: `simd_select_bitmask` mask arg, LLVM-like constant alignment, >16-byte stack alignment, `llvm.{u,s}{add,sub}.sat`, x86 `vzeroupper`/`vzeroall`/fences, wasm custom sections + `target_features`, `-O0` always-inline (wasm-bindgen describe shims), no-arg `main` → C `main(argc, argv)` wrapper in pliron-wasm-ld.
