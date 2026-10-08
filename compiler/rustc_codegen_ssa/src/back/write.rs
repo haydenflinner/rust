@@ -1642,20 +1642,22 @@ fn start_executing_work<B: WriteBackendMethods>(
                     {
                         helper.request_token();
                     }
-                    if !cfg!(target_family = "wasm") {
-                        assert_eq!(main_thread_state, MainThreadState::Codegenning);
+                    assert!(cfg!(target_family = "wasm") || main_thread_state == MainThreadState::Codegenning);
+                    // wasm replays these after the fact; a main thread still lending keeps its token.
+                    if main_thread_state == MainThreadState::Codegenning {
+                        main_thread_state = MainThreadState::Idle;
                     }
-                    main_thread_state = MainThreadState::Idle;
                 }
 
                 Message::CodegenComplete => {
                     if codegen_state != Aborted {
                         codegen_state = Completed;
                     }
-                    if !cfg!(target_family = "wasm") {
-                        assert_eq!(main_thread_state, MainThreadState::Codegenning);
+                    assert!(cfg!(target_family = "wasm") || main_thread_state == MainThreadState::Codegenning);
+                    // wasm replays these after the fact; a main thread still lending keeps its token.
+                    if main_thread_state == MainThreadState::Codegenning {
+                        main_thread_state = MainThreadState::Idle;
                     }
-                    main_thread_state = MainThreadState::Idle;
                 }
 
                 // If codegen is aborted that means translation was aborted due
@@ -1710,11 +1712,12 @@ fn start_executing_work<B: WriteBackendMethods>(
 
                 Message::AddImportOnlyModule { bitcode_path, work_product } => {
                     assert_eq!(codegen_state, Ongoing);
-                    if !cfg!(target_family = "wasm") {
-                        assert_eq!(main_thread_state, MainThreadState::Codegenning);
-                    }
+                    assert!(cfg!(target_family = "wasm") || main_thread_state == MainThreadState::Codegenning);
                     lto_import_only_modules.push((bitcode_path, work_product));
-                    main_thread_state = MainThreadState::Idle;
+                    // wasm replays these after the fact; a main thread still lending keeps its token.
+                    if main_thread_state == MainThreadState::Codegenning {
+                        main_thread_state = MainThreadState::Idle;
+                    }
                 }
             }
         }
