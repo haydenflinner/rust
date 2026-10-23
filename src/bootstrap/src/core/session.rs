@@ -699,6 +699,9 @@ impl Session {
         if self.config.llvm_enabled(target) && check("llvm") {
             features.push("llvm");
         }
+        if target.contains("wasm") && check("pliron") {
+            features.push("pliron");
+        }
         if self.config.llvm_offload {
             features.push("llvm_offload");
         }

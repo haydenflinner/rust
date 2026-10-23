@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::path::Path;
+#[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
+#[cfg(not(target_family = "wasm"))]
 use rustc_fs_util::try_canonicalize;
 use rustc_proc_macro::bridge::client::Client as ProcMacroClient;
 use rustc_session::StableCrateId;
@@ -13,6 +15,7 @@ fn format_dlopen_err(e: &(dyn std::error::Error + 'static)) -> String {
     e.sources().map(|e| format!(": {e}")).collect()
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn attempt_load_dylib(path: &Path) -> Result<libloading::Library, libloading::Error> {
     #[cfg(target_os = "aix")]
     if let Some(ext) = path.extension()
@@ -36,6 +39,7 @@ fn attempt_load_dylib(path: &Path) -> Result<libloading::Library, libloading::Er
     unsafe { libloading::Library::new(path) }
 }
 
+#[cfg(not(target_family = "wasm"))]
 // On Windows the compiler would sometimes intermittently fail to open the
 // proc-macro DLL with `Error::LoadLibraryExW`. It is suspected that something in the
 // system still holds a lock on the file, so we retry a few times before calling it
@@ -103,6 +107,18 @@ impl From<DylibError> for CrateError {
     }
 }
 
+#[cfg(target_family = "wasm")]
+pub unsafe fn load_symbol_from_dylib<T: Copy>(
+    path: &Path,
+    _sym_name: &str,
+) -> Result<T, DylibError> {
+    Err(DylibError::DlOpen(
+        path.display().to_string(),
+        ": dynamic libraries are not supported on wasm hosts".to_string(),
+    ))
+}
+
+#[cfg(not(target_family = "wasm"))]
 pub unsafe fn load_symbol_from_dylib<T: Copy>(
     path: &Path,
     sym_name: &str,

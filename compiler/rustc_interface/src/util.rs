@@ -185,6 +185,18 @@ fn run_in_thread_with_globals<F: FnOnce(CurrentGcx) -> R + Send, R: Send>(
     // the parallel compiler, in particular to ensure there is no accidental
     // sharing of data between the main thread and the compilation thread
     // (which might cause problems for the parallel compiler).
+    // Single-threaded wasm (e.g. wasm32-wasip1) can't spawn threads.
+    #[cfg(all(target_family = "wasm", not(target_feature = "atomics")))]
+    {
+        let _ = thread_stack_size;
+        return rustc_span::create_session_globals_then(
+            edition,
+            extra_symbols,
+            Some(sm_inputs),
+            || f(CurrentGcx::new()),
+        );
+    }
+    #[allow(unreachable_code)]
     let builder = thread::Builder::new().name("rustc".to_string()).stack_size(thread_stack_size);
 
     // We build the session globals and run `f` on the spawned thread, because
@@ -387,6 +399,8 @@ pub fn get_codegen_backend(
             "dummy" => || Box::new(DummyCodegenBackend),
             #[cfg(feature = "llvm")]
             "llvm" => rustc_codegen_llvm::LlvmCodegenBackend::new,
+            #[cfg(feature = "pliron")]
+            "pliron" => rustc_codegen_pliron::__rustc_codegen_backend,
             backend_name => get_codegen_sysroot(early_dcx, sysroot, backend_name),
         }
     });

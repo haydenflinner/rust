@@ -276,6 +276,13 @@ fn current_dll_path() -> Result<PathBuf, String> {
 
 /// This function checks if sysroot is found using env::args().next(), and if it
 /// is not found, finds sysroot from current rustc_driver dll.
+/// wasm hosts have no executable/dll path to derive the sysroot from.
+#[cfg(target_family = "wasm")]
+pub(crate) fn default_sysroot() -> PathBuf {
+    std::env::var_os("RUSTC_SYSROOT").map_or_else(|| PathBuf::from("/sysroot"), PathBuf::from)
+}
+
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn default_sysroot() -> PathBuf {
     fn default_from_rustc_driver_dll() -> Result<PathBuf, String> {
         let dll = current_dll_path()?;

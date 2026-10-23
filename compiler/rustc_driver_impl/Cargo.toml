@@ -62,6 +62,7 @@ ctrlc = "3.4.4"
 check_only = ['rustc_interface/check_only']
 jemalloc = []
 llvm = ['rustc_interface/llvm']
+pliron = ['rustc_interface/pliron']
 llvm_offload = ['rustc_interface/llvm_offload']
 max_level_info = ['rustc_log/max_level_info']
 rustc_randomized_layouts = [

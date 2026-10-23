@@ -5,6 +5,10 @@ use rustc_windows_rc::{VersionInfoFileType, compile_windows_resource_file};
 fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS");
     let target_env = env::var("CARGO_CFG_TARGET_ENV");
+    // wasm has no threads to give rustc its usual big stack, so size the main one.
+    if env::var("CARGO_CFG_TARGET_FAMILY").is_ok_and(|f| f.split(',').any(|f| f == "wasm")) {
+        println!("cargo:rustc-link-arg-bin=rustc-main=-zstack-size=67108864");
+    }
     if Ok("windows") == target_os.as_deref() && Ok("msvc") == target_env.as_deref() {
         set_windows_exe_options();
     } else {
