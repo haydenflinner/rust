@@ -2529,11 +2529,6 @@ impl CommandLineStep for Assemble {
                         // library sysroots, so that they are available for cg_gcc.
                         dylib_set.install_to(builder, target_compiler);
                     }
-                    CodegenBackendKind::Custom(name)
-                        if name == "pliron" && target_compiler.host.contains("wasm") =>
-                    {
-                        continue;
-                    }
                     CodegenBackendKind::Custom(name) if name == "pliron" => {
                         let stamp =
                             builder.ensure(PlironCodegenBackend { compilers: prepare_compilers() });
