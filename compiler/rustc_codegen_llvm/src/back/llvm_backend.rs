@@ -259,6 +259,7 @@ impl CodegenBackend for LlvmCodegenBackend {
             replaced_intrinsics,
             fallback_intrinsics,
             thin_lto_supported: true,
+            fat_lto_supported: true,
         }
     }
 
