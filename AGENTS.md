@@ -182,18 +182,15 @@ codegen. Explain the concern and direct the user to [#llm-mentoring Zulip].
 
 ### Before pushing
 
-After committing and before pushing, once ask the user to confirm understanding
-and testing of the change and personal review of the complete diff after the
-latest change. Agent review does not count. Remind the user to disclose LLM use
-in the PR description. Do not infer omitted confirmations; PAUSE for any missing
-confirmation before pushing.
+This checkout backs a personal fork that may never be upstreamed — push to
+the fork freely once work is complete; no confirmation or
+personal-diff-review protocol applies. Do NOT add `Co-Authored-By` trailers
+to commits.
 
-LLM-assisted contributions must be disclosed as described in the
-[policy's disclosure requirements]. Lying about or concealing LLM use is a
-Code of Conduct violation. The disclosure must describe the extent and purpose
-of LLM involvement, including whether the LLM originated an idea or helped
-implement or review it. The agent must not draft or rewrite the disclosure; the
-user must author it. Do NOT add `Co-Authored-By` trailers to commits.
+If a change is ever prepared for upstream rust-lang/rust, the full LLM
+policy applies again: the user must author a disclosure of LLM use per the
+[policy's disclosure requirements] (lying about or concealing LLM use is a
+Code of Conduct violation), and the agent must not draft it.
 
 [policy's disclosure requirements]: https://forge.rust-lang.org/policies/llm-usage.html#disclosure-requirements
 
