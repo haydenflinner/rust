@@ -228,6 +228,7 @@ pub(crate) enum CodegenBackend {
     Cranelift,
     Gcc,
     Llvm,
+    Pliron,
 }
 
 impl FromStr for CodegenBackend {
@@ -238,6 +239,7 @@ impl FromStr for CodegenBackend {
             "cranelift" => Ok(Self::Cranelift),
             "gcc" => Ok(Self::Gcc),
             "llvm" => Ok(Self::Llvm),
+            "pliron" => Ok(Self::Pliron),
             _ => Err("unknown codegen backend"),
         }
     }
@@ -249,6 +251,7 @@ impl CodegenBackend {
             Self::Cranelift => "cranelift",
             Self::Gcc => "gcc",
             Self::Llvm => "llvm",
+            Self::Pliron => "pliron",
         }
     }
 
