@@ -156,7 +156,7 @@ pub(crate) fn dlsym_proc_macros(
             }
             Err(err) => {
                 debug!("failed to dlsym proc_macros {} for symbol `{}`", path.display(), sym_name);
-                Err(err.into())
+                Err(err)
             }
         }
     }
