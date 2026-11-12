@@ -3,7 +3,6 @@ use std::ptr;
 use rustc_ast::expand::autodiff_attrs::{DiffActivity, DiffMode};
 use rustc_ast::expand::typetree::FncTree;
 use rustc_attr_ir::RustcAutodiff;
-use rustc_codegen_ssa::common::TypeKind;
 use rustc_codegen_ssa::mir::IntrinsicResult;
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
 use rustc_codegen_ssa::mir::place::PlaceValue;
@@ -18,7 +17,7 @@ use tracing::debug;
 use crate::builder::{Builder, UNNAMED};
 use crate::context::SimpleCx;
 use crate::declare::declare_simple_fn;
-use crate::llvm::{self, TRUE, Type, Value};
+use crate::llvm::{self, TRUE, Type, TypeKind, Value};
 
 pub(crate) fn adjust_activity_to_abi<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -137,9 +136,9 @@ pub(crate) fn adjust_activity_to_abi<'tcx>(
 fn match_args_from_caller_to_enzyme<'ll, 'tcx>(
     builder: &mut Builder<'_, 'll, 'tcx>,
     width: u32,
-    args: &mut Vec<&'ll Value>,
+    args: &mut Vec<Value<'ll>>,
     inputs: &[DiffActivity],
-    outer_args: &[&'ll Value],
+    outer_args: &[Value<'ll>],
 ) {
     debug!("matching autodiff arguments");
     // We now handle the issue that Rust level arguments not always match the llvm-ir level
@@ -167,7 +166,7 @@ fn match_args_from_caller_to_enzyme<'ll, 'tcx>(
         let diff_activity = inputs[activity_pos as usize];
         // Duplicated arguments received a shadow argument, into which enzyme will write the
         // gradient.
-        let (activity, duplicated): (&Value, bool) = match diff_activity {
+        let (activity, duplicated): (Value<'ll>, bool) = match diff_activity {
             DiffActivity::None => panic!("not a valid input activity"),
             DiffActivity::Const => (global_const, false),
             DiffActivity::Active => (global_out, false),
@@ -193,7 +192,7 @@ fn match_args_from_caller_to_enzyme<'ll, 'tcx>(
             // Now we multiply `4 * next_outer_arg` to get the stride.
             let mul = unsafe {
                 llvm::LLVMBuildMul(
-                    builder.llbuilder,
+                    builder.llbuilder(),
                     cx.get_const_int(cx.type_i64(), elem_bytes_size),
                     next_outer_arg,
                     UNNAMED,
@@ -285,15 +284,15 @@ fn match_args_from_caller_to_enzyme<'ll, 'tcx>(
 // cover some assumptions of enzyme/autodiff, which could lead to UB otherwise.
 pub(crate) fn generate_enzyme_call<'ll, 'tcx>(
     bx: &mut Builder<'_, 'll, 'tcx>,
-    fn_to_diff: &'ll Value,
+    fn_to_diff: Value<'ll>,
     outer_name: &str,
-    ret_ty: &'ll Type,
-    fn_args: &[&'ll Value],
+    ret_ty: Type<'ll>,
+    fn_args: &[Value<'ll>],
     attrs: &RustcAutodiff,
     dest_layout: ty::layout::TyAndLayout<'tcx>,
-    dest_place: Option<PlaceValue<&'ll Value>>,
+    dest_place: Option<PlaceValue<Value<'ll>>>,
     fnc_tree: FncTree,
-) -> IntrinsicResult<'tcx, &'ll Value> {
+) -> IntrinsicResult<'tcx, Value<'ll>> {
     let cx: &SimpleCx<'ll> = &bx.scx;
     // We have to pick the name depending on whether we want forward or reverse mode autodiff.
     let mut ad_name: String = match attrs.mode {
@@ -347,7 +346,7 @@ pub(crate) fn generate_enzyme_call<'ll, 'tcx>(
         enzyme_ty,
     );
 
-    let num_args = llvm::LLVMCountParams(&fn_to_diff);
+    let num_args = llvm::LLVMCountParams(fn_to_diff);
     let mut args = Vec::with_capacity(num_args as usize + 1);
     args.push(fn_to_diff);
 
@@ -370,7 +369,7 @@ pub(crate) fn generate_enzyme_call<'ll, 'tcx>(
     let call = bx.call(enzyme_ty, None, None, ad_fn, ReturnSlot::Direct, &args, None, None);
 
     let fn_ret_ty = bx.cx.val_ty(call);
-    if fn_ret_ty == bx.cx.type_void() || fn_ret_ty == bx.cx.type_struct(&[], false) {
+    if fn_ret_ty == bx.cx.type_void() || fn_ret_ty == bx.cx.type_struct(&[]) {
         // If we return void or an empty struct, then our caller (due to how we generated it)
         // does not expect a return value. As such, we have no pointer (or place) into which
         // we could store our value, and would store into an undef, which would cause UB.

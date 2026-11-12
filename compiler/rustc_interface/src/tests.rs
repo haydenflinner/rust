@@ -346,7 +346,7 @@ fn test_search_paths_tracking_hash_different_order() {
     let early_dcx = EarlyDiagCtxt::new(JSON);
     const JSON: ErrorOutputType = ErrorOutputType::Json {
         pretty: false,
-        json_rendered: HumanReadableErrorType { short: false, unicode: false },
+        json_rendered: HumanReadableErrorType { no_graphics: false, short: false, unicode: false },
         color_config: ColorConfig::Never,
     };
 
@@ -789,6 +789,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(always_encode_mir, true);
     tracked!(annotate_moves, AnnotateMoves::Enabled(Some(1234)));
     tracked!(assume_incomplete_release, true);
+    tracked!(async_panic, false);
     tracked!(autodiff, vec![AutoDiff::Enable, AutoDiff::NoTT]);
     tracked!(autodiff_post_passes, Some("function(mem2reg,instsimplify,simplifycfg)".to_string()));
     tracked!(binary_dep_depinfo, true);

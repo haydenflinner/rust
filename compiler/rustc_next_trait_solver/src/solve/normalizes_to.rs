@@ -350,7 +350,7 @@ where
                             }
                             // Outside of coherence, we treat the associated item as rigid instead.
                             ty::TypingMode::Typeck { .. }
-                            | ty::TypingMode::PostTypeckUntilBorrowck { .. }
+                            | ty::TypingMode::PostTypeckThroughBorrowck { .. }
                             | ty::TypingMode::PostBorrowck { .. }
                             | ty::TypingMode::PostAnalysis
                             | ty::TypingMode::Reflection
@@ -459,7 +459,7 @@ where
                         },
                         target_args,
                     );
-                    return ecx.evaluate_const_and_instantiate_projection_term(
+                    return ecx.evaluate_const(
                         goal.param_env,
                         goal.predicate.alias,
                         goal.predicate.term,
@@ -529,6 +529,13 @@ where
         goal: Goal<I, Self>,
     ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
         panic!("`FnPtr` does not have an associated type: {:?}", goal);
+    }
+
+    fn consider_builtin_fn_static_trait_candidate(
+        _ecx: &mut EvalCtxt<'_, D>,
+        goal: Goal<I, Self>,
+    ) -> Result<Candidate<I>, NoSolutionOrRerunNonErased> {
+        panic!("`FnStatic` does not have an associated type: {:?}", goal);
     }
 
     fn consider_builtin_fn_trait_candidates(

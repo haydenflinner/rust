@@ -13,7 +13,7 @@ use rustc_ast_pretty::pprust;
 use rustc_attr_ir::diagnostic::Directive;
 use rustc_attr_ir::{self as attrs, find_attr};
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
-use rustc_errors::{Applicability, Diag, ErrorGuaranteed, MultiSpan};
+use rustc_errors::{Applicability, Diag, ErrorGuaranteed, MultiSpan, StringPart};
 use rustc_feature::Features;
 use rustc_hir::def::MacroKinds;
 use rustc_lint_defs::builtin::{
@@ -635,15 +635,14 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
     let parser = parser_from_cx(psess, arg.clone(), T::recovery());
     // Try each arm's matchers.
     let mut tt_parser = TtParser::new();
+    // Take a snapshot of the state of pre-expansion gating at this point.
+    // This is used so that if a matcher is not `Success(..)`ful,
+    // then the spans which became gated when parsing the unsuccessful matcher
+    // are not recorded. On the first `Success(..)`ful matcher, the spans are merged.
+    let gated_spans_snapshot = mem::take(&mut *psess.gated_spans.spans.borrow_mut());
     for (i, rule) in rules.iter().enumerate() {
         let MacroRule::Func { lhs, .. } = rule else { continue };
         let _tracing_span = trace_span!("Matching arm", %i);
-
-        // Take a snapshot of the state of pre-expansion gating at this point.
-        // This is used so that if a matcher is not `Success(..)`ful,
-        // then the spans which became gated when parsing the unsuccessful matcher
-        // are not recorded. On the first `Success(..)`ful matcher, the spans are merged.
-        let mut gated_spans_snapshot = mem::take(&mut *psess.gated_spans.spans.borrow_mut());
 
         track.prepare(WhichMatcher::FOR_FUNC, lhs);
         let result = tt_parser.parse_tt(&mut Cow::Borrowed(&parser), lhs, track);
@@ -674,11 +673,10 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
             }
         }
 
-        // The matcher was not `Success(..)`ful.
-        // Restore to the state before snapshotting and maybe try again.
-        mem::swap(&mut gated_spans_snapshot, &mut psess.gated_spans.spans.borrow_mut());
+        psess.gated_spans.spans.borrow_mut().clear();
     }
 
+    *psess.gated_spans.spans.borrow_mut() = gated_spans_snapshot;
     Err(CanRetry::Yes)
 }
 
@@ -1646,21 +1644,32 @@ fn check_matcher_core<'tt>(
                                 );
                             }
 
-                            let msg = "allowed there are: ";
                             match possible {
                                 &[] => {}
                                 &[t] => {
-                                    err.note(format!(
-                                        "only {t} is allowed after `{kind}` fragments",
-                                    ));
+                                    err.highlighted_note(vec![
+                                        StringPart::normal("only "),
+                                        StringPart::highlighted(t),
+                                        StringPart::normal(format!(
+                                            " is allowed after `{kind}` fragments"
+                                        )),
+                                    ]);
                                 }
                                 ts => {
-                                    err.note(format!(
-                                        "{}{} or {}",
-                                        msg,
-                                        ts[..ts.len() - 1].to_vec().join(", "),
-                                        ts[ts.len() - 1],
-                                    ));
+                                    let mut msg_parts =
+                                        vec![StringPart::normal("allowed there are: ")];
+
+                                    for (i, &t) in ts.iter().enumerate() {
+                                        if i == ts.len() - 1 {
+                                            msg_parts.push(StringPart::normal(" or "));
+                                        } else if i > 0 {
+                                            msg_parts.push(StringPart::normal(", "));
+                                        }
+
+                                        msg_parts.push(StringPart::highlighted(t));
+                                    }
+
+                                    err.highlighted_note(msg_parts);
                                 }
                             }
                             errored = Err(err.emit_err());

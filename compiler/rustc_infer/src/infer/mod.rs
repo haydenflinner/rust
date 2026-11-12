@@ -29,12 +29,12 @@ use rustc_middle::traits::solve::Goal;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::{
     self, BoundVarReplacerDelegate, ConstVid, FloatVid, GenericArg, GenericArgKind, GenericArgs,
-    GenericArgsRef, GenericParamDefKind, InferConst, OpaqueTypeKey, ProvisionalHiddenType,
-    PseudoCanonicalInput, Term, Ty, TyCtxt, TyVid, TypeFoldable, TypeFolder, TypeSuperFoldable,
-    TypeVisitable, TypeVisitableExt, TypingEnv, TypingMode, fold_regions,
+    GenericParamDefKind, InferConst, OpaqueTypeKey, ProvisionalHiddenType, PseudoCanonicalInput,
+    Term, Ty, TyCtxt, TyVid, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitable,
+    TypeVisitableExt, TypingEnv, TypingMode, fold_regions,
 };
 use rustc_span::{DUMMY_SP, Span, Symbol, bug};
-use rustc_type_ir::{CanonicalizerState, MayBeErased};
+use rustc_type_ir::MayBeErased;
 use snapshot::undo_log::InferCtxtUndoLogs;
 use tracing::{debug, instrument};
 use ty::solve::TyOrConstInferVar;
@@ -348,11 +348,6 @@ pub struct InferCtxt<'tcx> {
     enable_next_solver_overflow_fcw: Cell<bool>,
 
     pub obligation_inspector: Cell<Option<ObligationInspector<'tcx>>>,
-
-    /// State reused by each new canonicalizer, and then cleared (but not deallocated) once the
-    /// canonicalizer is finished. A performance win, because it avoids reallocating new
-    /// vecs/hashmaps for every canonicalizer.
-    pub canonicalizer_state: RefCell<CanonicalizerState<TyCtxt<'tcx>>>,
 }
 
 impl<'tcx> Drop for InferCtxt<'tcx> {
@@ -360,10 +355,10 @@ impl<'tcx> Drop for InferCtxt<'tcx> {
         let mut inner = self.inner.borrow_mut();
         let opaque_type_storage = &mut inner.opaque_type_storage;
 
-        // No need for the drop bomb when we're in `TypingMode::PostTypeckUntilBorrowck`, and the `InferCtxt`
+        // No need for the drop bomb when we're in `TypingMode::PostTypeckThroughBorrowck`, and the `InferCtxt`
         // doesn't consider regions. This is okay since after typeck, the only reason we care about opaques is
         // in relation to regions. In some places *after* typeck that aren't borrowck, we use
-        // `TypingMode::PostTypeckUntilBorrowck` to prevent defining opaque types and we simply don't care about regions.
+        // `TypingMode::PostTypeckThroughBorrowck` to prevent defining opaque types and we simply don't care about regions.
         match self.typing_mode_raw() {
             TypingMode::Coherence
             | TypingMode::Typeck { .. }
@@ -373,7 +368,7 @@ impl<'tcx> Drop for InferCtxt<'tcx> {
             | TypingMode::Codegen => {}
             // In erased mode, the opaque type storage is always empty
             TypingMode::ErasedNotCoherence(..) => {}
-            TypingMode::PostTypeckUntilBorrowck { .. } => {
+            TypingMode::PostTypeckThroughBorrowck { .. } => {
                 if !self.considering_regions {
                     return;
                 }
@@ -696,7 +691,6 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
             next_trait_solver,
             enable_next_solver_overflow_fcw: Cell::new(enable_next_solver_overflow_fcw),
             obligation_inspector: Cell::new(None),
-            canonicalizer_state: Default::default(),
         }
     }
 }
@@ -883,7 +877,7 @@ impl<'tcx> InferCtxt<'tcx> {
 
         self.enter_forall(predicate, |ty::SubtypePredicate { a_is_expected, a, b }| {
             if a_is_expected {
-                Ok(self.at(cause, param_env).sub(DefineOpaqueTypes::Yes, a, b))
+                Ok(self.sub_raw(cause, param_env, DefineOpaqueTypes::Yes, a, b))
             } else {
                 Ok(self.sup_raw(cause, param_env, DefineOpaqueTypes::Yes, b, a))
             }
@@ -1076,7 +1070,7 @@ impl<'tcx> InferCtxt<'tcx> {
 
     /// Given a set of generics defined on a type or impl, returns the generic parameters mapping
     /// each type/region parameter to a fresh inference variable.
-    pub fn fresh_args_for_item(&self, span: Span, def_id: DefId) -> GenericArgsRef<'tcx> {
+    pub fn fresh_args_for_item(&self, span: Span, def_id: DefId) -> GenericArgs<'tcx> {
         GenericArgs::for_item(self.tcx, def_id, |param, _| self.var_for_def(span, param))
     }
 
@@ -1193,7 +1187,7 @@ impl<'tcx> InferCtxt<'tcx> {
         debug_assert!(!self.next_trait_solver());
         match self.typing_mode_raw().assert_not_erased() {
             TypingMode::Typeck { defining_opaque_types_and_generators: defining_opaque_types }
-            | TypingMode::PostTypeckUntilBorrowck { defining_opaque_types } => {
+            | TypingMode::PostTypeckThroughBorrowck { defining_opaque_types } => {
                 id.into().as_local().is_some_and(|def_id| defining_opaque_types.contains(&def_id))
             }
             // FIXME(#132279): This function is quite weird in post-analysis
@@ -1683,7 +1677,7 @@ impl<'tcx> InferCtxt<'tcx> {
             // errors and fail to reveal opaques while inside of bodies. We should rename this
             // function and require explicit comments on all use-sites in the future.
             ty::TypingMode::Typeck { defining_opaque_types_and_generators: _ }
-            | ty::TypingMode::PostTypeckUntilBorrowck { defining_opaque_types: _ } => {
+            | ty::TypingMode::PostTypeckThroughBorrowck { defining_opaque_types: _ } => {
                 TypingMode::non_body_analysis()
             }
             mode @ (ty::TypingMode::Coherence
