@@ -20,7 +20,7 @@ use crate::{
         traversals::region::{DFSEdgeKind, DFSTraversal},
     },
     irbuild::inserter::OpInsertionPoint,
-    linked_list::{ContainsLinkedList, LinkedList},
+    linked_list::ContainsLinkedList,
     pass::{Analysis, AnalysisManager},
     region::Region,
     result::Result,
@@ -291,7 +291,7 @@ impl LivenessTq {
     /// Otherwise, returns `None`.
     fn use_blocks_in_region(&self, ctx: &Context, value: Value) -> Option<BitSet> {
         let mut use_blocks = BitSet::default();
-        for r#use in value.uses(ctx) {
+        for r#use in value.uses_iter(ctx) {
             let Some(user_block) = r#use.user_op().deref(ctx).get_parent_block() else {
                 // We don't know where the user op is, hence unanalysable
                 return None;
@@ -500,7 +500,7 @@ impl<T: RegionLiveness + 'static> Analysis for Liveness<T> {
         let mut liveness = Self::default();
         let mut dom_info = analyses.get_analysis_mut::<DomInfo>(op, ctx)?;
         // Precompute liveness for the top-level regions of the operation.
-        for region in op.deref(ctx).regions() {
+        for region in op.deref(ctx).regions(ctx) {
             liveness.get_region_info(ctx, &mut dom_info, region);
         }
         Ok(liveness)
@@ -522,8 +522,7 @@ impl<T: RegionLiveness> Liveness<T> {
 
     fn has_use_in_region_subtree(ctx: &Context, value: Value, region: Ptr<Region>) -> bool {
         value
-            .uses(ctx)
-            .iter()
+            .uses_iter(ctx)
             .any(|r#use| find_ancestor_op_of_op_in_region(ctx, r#use.user_op(), region).is_some())
     }
 
@@ -535,20 +534,19 @@ impl<T: RegionLiveness> Liveness<T> {
             .expect("Query point must be within a block for local use check");
 
         let user_ops_in_point_block: HSet<_> = value
-            .uses(ctx)
-            .iter()
+            .uses_iter(ctx)
             .filter_map(|r#use| find_ancestor_op_of_op_in_block(ctx, r#use.user_op(), point_block))
             .collect();
 
         let op_iter = match point {
             OpInsertionPoint::BeforeOperation(op) => Some(op),
-            OpInsertionPoint::AfterOperation(op) => op.deref(ctx).get_next(),
+            OpInsertionPoint::AfterOperation(op) => op.get_next(ctx),
             OpInsertionPoint::AtBlockStart(block) => block.deref(ctx).get_head(),
             OpInsertionPoint::AtBlockEnd(_block) => None,
             OpInsertionPoint::Unset => panic!("Insertion point must be set for local use check"),
         };
 
-        core::iter::successors(op_iter, |op| op.deref(ctx).get_next())
+        core::iter::successors(op_iter, |op| op.get_next(ctx))
             .any(|op| user_ops_in_point_block.contains(&op))
     }
 
@@ -742,7 +740,7 @@ mod tests {
             0,
         );
         def_op.insert_at_back(block, ctx);
-        let value = def_op.deref(ctx).get_result(0);
+        let value = def_op.deref(ctx).get_result(ctx, 0);
         (def_op, value)
     }
 
@@ -777,7 +775,7 @@ mod tests {
             1,
         );
         holder.insert_at_back(block, ctx);
-        let region = holder.deref(ctx).get_region(0);
+        let region = holder.deref(ctx).get_region(ctx, 0);
         let inner_block = BasicBlock::new(ctx, None, vec![]);
         inner_block.insert_at_back(region, ctx);
         (holder, region, inner_block)

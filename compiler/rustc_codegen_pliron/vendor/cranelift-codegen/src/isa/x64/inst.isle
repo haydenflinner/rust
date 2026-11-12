@@ -568,17 +568,25 @@
 (rule to_amode_add_const_lhs 2 (to_amode_add flags (i32_from_iconst c) x offset)
         (if-let sum (i32_checked_add offset c))
         (amode_imm_reg flags x sum))
-(rule to_amode_add_const_fold_iadd_lhs_rhs 3 (to_amode_add flags (iadd _ x (i32_from_iconst c)) y offset)
-        (if-let sum (i32_checked_add offset c))
+;; PLIRON (`PLIRON_X64_SUAMODE`, default-on): the extractor matches
+;; the same `iadd x, K` in either operand order the stock four rules
+;; covered, plus a use-count gate — fold `K` into the displacement
+;; only when the sum has ≤1 direct use. A multi-use sum is
+;; materialized anyway for its other consumers; folding then keeps
+;; `x` live alongside the sum (parse's digit adds: folded
+;; `lea -0x30(char, acc*2)` kept `char` live across the range check →
+;; spills; `lea (digit, acc*2)` frees it). `PLIRON_X64_SUAMODE=0`
+;; makes the extractor ignore use counts — identical to the stock
+;; rules.
+(decl pure pliron_iadd_su_iconst (Value i64) Value)
+(extern extractor pliron_iadd_su_iconst pliron_iadd_su_iconst)
+(rule to_amode_add_const_fold_iadd_lhs 3 (to_amode_add flags (pliron_iadd_su_iconst x c) y offset)
+        (if-let k (i64_try_into_i32 c))
+        (if-let sum (i32_checked_add offset k))
         (amode_imm_reg_reg_shift flags x y sum))
-(rule to_amode_add_const_fold_iadd_lhs_lhs 4 (to_amode_add flags (iadd _ (i32_from_iconst c) x) y offset)
-        (if-let sum (i32_checked_add offset c))
-        (amode_imm_reg_reg_shift flags x y sum))
-(rule to_amode_add_const_fold_iadd_rhs_rhs 5 (to_amode_add flags x (iadd _ y (i32_from_iconst c)) offset)
-        (if-let sum (i32_checked_add offset c))
-        (amode_imm_reg_reg_shift flags x y sum))
-(rule to_amode_add_const_fold_iadd_rhs_lhs 6 (to_amode_add flags x (iadd _ (i32_from_iconst c) y) offset)
-        (if-let sum (i32_checked_add offset c))
+(rule to_amode_add_const_fold_iadd_rhs 4 (to_amode_add flags x (pliron_iadd_su_iconst y c) offset)
+        (if-let k (i64_try_into_i32 c))
+        (if-let sum (i32_checked_add offset k))
         (amode_imm_reg_reg_shift flags x y sum))
 
 ;; Final cases of amode lowering. Does not hunt for constants and only attempts
@@ -601,6 +609,41 @@
 (rule amode_imm_reg_reg_shift_shl_lhs 2 (amode_imm_reg_reg_shift flags (ishl _ y (iconst _ (uimm8 shift))) x offset)
         (if-let true (u32_lt_eq shift 3))
         (Amode.ImmRegRegShift offset x y shift flags))
+(decl pure pliron_amode_iadd () bool)
+(extern constructor pliron_amode_iadd pliron_amode_iadd)
+
+;; PLIRON: `base + ((idx + K) << s)` folds `K<<s` into the displacement
+;; instead of materializing `idx+K` with a separate `lea`. Indexed-loop
+;; addressing (pliron's `iadd`/`ishl`/`iadd` chains) hits this on every
+;; strided access; without it each element costs one extra ALU op.
+(rule amode_imm_reg_reg_shift_iadd_shl_rhs 3
+      (amode_imm_reg_reg_shift flags x (ishl _ (iadd _ y (i64_from_iconst k)) (iconst _ (uimm8 shift))) offset)
+      (if-let true (u32_lt_eq shift 3))
+      (if-let true (pliron_amode_iadd))
+      (if-let disp (i64_try_into_i32 (u64_cast_signed (u64_wrapping_shl (i64_cast_unsigned k) (u8_into_u32 shift)))))
+      (if-let sum (i32_checked_add offset disp))
+      (Amode.ImmRegRegShift sum x y shift flags))
+(rule amode_imm_reg_reg_shift_iadd_shl_rhs2 4
+      (amode_imm_reg_reg_shift flags x (ishl _ (iadd _ (i64_from_iconst k) y) (iconst _ (uimm8 shift))) offset)
+      (if-let true (u32_lt_eq shift 3))
+      (if-let true (pliron_amode_iadd))
+      (if-let disp (i64_try_into_i32 (u64_cast_signed (u64_wrapping_shl (i64_cast_unsigned k) (u8_into_u32 shift)))))
+      (if-let sum (i32_checked_add offset disp))
+      (Amode.ImmRegRegShift sum x y shift flags))
+(rule amode_imm_reg_reg_shift_iadd_shl_lhs 5
+      (amode_imm_reg_reg_shift flags (ishl _ (iadd _ y (i64_from_iconst k)) (iconst _ (uimm8 shift))) x offset)
+      (if-let true (u32_lt_eq shift 3))
+      (if-let true (pliron_amode_iadd))
+      (if-let disp (i64_try_into_i32 (u64_cast_signed (u64_wrapping_shl (i64_cast_unsigned k) (u8_into_u32 shift)))))
+      (if-let sum (i32_checked_add offset disp))
+      (Amode.ImmRegRegShift sum x y shift flags))
+(rule amode_imm_reg_reg_shift_iadd_shl_lhs2 6
+      (amode_imm_reg_reg_shift flags (ishl _ (iadd _ (i64_from_iconst k) y) (iconst _ (uimm8 shift))) x offset)
+      (if-let true (u32_lt_eq shift 3))
+      (if-let true (pliron_amode_iadd))
+      (if-let disp (i64_try_into_i32 (u64_cast_signed (u64_wrapping_shl (i64_cast_unsigned k) (u8_into_u32 shift)))))
+      (if-let sum (i32_checked_add offset disp))
+      (Amode.ImmRegRegShift sum x y shift flags))
 
 ;; Offsetting an Amode. Used when we need to do consecutive
 ;; loads/stores to adjacent addresses.
@@ -755,6 +798,8 @@
 (type XmmMem32 extern (enum))
 (type XmmMem64 extern (enum))
 (type XmmMem128 extern (enum))
+(type XmmMem256 extern (enum))
+(type XmmMem512 extern (enum))
 (type XmmMemAligned extern (enum))
 (type XmmMemAligned8 extern (enum))
 (type XmmMemAligned16 extern (enum))
@@ -1158,6 +1203,40 @@
 (decl xmm_mem_aligned_imm_128_to_xmm_mem_aligned_imm (XmmMemAlignedImm128) XmmMemAlignedImm)
 (extern constructor xmm_mem_aligned_imm_128_to_xmm_mem_aligned_imm xmm_mem_aligned_imm_128_to_xmm_mem_aligned_imm)
 
+;; PLIRON: sized xmm-or-mem operand types for 256/512-bit wide-vector
+;; operands — the type system, not convention, keeps a 128-bit mem
+;; operand out of a ymm/zmm instruction.
+(decl xmm_to_xmm_mem_256 (Xmm) XmmMem256)
+(extern constructor xmm_to_xmm_mem_256 xmm_to_xmm_mem_256)
+(decl xmm_to_xmm_mem_512 (Xmm) XmmMem512)
+(extern constructor xmm_to_xmm_mem_512 xmm_to_xmm_mem_512)
+(decl synthetic_amode_to_xmm_mem_256 (SyntheticAmode) XmmMem256)
+(extern constructor synthetic_amode_to_xmm_mem_256 synthetic_amode_to_xmm_mem_256)
+(decl synthetic_amode_to_xmm_mem_512 (SyntheticAmode) XmmMem512)
+(extern constructor synthetic_amode_to_xmm_mem_512 synthetic_amode_to_xmm_mem_512)
+(decl xmm_mem_256_to_xmm_mem (XmmMem256) XmmMem)
+(extern constructor xmm_mem_256_to_xmm_mem xmm_mem_256_to_xmm_mem)
+(decl xmm_mem_512_to_xmm_mem (XmmMem512) XmmMem)
+(extern constructor xmm_mem_512_to_xmm_mem xmm_mem_512_to_xmm_mem)
+(decl put_in_xmm_mem_256 (Value) XmmMem256)
+(extern constructor put_in_xmm_mem_256 put_in_xmm_mem_256)
+(decl put_low128_in_xmm_mem (Value) XmmMem128)
+(extern constructor put_low128_in_xmm_mem put_low128_in_xmm_mem)
+(decl wide_lane_mask_amode (Type u8 u8) SyntheticAmode)
+(extern constructor wide_lane_mask_amode wide_lane_mask_amode)
+(decl wide_sign_mask_amode (Type) SyntheticAmode)
+(extern constructor wide_sign_mask_amode wide_sign_mask_amode)
+(decl wide_abs_mask_amode (Type) SyntheticAmode)
+(extern constructor wide_abs_mask_amode wide_abs_mask_amode)
+(decl wide_ones_amode (Type) SyntheticAmode)
+(extern constructor wide_ones_amode wide_ones_amode)
+(decl put_in_xmm_mem_512 (Value) XmmMem512)
+(extern constructor put_in_xmm_mem_512 put_in_xmm_mem_512)
+(decl writable_xmm_to_xmm_mem_256 (WritableXmm) XmmMem256)
+(extern constructor writable_xmm_to_xmm_mem_256 writable_xmm_to_xmm_mem_256)
+(decl writable_xmm_to_xmm_mem_512 (WritableXmm) XmmMem512)
+(extern constructor writable_xmm_to_xmm_mem_512 writable_xmm_to_xmm_mem_512)
+
 ;; Put a value into a XMM.
 ;;
 ;; Asserts that the value goes into a XMM.
@@ -1294,6 +1373,8 @@
 
 (decl pure has_avx512f () bool)
 (extern constructor has_avx512f has_avx512f)
+(decl pure has_avx512bw () bool)
+(extern constructor has_avx512bw has_avx512bw)
 
 (decl pure has_avx512bitalg () bool)
 (extern constructor has_avx512bitalg has_avx512bitalg)
@@ -1309,6 +1390,16 @@
 
 (decl pure has_bmi2 () bool)
 (extern constructor has_bmi2 has_bmi2)
+
+;; pliron: gate for the `(bitmap >> x) & 1` -> `bt` fold; env
+;; PLIRON_X64_BITTAB=0 disables (enabled by default).
+(decl pure pliron_bittab () bool)
+(extern constructor pliron_bittab pliron_bittab)
+
+;; pliron: true when the value is not an `iconst` — guards the `emit_cmp`
+;; LHS-load swap so constants keep the RMI/imm slot.
+(decl pure pliron_not_iconst (Value) bool)
+(extern constructor pliron_not_iconst pliron_not_iconst)
 
 (decl pure use_popcnt () bool)
 (extern constructor use_popcnt use_popcnt)
@@ -1660,7 +1751,11 @@
 (rule 1 (x64_xor_vector $F128 x y) (x64_xorps x y))
 (rule 1 (x64_xor_vector $F32X4 x y) (x64_xorps x y))
 (rule 1 (x64_xor_vector $F64X2 x y) (x64_xorpd x y))
-(rule 0 (x64_xor_vector (multi_lane _ _) x y) (x64_pxor x y))
+;; PLIRON: 128-bit path only — wide vectors reaching this helper have no
+;; lowering rather than silently computing the low 128 bits.
+(rule 0 (x64_xor_vector ty @ (multi_lane _ _) x y)
+      (if-let true (u64_lt_eq (ty_bits_u64 ty) 128))
+      (x64_pxor x y))
 
 ;; Generates a register value which has an all-ones pattern.
 ;;
@@ -2482,6 +2577,23 @@
 (rule 0 (x64_test ty @ $I32 src1 (is_gpr_mem src2)) (x64_testl_mr (gpr_mem_32_for_ty ty src2) src1))
 (rule 0 (x64_test ty @ $I64 src1 (is_gpr_mem src2)) (x64_testq_mr (gpr_mem_64_for_ty ty src2) src1))
 
+;; Helper for `cmp` with a memory first operand (`cmp r/m, imm`). x64 has no
+;; mem,mem encodings, so the second operand is restricted to immediates; the
+;; `Type` is the width the comparison reads (the sunk load's own width), so
+;; signed and unsigned condition codes are both exact.
+(decl x64_cmp_mem (Type GprMem GprMemImm) ProducesFlags)
+
+;; Match 8-bit immediates first; allows a smaller instruction encoding.
+(rule 1 (x64_cmp_mem $I16 src1 (is_simm8 src2)) (x64_cmpw_mi_sxb (gpr_mem_16_for_ty $I16 src1) src2))
+(rule 1 (x64_cmp_mem $I32 src1 (is_simm8 src2)) (x64_cmpl_mi_sxb (gpr_mem_32_for_ty $I32 src1) src2))
+(rule 1 (x64_cmp_mem $I64 src1 (is_simm8 src2)) (x64_cmpq_mi_sxb (gpr_mem_64_for_ty $I64 src1) src2))
+
+;; Match the remaining immediates.
+(rule 0 (x64_cmp_mem $I8  src1 (is_imm8 src2))   (x64_cmpb_mi (gpr_mem_8_for_ty  $I8  src1) src2))
+(rule 0 (x64_cmp_mem $I16 src1 (is_imm16 src2)) (x64_cmpw_mi (gpr_mem_16_for_ty $I16 src1) src2))
+(rule 0 (x64_cmp_mem $I32 src1 (is_imm32 src2)) (x64_cmpl_mi (gpr_mem_32_for_ty $I32 src1) src2))
+(rule 0 (x64_cmp_mem $I64 src1 (is_simm32 src2))(x64_cmpq_mi (gpr_mem_64_for_ty $I64 src1) src2))
+
 ;; Helper for creating `ptest` instructions.
 (decl x64_ptest (Xmm XmmMem128) ProducesFlags)
 (rule (x64_ptest src1 src2) (x64_ptest_rm_or_avx src1 src2))
@@ -2956,6 +3068,11 @@
 (decl x64_pmaddubsw (Xmm XmmMem128) Xmm)
 (rule (x64_pmaddubsw src1 src2) (x64_pmaddubsw_a_or_avx src1 src2))
 
+;; PLIRON: SSE2 `psadbw` — per-8-byte-group sum of absolute byte differences;
+;; with a zero source it's the u8x16 -> u64x2 byte-sum reduction.
+(decl x64_psadbw (Xmm XmmMem128) Xmm)
+(rule (x64_psadbw src1 src2) (x64_psadbw_a_or_avx src1 src2))
+
 ;; AVX-VNNI `vpdpbusd acc, uns, sgn`: acc += dot(u8 lanes of `uns`, i8 lanes of
 ;; `sgn`) grouped 16->4. `acc` is the read-write accumulator.
 (decl x64_vpdpbusd (Xmm Xmm XmmMem128) Xmm)
@@ -3204,16 +3321,28 @@
 
 ;; Helper for creating `blsi` instructions.
 (decl x64_blsi (Type GprMem) Gpr)
+;; pliron: `blsrl` is used for `i8`/`i16` too — the low bits of `x & -x`
+;; depend only on the low bits of `x`, so truncation makes the widened
+;; form exact.
+(rule (x64_blsi ty @ $I8  src) (x64_blsil_vm (gpr_mem_as_gpr_mem_32_or_widened_in_reg ty src)))
+(rule (x64_blsi ty @ $I16 src) (x64_blsil_vm (gpr_mem_as_gpr_mem_32_or_widened_in_reg ty src)))
 (rule (x64_blsi ty @ $I32 src) (x64_blsil_vm (gpr_mem_32_for_ty ty src)))
 (rule (x64_blsi ty @ $I64 src) (x64_blsiq_vm (gpr_mem_64_for_ty ty src)))
 
 ;; Helper for creating `blsmsk` instructions.
 (decl x64_blsmsk (Type GprMem) Gpr)
+;; pliron: as for `blsi`, `x ^ (x-1)` is low-bit exact under a widened form.
+(rule (x64_blsmsk ty @ $I8  src) (x64_blsmskl_vm (gpr_mem_as_gpr_mem_32_or_widened_in_reg ty src)))
+(rule (x64_blsmsk ty @ $I16 src) (x64_blsmskl_vm (gpr_mem_as_gpr_mem_32_or_widened_in_reg ty src)))
 (rule (x64_blsmsk ty @ $I32 src) (x64_blsmskl_vm (gpr_mem_32_for_ty ty src)))
 (rule (x64_blsmsk ty @ $I64 src) (x64_blsmskq_vm (gpr_mem_64_for_ty ty src)))
 
 ;; Helper for creating `blsr` instructions.
 (decl x64_blsr (Type GprMem) Gpr)
+;; pliron: as for `blsi`, `x & (x-1)` is low-bit exact under a widened
+;; form — the borrow into the low bits depends only on the low bits.
+(rule (x64_blsr ty @ $I8  src) (x64_blsrl_vm (gpr_mem_as_gpr_mem_32_or_widened_in_reg ty src)))
+(rule (x64_blsr ty @ $I16 src) (x64_blsrl_vm (gpr_mem_as_gpr_mem_32_or_widened_in_reg ty src)))
 (rule (x64_blsr ty @ $I32 src) (x64_blsrl_vm (gpr_mem_32_for_ty ty src)))
 (rule (x64_blsr ty @ $I64 src) (x64_blsrq_vm (gpr_mem_64_for_ty ty src)))
 
@@ -3879,6 +4008,21 @@
 (rule 2 (is_nonzero (band _ a @ (value_type (ty_int (fits_in_64 ty))) b))
       (is_nonzero_band ty a b))
 
+;; A non-zero test of a sinkable load reads memory directly — `cmp $0, mem`
+;; — instead of materializing the value into a register for `test`. The
+;; `uextend` form covers `icmp ne (uextend byte), 0`: zero-extension means
+;; the extended value is nonzero exactly when the loaded bytes are.
+(rule 3 (is_nonzero (and (value_type (ty_int (fits_in_64 ty)))
+                         (sinkable_load_exact sl)))
+      (CondResult.CC (x64_cmp_mem ty (sink_load_to_gpr_mem sl)
+                                   (RegMemImm.Imm 0))
+                     (CC.NZ)))
+(rule 4 (is_nonzero (uextend _ (and (value_type (ty_int (fits_in_64 ty)))
+                                    (sinkable_load_exact sl))))
+      (CondResult.CC (x64_cmp_mem ty (sink_load_to_gpr_mem sl)
+                                   (RegMemImm.Imm 0))
+                     (CC.NZ)))
+
 ;; Like `is_nonzero` but with additional specializations for compare
 ;; operators. We break this out from `is_nonzero` because we want to
 ;; avoid unbounded recursion.
@@ -3916,6 +4060,42 @@
 ;; [1]: https://github.com/bytecodealliance/wasmtime/pull/11128#discussion_r2164888415
 (rule 2 (is_nonzero_band ty a b @ (i32_from_iconst _))
   (CondResult.CC (x64_test ty a b) (CC.NZ)))
+
+;; pliron: bit-table probe — `(bitmap >> x) & 1`. `bt` puts bit `x`
+;; of the bitmap operand into CF (the index is taken mod operand-
+;; width, matching CLIF's masked `ushr`), so the whole shr+test
+;; chain becomes one `bt` for any base — a constant table or the
+;; `select`-guarded form `is_whitespace` emits. Gated by
+;; pliron_bittab. `pliron_bt_idx` strips a `& (width-1)` mask off
+;; the index (Rust's `a >> b` masks the shift amount); `bt` takes
+;; the index mod the operand width anyway.
+(rule 3 (is_nonzero_band (ty_32_or_64 ty) (ushr _ k x) (u64_from_iconst 1))
+  (if-let true (pliron_bittab))
+  (CondResult.CC (x64_bt ty (put_in_gpr k) (pliron_bt_idx ty x)) (CC.B)))
+(rule 3 (is_nonzero_band (ty_32_or_64 ty) (u64_from_iconst 1) (ushr _ k x))
+  (if-let true (pliron_bittab))
+  (CondResult.CC (x64_bt ty (put_in_gpr k) (pliron_bt_idx ty x)) (CC.B)))
+;; pliron: the same probe through an `ireduce` — narrowing passes
+;; rewrite `band (ushr k x), 1` into `band (ireduce (ushr k x)), 1`,
+;; and bit 0 survives any ireduce. `bt`'s width is the ushr's, not
+;; the reduced band's.
+(rule 3 (is_nonzero_band ty (ireduce _ (ushr (ty_32_or_64 uty) k x)) (u64_from_iconst 1))
+  (if-let true (pliron_bittab))
+  (CondResult.CC (x64_bt uty (put_in_gpr k) (pliron_bt_idx uty x)) (CC.B)))
+(rule 3 (is_nonzero_band ty (u64_from_iconst 1) (ireduce _ (ushr (ty_32_or_64 uty) k x)))
+  (if-let true (pliron_bittab))
+  (CondResult.CC (x64_bt uty (put_in_gpr k) (pliron_bt_idx uty x)) (CC.B)))
+
+;; pliron: `bt` takes its bit index modulo the operand width, exactly
+;; like CLIF's masked shift semantics, so an explicit `band x,
+;; (width-1)` — possibly under a `uextend` — on the shift index is
+;; dead work. Strip it so `bt` can use the unmasked index register.
+(decl pliron_bt_idx (Type Value) Value)
+(rule 1 (pliron_bt_idx $I64 (uextend _ (band _ x (u64_from_iconst 63)))) x)
+(rule 1 (pliron_bt_idx $I64 (band _ x (u64_from_iconst 63))) x)
+(rule 1 (pliron_bt_idx $I32 (uextend _ (band _ x (u64_from_iconst 31)))) x)
+(rule 1 (pliron_bt_idx $I32 (band _ x (u64_from_iconst 31))) x)
+(rule (pliron_bt_idx _ x) x)
 
 ;; Helper to test whether the `u64` input has a single bit set, and if so
 ;; yields the bit position of where that bit is set. Used in the lowering of
@@ -3965,6 +4145,33 @@
 (rule 3 (emit_cmp cc (u64_from_iconst 0) b @ (value_type ty))
       (let ((b Gpr (put_in_reg b)))
         (CondResult.CC (x64_test ty b b) (intcc_swap_args cc))))
+
+;; pliron: x64 `cmp` only takes a memory operand on its right-hand side, so a
+;; sinkable `load` on the LHS of `icmp` can never fold into the compare: it
+;; is always materialized into a register first. Swap the comparison order —
+;; `cmp reg, [mem]` — and the condition code with it, which is a no-op for
+;; `eq`/`ne` (e.g. hashbrown's `*key == probe` candidate check) and still
+;; correct for ordered compares. Requires an actually-sinkable load so a
+;; non-sinkable LHS load doesn't steal the RMI slot from a sinkable RHS.
+;; Kept above the `is_nonzero` rewrites in priority but guarded so `b` stays
+;; in the RMI/imm slot when it's a constant (`cmp reg, imm` / `test` wins
+;; there); `i128` is excluded by `fits_in_64`.
+(rule 7 (emit_cmp cc a @ (and (sinkable_load_exact sl)
+                            (value_type (ty_int (fits_in_64 ty))))
+                  b)
+      (if-let true (pliron_not_iconst b))
+      (CondResult.CC (x64_cmp ty (put_in_gpr b) (sink_load_to_gpr_mem_imm sl))
+                     (intcc_swap_args cc)))
+
+;; pliron: against a constant the swapped form isn't needed — `cmp r/m, imm`
+;; compares the memory operand directly at the icmp's own width (the
+;; condition code stays put: `mem - imm` produces the same flags as the
+;; loaded value would). Constants too wide for the encoding fall through to
+;; the register form.
+(rule 8 (emit_cmp cc a @ (and (sinkable_load_exact sl)
+                            (value_type (ty_int (fits_in_64 ty))))
+                  b @ (simm32_from_value b_imm))
+      (CondResult.CC (x64_cmp_mem ty (sink_load_to_gpr_mem sl) b_imm) cc))
 
 ;; For I128 values (held in two GPRs), the instruction sequences depend on what
 ;; kind of condition is tested.
@@ -4302,6 +4509,11 @@
 (decl shuffle_0_31_mask (VecMask) VCodeConstant)
 (extern constructor shuffle_0_31_mask shuffle_0_31_mask)
 
+;; PLIRON: constant 0x00FF per 16-bit lane, used by the `imul.i8x16`
+;; lowering to mask each even-byte product to its low byte.
+(decl mask_00ff () VCodeConstant)
+(extern constructor mask_00ff mask_00ff)
+
 ;; Produce a mask suitable for use with `pshufb` for permuting the lhs of a
 ;; `shuffle` operation (lanes 0-15).
 (decl shuffle_0_15_mask (VecMask) VCodeConstant)
@@ -4502,12 +4714,16 @@
 (convert Value XmmMemAlignedImm32  put_in_xmm_mem_aligned_imm_32)
 (convert Value XmmMemAlignedImm64  put_in_xmm_mem_aligned_imm_64)
 (convert Value XmmMemAlignedImm128 put_in_xmm_mem_aligned_imm_128)
+(convert Value XmmMem256         put_in_xmm_mem_256)
+(convert Value XmmMem512         put_in_xmm_mem_512)
 
 (convert Xmm XmmMem8     xmm_to_xmm_mem_8)
 (convert Xmm XmmMem16    xmm_to_xmm_mem_16)
 (convert Xmm XmmMem32    xmm_to_xmm_mem_32)
 (convert Xmm XmmMem64    xmm_to_xmm_mem_64)
 (convert Xmm XmmMem128   xmm_to_xmm_mem_128)
+(convert Xmm XmmMem256   xmm_to_xmm_mem_256)
+(convert Xmm XmmMem512   xmm_to_xmm_mem_512)
 (convert Xmm XmmMemAligned8   xmm_to_xmm_mem_aligned_8)
 (convert Xmm XmmMemAligned16  xmm_to_xmm_mem_aligned_16)
 (convert Xmm XmmMemAligned32  xmm_to_xmm_mem_aligned_32)
@@ -4529,6 +4745,8 @@
 (convert XmmMem32    XmmMem xmm_mem_32_to_xmm_mem)
 (convert XmmMem64    XmmMem xmm_mem_64_to_xmm_mem)
 (convert XmmMem128   XmmMem xmm_mem_128_to_xmm_mem)
+(convert XmmMem256   XmmMem xmm_mem_256_to_xmm_mem)
+(convert XmmMem512   XmmMem xmm_mem_512_to_xmm_mem)
 (convert XmmMemAligned8   XmmMemAligned xmm_mem_aligned_8_to_xmm_mem_aligned)
 (convert XmmMemAligned16  XmmMemAligned xmm_mem_aligned_16_to_xmm_mem_aligned)
 (convert XmmMemAligned32  XmmMemAligned xmm_mem_aligned_32_to_xmm_mem_aligned)
@@ -4606,6 +4824,8 @@
 (convert SyntheticAmode XmmMem32          synthetic_amode_to_xmm_mem_32)
 (convert SyntheticAmode XmmMem64          synthetic_amode_to_xmm_mem_64)
 (convert SyntheticAmode XmmMem128         synthetic_amode_to_xmm_mem_128)
+(convert SyntheticAmode XmmMem256         synthetic_amode_to_xmm_mem_256)
+(convert SyntheticAmode XmmMem512         synthetic_amode_to_xmm_mem_512)
 (convert SyntheticAmode XmmMemAligned128  synthetic_amode_to_xmm_mem_aligned_128)
 
 (convert Amode GprMem8           amode_to_gpr_mem_8)
@@ -4629,6 +4849,8 @@
 (convert WritableGpr GprMem32 writable_gpr_to_gpr_mem_32)
 (convert WritableGpr GprMem64 writable_gpr_to_gpr_mem_64)
 (convert WritableXmm XmmMem128         writable_xmm_to_xmm_mem_128)
+(convert WritableXmm XmmMem256         writable_xmm_to_xmm_mem_256)
+(convert WritableXmm XmmMem512         writable_xmm_to_xmm_mem_512)
 (convert WritableXmm XmmMemAligned128  writable_xmm_to_xmm_mem_aligned_128)
 
 ;; Sized `XmmMem{N} -> XmmMemAligned{N}` bridges: if the operand is a

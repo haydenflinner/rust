@@ -116,7 +116,31 @@ macro_rules! isle_lower_prelude_methods {
 
         #[inline]
         fn put_in_reg(&mut self, val: Value) -> Reg {
-            self.put_in_regs(val).only_reg().unwrap()
+            let regs = self.put_in_regs(val);
+            regs.only_reg().unwrap_or_else(|| {
+                let f = self.lower_ctx.f;
+                let mut users = alloc::string::String::new();
+                for b in f.layout.blocks() {
+                    for i in f.layout.block_insts(b) {
+                        if f.dfg
+                            .inst_args(i)
+                            .iter()
+                            .any(|&a| f.dfg.resolve_aliases(a) == val)
+                        {
+                            users += &format!("  {} in {:?}\n", f.dfg.display_inst(i), b);
+                        }
+                    }
+                }
+                panic!(
+                    "put_in_reg: {:?} (ty {:?}, def {:?}) has {} regs in {}\nusers:\n{}",
+                    val,
+                    self.lower_ctx.value_ty(val),
+                    f.dfg.value_def(val),
+                    regs.len(),
+                    f.name,
+                    users
+                )
+            })
         }
 
         #[inline]
@@ -129,6 +153,27 @@ macro_rules! isle_lower_prelude_methods {
             (off..list.len(&self.lower_ctx.dfg().value_lists))
                 .map(|ix| {
                     let val = list.get(ix, &self.lower_ctx.dfg().value_lists).unwrap();
+                    self.put_in_regs(val)
+                })
+                .collect()
+        }
+
+        /// PLIRON (`PLIRON_NARROWEXT`): like `put_in_regs_vec`, used only
+        /// for `return` operands. A narrow `ireduce` operand whose
+        /// source is already uext-clean (`narrow_ret_uext_clean`) yields
+        /// the *source's* registers: the ireduce then has no remaining
+        /// uses and never materialises its `uxtb`/`uxth` (LLVM likewise
+        /// returns the raw producer register; the ABI's uext-on-retval
+        /// contract still holds because the source is clean). A dirty or
+        /// multi-reg source keeps the identity — the ireduce
+        /// materialises once, as before. Identity when the backend's
+        /// oracle says not clean, so the default (feature off) build is
+        /// unaffected.
+        fn put_in_regs_vec_ret(&mut self, (list, off): ValueSlice) -> ValueRegsVec {
+            (off..list.len(&self.lower_ctx.dfg().value_lists))
+                .map(|ix| {
+                    let val = list.get(ix, &self.lower_ctx.dfg().value_lists).unwrap();
+                    let val = crate::machinst::isle::ret_ireduce_src(self, val);
                     self.put_in_regs(val)
                 })
                 .collect()
@@ -560,6 +605,12 @@ macro_rules! isle_lower_prelude_methods {
             let input = self.lower_ctx.get_value_as_source_or_const(val);
 
             if let InputSourceInst::UniqueUse(inst, _) = input.inst {
+                // A pending post-index fusion claims this inst: its
+                // writeback result is defined by the fused emit at the
+                // inst's own position, so it must not be sunk into us.
+                if self.lower_ctx.is_pending_postindex_cand(inst) {
+                    return None;
+                }
                 Some(inst)
             } else {
                 None
@@ -605,7 +656,9 @@ macro_rules! isle_lower_prelude_methods {
 
         /// Generate the return instruction.
         fn gen_return(&mut self, rets: &ValueRegsVec) {
-            self.lower_ctx.gen_return(rets);
+            let backend = self.backend;
+            self.lower_ctx
+                .gen_return(rets, &mut |ctx, v| backend.narrow_ret_uext_clean(ctx, v));
         }
 
         fn gen_call_output(&mut self, sig_ref: SigRef) -> ValueRegsVec {
@@ -613,11 +666,25 @@ macro_rules! isle_lower_prelude_methods {
         }
 
         fn gen_call_args(&mut self, sig: Sig, inputs: &ValueRegsVec) -> CallArgList {
-            self.lower_ctx.gen_call_args(sig, inputs)
+            let backend = self.backend;
+            let skip = self.lower_ctx.call_arg_uext_skips(
+                inputs,
+                backend.arg_uext_skip_bits(),
+                &mut |ctx, v| backend.narrow_arg_uext_clean(ctx, v),
+            );
+            self.lower_ctx
+                .gen_call_args(sig, inputs, skip.as_deref().unwrap_or(&[]))
         }
 
         fn gen_return_call_args(&mut self, sig: Sig, inputs: &ValueRegsVec) -> CallArgList {
-            self.lower_ctx.gen_return_call_args(sig, inputs)
+            let backend = self.backend;
+            let skip = self.lower_ctx.call_arg_uext_skips(
+                inputs,
+                backend.arg_uext_skip_bits(),
+                &mut |ctx, v| backend.narrow_arg_uext_clean(ctx, v),
+            );
+            self.lower_ctx
+                .gen_return_call_args(sig, inputs, skip.as_deref().unwrap_or(&[]))
         }
 
         fn gen_call_rets(&mut self, sig: Sig, outputs: &ValueRegsVec) -> CallRetList {
@@ -666,10 +733,34 @@ macro_rules! isle_lower_prelude_methods {
             let continuation = labels.next().unwrap();
             assert_eq!(labels.next(), None);
 
+            // If the normal-return destination is a block containing only
+            // a single `trap` (and the edge carries no block arguments),
+            // the trap can be emitted inline right after the call rather
+            // than jumping to the block. Trap-only blocks are treated as
+            // cold by the block-ordering pass and always sink, so the jump
+            // would never be elided as a fallthrough.
+            let continuation_trap = {
+                let f = self.lower_ctx.f;
+                let nbc = f.dfg.exception_tables[et].normal_return();
+                let nb = nbc.block(&f.dfg.value_lists);
+                let mut insts = f.layout.block_insts(nb);
+                match (insts.next(), insts.next()) {
+                    (Some(i), None)
+                        if f.dfg.insts[i].opcode() == crate::ir::Opcode::Trap
+                            && nbc.args(&f.dfg.value_lists).next().is_none() =>
+                    {
+                        f.dfg.insts[i].trap_code()
+                    }
+                    _ => None,
+                }
+            };
+
             let exception_handlers = exception_handlers.into_boxed_slice();
 
             Some(TryCallInfo {
                 continuation,
+                continuation_trap,
+                continuation_elide: false,
                 exception_handlers,
             })
         }
@@ -774,8 +865,27 @@ macro_rules! isle_lower_prelude_methods {
             targets.len() as u32
         }
 
+        fn jump_table_default_dead(&mut self, jt: JumpTable) -> bool {
+            static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+                std::env::var("PLIRON_SWITCH_KEEPDEAD").as_deref() != Ok("0")
+            });
+            if !*ON {
+                return false;
+            }
+            let f = self.lower_ctx.f;
+            let b = f.dfg.jump_tables[jt].default_block().block(&f.dfg.value_lists);
+            f.layout.first_inst(b).is_some_and(|i| {
+                matches!(f.dfg.insts[i], InstructionData::Trap { code, .. }
+                    if code == crate::ir::TrapCode::unwrap_user(2))
+            })
+        }
+
         fn value_is_unused(&mut self, val: Value) -> bool {
             self.lower_ctx.value_is_unused(val)
+        }
+
+        fn value_has_multiple_uses(&mut self, val: Value) -> bool {
+            self.lower_ctx.value_has_multiple_uses(val)
         }
 
         fn block_exn_successor_label(&mut self, block: &Block, exn_succ: u64) -> MachLabel {
@@ -822,6 +932,34 @@ pub fn shuffle_imm_as_le_lane_idx(size: u8, bytes: &[u8]) -> Option<u8> {
     // immediate to specify a lane of `size` bytes. The index, when viewed as
     // `size`-byte immediates, will be the first byte divided by the byte size.
     Some(bytes[0] / size)
+}
+
+/// PLIRON (`PLIRON_NARROWEXT`): the `ireduce` operand a narrow `return`
+/// operand may be replaced by — its clean single-reg source — or `val`
+/// itself when the sink is not legal (non-ireduce, dirty or >64-bit
+/// source, oracle off). See `put_in_regs_vec_ret`.
+pub(crate) fn ret_ireduce_src<I, B>(ctx: &mut IsleContext<'_, '_, I, B>, val: Value) -> Value
+where
+    I: VCodeInst,
+    B: LowerBackend<MInst = I>,
+{
+    let f = ctx.lower_ctx.f;
+    let val = f.dfg.resolve_aliases(val);
+    let crate::ir::ValueDef::Result(inst, _) = f.dfg.value_def(val) else {
+        return val;
+    };
+    if f.dfg.insts[inst].opcode() != crate::ir::Opcode::Ireduce {
+        return val;
+    }
+    let src = f.dfg.resolve_aliases(f.dfg.inst_args(inst)[0]);
+    if f.dfg.value_type(src).bits() > 64 {
+        return val;
+    }
+    if ctx.backend.narrow_ret_uext_clean(ctx.lower_ctx, src) {
+        src
+    } else {
+        val
+    }
 }
 
 /// This structure is used to implement the ISLE-generated `Context` trait and

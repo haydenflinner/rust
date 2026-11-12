@@ -89,3 +89,93 @@ pub extern "C" fn fmt_len(x: u32) -> u32 {
     write!(w, "x={x} f={:.3}", x as f64 / 7.0).unwrap();
     w.1 as u32
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn eq_bytes_check(x: u32) -> u32 {
+    // raw_eq / compare_bytes with constant n: inline chunked equality
+    // must match at every chunk width (8/4/2/1) and odd tails.
+    let mut a = [0u8; 33];
+    for (i, v) in a.iter_mut().enumerate() {
+        *v = (i as u32).wrapping_mul(x).rotate_left((i % 13) as u32) as u8;
+    }
+    let mut b = a;
+    let mut hits = 0u32;
+    // compare_bytes, dynamic n: all-equal prefixes.
+    for flip in 0..33usize {
+        if a[..=flip] == b[..=flip] {
+            hits += 1;
+        }
+    }
+    // compare_bytes, constant n: inline equal scans.
+    if a[..1] == b[..1] {
+        hits += 1;
+    }
+    if a[..7] == b[..7] {
+        hits += 1;
+    }
+    if a[..16] == b[..16] {
+        hits += 1;
+    }
+    if a[..31] == b[..31] {
+        hits += 1;
+    }
+    // constant n, non-equal: the slow-path branch returns ordering.
+    b[5] ^= 0x5a;
+    if a[..6] != b[..6] {
+        hits += 1;
+    }
+    if a[..5] == b[..5] {
+        hits += 1;
+    }
+    b[5] = a[5];
+    // raw_eq n=32 (inline cap): equal and one-byte-different.
+    let a32: &[u8; 32] = a[..32].try_into().unwrap();
+    let b32: &[u8; 32] = b[..32].try_into().unwrap();
+    if a32 == b32 {
+        hits += 1;
+    }
+    let mut c = *a32;
+    c[31] ^= 1;
+    if *a32 != c {
+        hits += 1;
+    }
+    // raw_eq n=33 (> cap): libcall path still works.
+    if a == b {
+        hits += 1;
+    }
+    // ordering via memcmp: a < c2 where c2 differs only at the last byte.
+    let mut c2 = a;
+    c2[32] = c2[32].wrapping_add(1);
+    if a[..] < c2[..] {
+        hits += 1;
+    }
+    hits
+}
+
+static mut ADLER_BUF: [u8; 16384] = [0; 16384];
+
+/// Dual-accumulator byte loop under volatile perturb writes: `wpeep`'s
+/// keep-on-stack pass used to hoist a surviving `local.get` below an
+/// escaping `local.tee` copy here, reordering the operand stack so the
+/// loop-exit `i32.ne` compared the checksum (not the pointer) against the
+/// end — the loop ran off the end of memory.
+#[unsafe(no_mangle)]
+pub extern "C" fn adler32(reps: u32) -> u32 {
+    let mut acc = 0u32;
+    for r in 0..reps {
+        unsafe {
+            let i = (r as usize) & 15;
+            core::ptr::write_volatile(&raw mut ADLER_BUF[i], r as u8);
+        }
+        acc = acc.wrapping_add(core::hint::black_box({
+            let t = unsafe { &ADLER_BUF[..] };
+            let (mut a, mut b) = (1u32, 0u32);
+            for &x in t {
+                a = (a + x as u32) % 65521;
+                b = (b + a) % 65521;
+            }
+            (b << 16) | a
+        }));
+    }
+    acc
+}

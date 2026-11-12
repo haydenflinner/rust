@@ -59,9 +59,9 @@ impl<'a, 'tcx> BackendTypes for Builder<'a, 'tcx> {
     type Value = Value;
     type Type = TypeHandle;
     type FunctionSignature = TypeHandle;
-    type DIScope = ();
-    type DILocation = ();
-    type DIVariable = ();
+    type DIScope = u32;
+    type DILocation = u32;
+    type DIVariable = u32;
 }
 
 impl<'a, 'tcx> HasTyCtxt<'tcx> for Builder<'a, 'tcx> {
@@ -109,8 +109,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     fn push(&mut self, op: Ptr<Operation>) -> Option<Value> {
         let ctx = self.cx.pctx.borrow();
         op.insert_at_back(self.block, &ctx);
+        let l = self.cx.dbg_cur.get();
+        if l != 0 {
+            use pliron::location::Located;
+            op.deref_mut(&ctx).set_loc(pliron::location::Location::Dbg(l));
+        }
         let o = op.deref(&ctx);
-        (o.get_num_results() > 0).then(|| o.get_result(0))
+        (o.get_num_results() > 0).then(|| o.get_result(&ctx, 0))
     }
 
     fn mk_op<T: Op>(&mut self, f: impl FnOnce(&mut Context) -> T) -> Ptr<Operation> {
@@ -132,11 +137,41 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
     }
 
-    fn mark_volatile(&mut self, volatile: bool) {
+    pub(crate) fn mark_volatile(&mut self, volatile: bool) {
         if volatile {
             use pliron::linked_list::ContainsLinkedList;
             let tail = self.block.deref(&self.cx.pctx.borrow()).get_tail().unwrap();
             self.st.borrow_mut().volatile.insert(tail);
+        }
+    }
+
+    /// The current block's tail op, if any.
+    pub(crate) fn tail_op(&mut self) -> Option<Ptr<Operation>> {
+        use pliron::linked_list::ContainsLinkedList;
+        self.block.deref(&self.cx.pctx.borrow()).get_tail()
+    }
+
+    /// Mark every op appended to the current block after `prev` (`None`
+    /// marks all of them) volatile. Shared helpers like
+    /// `OperandValue::store` emit several ops without threading the flag
+    /// through, so the tail-only `mark_volatile` is not enough.
+    pub(crate) fn mark_ops_volatile(&mut self, prev: Option<Ptr<Operation>>) {
+        use pliron::linked_list::ContainsLinkedList;
+        let cx = self.cx.pctx.borrow();
+        let mut mark = prev.is_none();
+        let mut ops = Vec::new();
+        for op in self.block.deref(&*cx).iter(&*cx) {
+            if mark {
+                ops.push(op);
+            }
+            if Some(op) == prev {
+                mark = true;
+            }
+        }
+        drop(cx);
+        let mut st = self.st.borrow_mut();
+        for op in ops {
+            st.volatile.insert(op);
         }
     }
 
@@ -150,6 +185,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     }
 
     /// Integer op that carries (empty) overflow flags, as the printer requires.
+    // r[impl front.ir.noflags]
     fn binf<T: pliron_llvm::op_interfaces::IntBinArithOpWithOverflowFlag>(
         &mut self,
         a: Value,
@@ -191,21 +227,36 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         args: &[Value],
         exts: Exts,
     ) -> Value {
-        let callable = match self.cval(callee) {
+        let (callable, callee_sym) = match self.cval(callee) {
             Some(ConstVal::Sym { sym, off: 0 }) if self.st.borrow().funcs.contains_key(&sym) => {
-                CallOpCallable::Direct(self.ident(&sym))
+                (CallOpCallable::Direct(self.ident(&sym)), Some(sym))
             }
-            _ => CallOpCallable::Indirect(callee),
+            _ => (CallOpCallable::Indirect(callee), None),
         };
         let p = {
             let mut c = self.cx.pctx.borrow_mut();
             let fty = TypedHandle::<FuncType>::from_handle(fn_ty, &c).unwrap();
             CallOp::new(&mut c, callable, fty, args.to_vec()).get_operation()
         };
-        self.st
-            .borrow_mut()
-            .calls
-            .insert(p, CallInfo { fn_ty, exts, foreign: false, cc: None, tail: false });
+        self.st.borrow_mut().calls.insert(
+            p,
+            CallInfo {
+                fn_ty,
+                exts,
+                foreign: false,
+                cc: None,
+                tail: false,
+                nocap: None,
+                sret_nocap: false,
+                arg_extent: None,
+                arg_noalias: None,
+                arg_byval_ro: None,
+                arg_ro: None,
+                bb: false,
+                callee: callee_sym,
+                noret: false,
+            },
+        );
         self.st.borrow_mut().last_call = Some(p);
         let ret = match self.kind(fn_ty) {
             TyK::Func(r, ..) => r,
@@ -220,6 +271,22 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         self.declare_fn_sym(sym, fty, cranelift_module::Linkage::Import, Exts::default());
         let f = self.sym_addr(sym);
         self.call_raw(fty, f, args, Exts::default())
+    }
+
+    /// `call_sym` to a never-defined `__pliron_bb*` barrier symbol. The
+    /// bodiless callee is opaque to every pliron pass (nowrite marks the
+    /// caller writing, nocapture captures the args, retarg can't fold the
+    /// result); `lower.rs` sees the flag and emits the CLIF `black_box`
+    /// op — a `~{memory}` clobber emitting zero machine instructions —
+    /// instead of a call. wasm lowers CallOps to real wasm calls, so it
+    /// must not take this path.
+    pub fn call_bb(&mut self, sym: &str, ret: TypeHandle, args: &[Value]) -> Value {
+        let v = self.call_sym(sym, ret, args);
+        let mut st = self.st.borrow_mut();
+        if let Some(p) = st.last_call {
+            st.calls.get_mut(p).unwrap().bb = true;
+        }
+        v
     }
 
     fn parent_fn(&self) -> Ptr<Operation> {
@@ -246,9 +313,12 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let mut ctx = cx.pctx.borrow_mut();
         let f = Operation::get_op::<FuncOp>(llfn, &ctx).unwrap();
         if f.get_entry_block(&ctx).is_none() {
+            // A new body: until rustc sets one, its ops have no location
+            // (not the previous function's).
+            cx.dbg_cur.set(0);
             return f.get_or_create_entry_block(&mut ctx);
         }
-        let region = llfn.deref(&ctx).get_region(0);
+        let region = llfn.deref(&ctx).get_region(&ctx, 0);
         let bb = BasicBlock::new(&mut ctx, None, vec![]);
         bb.insert_at_back(region, &ctx);
         bb
@@ -289,6 +359,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
     }
 
+    // r[impl front.ir.switch]
     fn switch(
         &mut self,
         v: Value,
@@ -301,7 +372,10 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
         let ty = self.val_ty(v);
         // wasm.rs has no SwitchOp lowering; it gets the compare chain.
-        if crate::pass_enabled("PLIRON_SWITCH") && !self.cx.tcx.sess.target.is_like_wasm {
+        if crate::pass_enabled("PLIRON_SWITCH")
+            && (!self.cx.tcx.sess.target.is_like_wasm
+                || crate::pass_enabled("PLIRON_SWITCH_WASM"))
+        {
             let w = self.int_width(ty) as usize;
             let cases = {
                 let c = self.cx.pctx.borrow();
@@ -342,6 +416,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
     }
 
+    // r[impl front.eh.invoke]
     fn invoke(
         &mut self,
         llty: TypeHandle,
@@ -529,6 +604,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
     }
 
+    // r[impl front.ir.align]
     fn alloca(&mut self, size: Size, align: Align) -> Value {
         let arr = self.type_array(self.type_i8(), size.bytes());
         let one = self.const_i32(1);
@@ -547,7 +623,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 .get_head()
                 .expect("function has no entry block");
             op.insert_at_front(entry, &ctx);
-            op.deref(&ctx).get_result(0)
+            op.deref(&ctx).get_result(&ctx, 0)
         };
         self.st
             .borrow_mut()
@@ -779,7 +855,23 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             IntSLT => ICmpPredicateAttr::SLT,
             IntSLE => ICmpPredicateAttr::SLE,
         };
-        self.mk(|c| ICmpOp::new(c, p, a, b))
+        let r = self.mk(|c| ICmpOp::new(c, p, a, b));
+        // `x != null` for a later `assume` (rustc's `assume_nonnull`, e.g.
+        // building a `NonNull`): see `ne_null` and `assume`. `x == null`
+        // is recorded too — an `assume` of its `not` (`assume(!x.is_null())`)
+        // means the same.
+        if matches!(op, IntNE | IntEQ) {
+            let zero = |v: Value| self.cx.const_to_opt_uint(v) == Some(0);
+            let x = if zero(b) { Some(a) } else if zero(a) { Some(b) } else { None };
+            if let (Some(x), Some(cop)) = (x, r.defining_op()) {
+                if matches!(op, IntNE) {
+                    self.st.borrow_mut().ne_null.insert(cop, x);
+                } else {
+                    self.st.borrow_mut().eq_null.insert(cop, x);
+                }
+            }
+        }
+        r
     }
     fn fcmp(&mut self, op: RealPredicate, a: Value, b: Value) -> Value {
         use RealPredicate::*;
@@ -852,22 +944,25 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk(|c| SelectOp::new(c, cond, then_val, else_val))
     }
 
+    // r[impl front.abi.va-layout]
     fn va_arg(&mut self, list: Value, ty: TypeHandle) -> Value {
         // SysV `__va_list_tag`: the cursor lives in `overflow_arg_area` (+8);
         // gp/fp offsets are exhausted so every type takes the overflow path.
         // Each argument sits in an 8-byte slot aligned to its alignment (capped
         // at 16), matching the packing in the call lowering and what a foreign
         // callee's va_arg decodes from a forwarded VaList.
-        let (size, align) = crate::types::size_align(&self.cx.pctx.borrow(), ty);
+        let wasm = self.tcx().sess.target.is_like_wasm;
+        let ctx = self.cx.pctx.borrow();
+        let (size, align) = crate::types::size_align(&ctx, ty);
+        // wasm C ABI: the slot holds a pointer to a caller-side copy for
+        // aggregates other than single-element structs (va_indirect).
+        let indirect = wasm && crate::types::va_indirect(&ctx, ty);
+        drop(ctx);
         let ptr = self.type_ptr();
         let isize = self.type_isize();
         let i8t = self.type_i8();
-        // wasm's va_list is an opaque pointer: the place itself is the cursor.
-        let cur_off = if self.tcx().sess.target.is_like_wasm {
-            0
-        } else {
-            8
-        };
+        // The cursor's offset in the platform va_list (see `va_start`).
+        let cur_off = if va_kind(self.tcx()) == VaKind::SysV { 8 } else { 0 };
         let cur_slot = if cur_off == 0 {
             list
         } else {
@@ -875,14 +970,33 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         };
         let cur_p = self.load(ptr, cur_slot, Align::EIGHT);
         let cur = self.ptrtoint(cur_p, isize);
-        let a_eff = align.clamp(8, 16);
+        // SysV: 8-byte slots, align clamped to [8,16]. wasm (BasicCABI):
+        // 4-byte slots at the arg's natural alignment; the indirect case
+        // reads a wasm32 pointer from a 4-byte slot.
+        let (a_eff, sz) = if wasm {
+            (
+                if indirect { 4 } else { align.max(1) },
+                if indirect {
+                    4
+                } else {
+                    crate::types::align_to(size, 4)
+                },
+            )
+        } else {
+            (align.clamp(8, 16), size.max(8).next_multiple_of(8))
+        };
         let a1 = self.const_usize(a_eff - 1);
         let mask = self.const_usize(!(a_eff - 1));
         let cur_a1 = self.add(cur, a1);
         let aligned = self.and(cur_a1, mask);
         let p = self.inttoptr(aligned, ptr);
-        let v = self.load(ty, p, Align::from_bytes(align).unwrap());
-        let sz = self.const_usize(size.max(8).next_multiple_of(8));
+        let v = if indirect {
+            let rp = self.load(ptr, p, Align::from_bytes(4).unwrap());
+            self.load(ty, rp, Align::from_bytes(align.max(4)).unwrap())
+        } else {
+            self.load(ty, p, Align::from_bytes(align).unwrap())
+        };
+        let sz = self.const_usize(sz);
         let next = self.add(aligned, sz);
         let next = self.inttoptr(next, ptr);
         self.store(next, cur_slot, Align::EIGHT);
@@ -923,6 +1037,13 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn resume(&mut self, exn0: Value, _exn1: Value) {
         let void = self.type_void();
         self.call_sym("_Unwind_Resume", void, &[exn0]);
+        // Declared noreturn by every unwinder (libgcc, libunwind).
+        {
+            let mut st = self.st.borrow_mut();
+            if let Some(p) = st.last_call {
+                st.calls.get_mut(p).unwrap().noret = true;
+            }
+        }
         self.unreachable();
     }
     // Wasm funclets map onto our emulated EH (see wasm.rs): an unwind in
@@ -964,6 +1085,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         *funclet
     }
 
+    // r[impl front.ir.atomics]
     fn atomic_cmpxchg(
         &mut self,
         dst: Value,
@@ -1011,10 +1133,17 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         };
         let p = {
             let mut c = self.cx.pctx.borrow_mut();
-            AtomicRmwOp::new(&mut c, dst, src, kind, ord(order), SyncScopeAttr::System)
-                .get_operation()
+            AtomicRmwOp::new(
+                &mut c,
+                dst,
+                src,
+                kind.clone(),
+                ord(order),
+                SyncScopeAttr::System,
+            )
+            .get_operation()
         };
-        self.st.borrow_mut().rmw.insert(p, op);
+        self.st.borrow_mut().rmw.insert(p, kind);
         self.push(p).unwrap()
     }
 
@@ -1026,9 +1155,29 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk_op(|c| FenceOp::new(c, ord(order), s));
     }
 
-    fn set_invariant_load(&mut self, _load: Value) {}
-    fn lifetime_start(&mut self, _ptr: Value, _size: Size) {}
-    fn lifetime_end(&mut self, _ptr: Value, _size: Size) {}
+    fn set_invariant_load(&mut self, load: Value) {
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG)
+        {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::frozen", "invariant.load {load:?}")
+            };
+        }
+        if let Some(op) = load.defining_op() {
+            self.st.borrow_mut().invariant.insert(op);
+        }
+    }
+    // StorageLive/Dead reach us as lifetime markers; slotmerge consumes them
+    // for exact stack-slot intervals (they emit no machine code).
+    // r[impl front.ir.lifetime]
+    fn lifetime_start(&mut self, ptr: Value, size: Size) {
+        let n = self.const_usize(size.bytes());
+        self.intrinsic("llvm.lifetime.start", self.type_void(), &[n, ptr]);
+    }
+    fn lifetime_end(&mut self, ptr: Value, size: Size) {
+        let n = self.const_usize(size.bytes());
+        self.intrinsic("llvm.lifetime.end", self.type_void(), &[n, ptr]);
+    }
 
     fn call(
         &mut self,
@@ -1057,13 +1206,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                     && matches!(i.def, rustc_middle::ty::InstanceKind::Item(_)) =>
             {
                 let foreign = self.tcx.is_foreign_item(i.def_id())
-                    || self
-                        .tcx
-                        .codegen_fn_attrs(i.def_id())
-                        .flags
-                        .contains(
-                            rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NAKED,
-                        );
+                    || self.tcx.codegen_fn_attrs(i.def_id()).flags.contains(
+                        rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::NAKED,
+                    );
                 let cc = match self.tcx.fn_sig(i.def_id()).skip_binder().abi() {
                     rustc_abi::ExternAbi::Win64 { .. } => {
                         Some(cranelift_codegen::isa::CallConv::WindowsFastcall)
@@ -1074,12 +1219,190 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             }
             _ => (false, None),
         };
+        // `extern "tail"` calls — including indirect ones through tail fn
+        // pointers, where the callee is unknown — use Cranelift's tail CC.
+        let cc = cc.or_else(|| {
+            fn_abi
+                .is_some_and(|a| a.conv == rustc_abi::CanonAbi::RustTail)
+                .then_some(cranelift_codegen::isa::CallConv::Tail)
+        });
+        // Per-operand `captures(none)` deduced from the callee's MIR — the
+        // same `DeducedParamAttrs` data rustc applies to `PassMode::Indirect`
+        // params for LLVM. It is only sound for by-value (Indirect) params:
+        // the analysis ignores `*_k` uses and `move`/`copy` of the param
+        // value, so for `&mut`/`&` (Direct) params a function that returns
+        // or stores the pointer reports `captures_none` anyway. A pointer
+        // the callee can't retain is a bounded use, not a function-end
+        // escape, for slotmerge. Walk `fn_abi.args` in operand order
+        // (Ignore = 0, Pair and unsized-indirect = 2, Cast = pad + 1,
+        // else 1); `full[0]` is the sret pointer when the return is indirect.
+        let deduced: &[rustc_middle::middle::deduced_param_attrs::DeducedParamAttrs] =
+            match instance {
+                Some(i)
+                    if matches!(i.def, ty::InstanceKind::Item(_))
+                        && fn_abi.is_some_and(|a| a.conv.is_rustic_abi()) =>
+                {
+                    self.tcx.deduced_param_attrs(i.def_id())
+                }
+                _ => &[],
+            };
+        let env = ty::TypingEnv::fully_monomorphized();
+        let mut nc = vec![false; full.len()];
+        let mut exts = vec![(0u64, 0u64); full.len()];
+        let mut nals = vec![false; full.len()];
+        let mut ros = vec![false; full.len()];
+        let mut roas = vec![false; full.len()];
+        let (mut any_nc, mut any_ex, mut any_nal, mut any_ro, mut any_roa) =
+            (false, false, false, false, false);
+        let mut sret_cap = false;
+        if let Some(abi) = fn_abi {
+            use rustc_target::callconv::PassMode;
+            let mut j = usize::from(return_slot.is_indirect());
+            // The sret out-pointer's reachable range is the return layout —
+            // what LLVM's `sret` attr encodes (dereferenceable size/align).
+            if return_slot.is_indirect() {
+                let e = (
+                    abi.ret.layout.size.bytes(),
+                    abi.ret.layout.align.abi.bytes(),
+                );
+                exts[0] = e;
+                any_ex |= e.0 > 0;
+                // `deduced[0]` is the return place: a non-captured sret
+                // pointer is a bounded write into the caller's slot, so
+                // slotprom can sync fields around the call rather than
+                // pinning the out-buffer to memory. It must NOT join
+                // `nocap`: SROA's copyable_arg reads a nocap mark as "a
+                // fresh copy is unobservable" and would hand the callee a
+                // copy of the out-buffer — the return never lands.
+                sret_cap = deduced
+                    .get(0)
+                    .is_some_and(|d| d.captures_none(self.tcx, env, abi.ret.layout.ty));
+            }
+            for (ai, a) in abi.args.iter().enumerate() {
+                let n = match &a.mode {
+                    PassMode::Ignore => 0,
+                    PassMode::Pair(..) => 2,
+                    PassMode::Indirect { .. } => 1,
+                    PassMode::IndirectUnsized { .. } => 2,
+                    PassMode::Cast { pad_i32_count, .. } => usize::from(*pad_i32_count) + 1,
+                    PassMode::Direct(_) => 1,
+                };
+                let cap = matches!(a.mode, PassMode::Indirect { .. } | PassMode::IndirectUnsized { .. })
+                    && deduced
+                        .get(ai + 1)
+                        .is_some_and(|d| d.captures_none(self.tcx, env, a.layout.ty));
+                // A by-value (Indirect, Rust ABI) param the callee never
+                // writes through — what LLVM gets as `readonly`. memcpyopt
+                // may then pass the caller's local itself instead of the
+                // argument copy (`PLIRON_BYVALHOME`).
+                let ro = matches!(a.mode, PassMode::Indirect { mode: rustc_target::callconv::IndirectMode::Pointer, .. })
+                    && deduced
+                        .get(ai + 1)
+                        .is_some_and(|d| d.read_only(self.tcx, env, a.layout.ty));
+                // `readonly` from the param's own attrs — rustc stamps it
+                // on frozen `&T` (`PointerKind::SharedRef`, together with
+                // `noalias` and `captures_readonly`) and inserts it into
+                // Indirect attrs from `deduced`. A `&T` operand marked here
+                // is a bounded read of the pointee for memcpyopt's tmp
+                // cone (`&mut T` is writable; `&Cell<T>` never freezes).
+                let roa: &[bool] = match &a.mode {
+                    PassMode::Direct(attrs)
+                    | PassMode::Indirect { attrs, .. }
+                    | PassMode::IndirectUnsized { attrs, .. } => &[attrs
+                        .regular
+                        .contains(rustc_target::callconv::ArgAttribute::ReadOnly)],
+                    PassMode::Pair(a0, a1) => &[
+                        a0.regular
+                            .contains(rustc_target::callconv::ArgAttribute::ReadOnly),
+                        a1.regular
+                            .contains(rustc_target::callconv::ArgAttribute::ReadOnly),
+                    ],
+                    _ => &[],
+                };
+                // The `(size, align)` range the callee may legally reach
+                // through this operand: a ref's pointee layout, or the
+                // whole arg for Indirect. Raw pointers are excluded —
+                // `slice.as_mut_ptr()` legally covers the whole buffer,
+                // not `size_of::<u8>()`. SROA pins just this range of a
+                // caller alloca, keeping the arg pointer's alignment.
+                //
+                // For `Direct` args rustc already computes `pointee_size`/
+                // `pointee_align` — what LLVM's `dereferenceable` gets —
+                // which also covers niche-wrapped refs (`Option<&mut T>`)
+                // and scalar-ABI'd single-pointer structs like
+                // `{&RandomState}` closure envs. Raw pointers and plain
+                // scalars keep `Size(0)` and are filtered out.
+                let ext = match &a.mode {
+                    PassMode::Indirect { .. } => {
+                        Some((a.layout.size.bytes(), a.layout.align.abi.bytes()))
+                    }
+                    PassMode::Direct(attrs) => {
+                        let n = attrs.pointee_size.bytes();
+                        (n > 0).then(|| (n, attrs.pointee_align.map_or(1, |a| a.bytes())))
+                    }
+                    _ => None,
+                };
+                // rustc's own `noalias` mark on `&mut`/`&`-frozen/Box params.
+                // The borrow it carries ends when the call returns, so the
+                // callee cannot legally touch the pointee through a retained
+                // copy afterwards — SROA syncs pinned slices around the call.
+                let na: &[bool] = match &a.mode {
+                    PassMode::Direct(attrs)
+                    | PassMode::Indirect { attrs, .. }
+                    | PassMode::IndirectUnsized { attrs, .. } => &[attrs
+                        .regular
+                        .contains(rustc_target::callconv::ArgAttribute::NoAlias)],
+                    PassMode::Pair(a0, a1) => &[
+                        a0.regular
+                            .contains(rustc_target::callconv::ArgAttribute::NoAlias),
+                        a1.regular
+                            .contains(rustc_target::callconv::ArgAttribute::NoAlias),
+                    ],
+                    _ => &[],
+                };
+                for k in 0..n {
+                    if j + k >= full.len() {
+                        break;
+                    }
+                    if cap {
+                        nc[j + k] = true;
+                    }
+                    if let Some(e) = ext {
+                        exts[j + k] = e;
+                    }
+                    if na.get(k).copied().unwrap_or(false) {
+                        nals[j + k] = true;
+                    }
+                    if ro {
+                        ros[j + k] = true;
+                    }
+                    if roa.get(k).copied().unwrap_or(false) {
+                        roas[j + k] = true;
+                    }
+                }
+                any_nc |= cap;
+                any_ex |= ext.is_some_and(|e| e.0 > 0);
+                any_nal |= na.iter().any(|b| *b);
+                any_ro |= ro;
+                any_roa |= roa.iter().any(|b| *b);
+                j += n;
+            }
+        }
         let lc = self.st.borrow().last_call;
         if let Some(p) = lc {
             let mut st = self.st.borrow_mut();
-            let info = st.calls.get_mut(&p).unwrap();
+            let info = st.calls.get_mut(p).unwrap();
             info.foreign = foreign;
             info.cc = cc;
+            info.nocap = any_nc.then(|| nc.into_boxed_slice());
+            info.sret_nocap = sret_cap;
+            info.arg_extent = any_ex.then(|| exts.into_boxed_slice());
+            info.arg_noalias = any_nal.then(|| nals.into_boxed_slice());
+            info.arg_byval_ro = any_ro.then(|| ros.into_boxed_slice());
+            info.arg_ro = any_roa.then(|| roas.into_boxed_slice());
+            // rustc's `noreturn` (rustc_codegen_llvm `apply_attrs_llfn`): the
+            // return layout is uninhabited, so the call cannot come back.
+            info.noret = fn_abi.is_some_and(|a| a.ret.layout.is_uninhabited());
         }
         v
     }
@@ -1109,7 +1432,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         // skipped by the terminator logic once `return_call` is emitted.
         let lc = self.st.borrow().last_call;
         if let Some(p) = lc {
-            self.st.borrow_mut().calls.get_mut(&p).unwrap().tail = true;
+            self.st.borrow_mut().calls.get_mut(p).unwrap().tail = true;
         }
         match self.kind(llty) {
             TyK::Func(ret, ..) if matches!(self.kind(ret), TyK::Void) => self.ret_void(),
@@ -1128,7 +1451,7 @@ impl<'a, 'tcx> AbiBuilderMethods for Builder<'a, 'tcx> {
             .unwrap()
             .get_entry_block(&ctx)
             .unwrap();
-        entry.deref(&ctx).get_argument(index)
+        entry.deref(&ctx).get_argument(&ctx, index)
     }
 }
 
@@ -1152,10 +1475,7 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let b = next(self);
                 OperandValue::Pair(a, b).store(self, dst);
             }
-            PassMode::Indirect {
-                meta_attrs: Some(_),
-                ..
-            } => {
+            PassMode::IndirectUnsized { .. } => {
                 let a = next(self);
                 let b = next(self);
                 OperandValue::Ref(rustc_codegen_ssa::mir::place::PlaceValue {
@@ -1166,9 +1486,7 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 .store(self, dst);
             }
             PassMode::Direct(_)
-            | PassMode::Indirect {
-                meta_attrs: None, ..
-            }
+            | PassMode::Indirect { .. }
             | PassMode::Cast { .. } => {
                 if let PassMode::Cast { pad_i32_count, .. } = arg_abi.mode {
                     for _ in 0..pad_i32_count {
@@ -1190,9 +1508,7 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         use rustc_target::callconv::PassMode;
         match &arg_abi.mode {
             PassMode::Ignore => {}
-            PassMode::Indirect {
-                meta_attrs: None, ..
-            } => {
+            PassMode::Indirect { .. } => {
                 let place = PlaceRef::new_sized(val, arg_abi.layout);
                 OperandValue::Ref(place.val).store(self, dst);
             }
@@ -1223,6 +1539,7 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> CoverageInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
+    // r[impl front.ignored]
     fn add_coverage(
         &mut self,
         _instance: Instance<'tcx>,
@@ -1234,48 +1551,61 @@ impl<'a, 'tcx> CoverageInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
 impl<'a, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn dbg_scope_fn(
         &mut self,
-        _instance: Instance<'tcx>,
+        instance: Instance<'tcx>,
         _fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
-        _llfn: Option<Ptr<Operation>>,
-    ) {
+        llfn: Option<Ptr<Operation>>,
+    ) -> u32 {
+        self.cx.dbg_scope_fn(instance, llfn.is_some())
     }
-    fn dbg_create_lexical_block(&mut self, _pos: rustc_span::BytePos, _parent: ()) {}
-    fn dbg_location_clone_with_discriminator(&mut self, _loc: (), _d: u32) -> Option<()> {
-        Some(())
+    fn dbg_create_lexical_block(&mut self, _pos: rustc_span::BytePos, parent: u32) -> u32 {
+        self.cx.dbg_block(parent)
     }
-    fn dbg_loc(&mut self, _scope: (), _inlined_at: Option<()>, _span: Span) {}
-    fn extend_scope_to_file(&mut self, _scope: (), _file: &rustc_span::SourceFile) {}
+    fn dbg_location_clone_with_discriminator(&mut self, loc: u32, _d: u32) -> Option<u32> {
+        Some(loc)
+    }
+    fn dbg_loc(&mut self, scope: u32, inlined_at: Option<u32>, span: Span) -> u32 {
+        self.cx.dbg_loc(scope, inlined_at, span)
+    }
+    fn extend_scope_to_file(&mut self, scope: u32, _file: &rustc_span::SourceFile) -> u32 {
+        scope
+    }
     fn create_dbg_var(
         &mut self,
-        _name: rustc_span::Symbol,
-        _ty: Ty<'tcx>,
-        _scope: (),
-        _kind: rustc_codegen_ssa::mir::debuginfo::VariableKind,
-        _span: Span,
-    ) {
+        name: rustc_span::Symbol,
+        ty: Ty<'tcx>,
+        scope: u32,
+        kind: rustc_codegen_ssa::mir::debuginfo::VariableKind,
+        span: Span,
+    ) -> u32 {
+        self.cx.dbg_var(name, ty, scope, kind, span)
     }
     fn dbg_var_addr(
         &mut self,
-        _dbg_var: (),
-        _dbg_loc: (),
-        _variable_alloca: Value,
-        _direct_offset: Size,
-        _indirect_offsets: &[Size],
-        _fragment: &Option<std::ops::Range<Size>>,
+        dbg_var: u32,
+        dbg_loc: u32,
+        variable_alloca: Value,
+        direct_offset: Size,
+        indirect_offsets: &[Size],
+        fragment: &Option<std::ops::Range<Size>>,
     ) {
+        self.cx.dbg_declare(dbg_var, dbg_loc, variable_alloca, direct_offset, indirect_offsets, fragment)
     }
     fn dbg_var_value(
         &mut self,
-        _dbg_var: (),
-        _dbg_loc: (),
+        _dbg_var: u32,
+        _dbg_loc: u32,
         _value: Value,
         _direct_offset: Size,
         _indirect_offsets: &[Size],
         _fragment: &Option<std::ops::Range<Size>>,
     ) {
     }
-    fn set_dbg_loc(&mut self, _dbg_loc: ()) {}
-    fn clear_dbg_loc(&mut self) {}
+    fn set_dbg_loc(&mut self, dbg_loc: u32) {
+        self.cx.dbg_cur.set(dbg_loc);
+    }
+    fn clear_dbg_loc(&mut self) {
+        self.cx.dbg_cur.set(0);
+    }
     fn insert_reference_to_gdb_debug_scripts_section_global(&mut self) {}
     fn set_var_name(&mut self, _value: Value, _name: &str) {}
 }
@@ -1298,5 +1628,28 @@ impl<'a, 'tcx> AsmBuilderMethods<'tcx> for Builder<'a, 'tcx> {
 impl<'a, 'tcx> StaticBuilderMethods for Builder<'a, 'tcx> {
     fn get_static(&mut self, def_id: rustc_hir::def_id::DefId) -> Value {
         self.cx.get_static_addr(def_id)
+    }
+}
+
+/// The platform `va_list` shape (core's `VaListInner` for the target), as
+/// `va_start` initializes it and `va_arg` finds the stack cursor in it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VaKind {
+    /// x86-64 SysV `__va_list_tag`; cursor `overflow_arg_area` at +8.
+    SysV,
+    /// AAPCS64 `va_list`; cursor `__stack` at +0.
+    Aapcs64,
+    /// A bare pointer that is itself the cursor.
+    Ptr,
+}
+
+pub(crate) fn va_kind(tcx: rustc_middle::ty::TyCtxt<'_>) -> VaKind {
+    let t = &tcx.sess.target;
+    use rustc_target::spec::{Arch, Os};
+    let plain = !t.is_like_windows && t.os != Os::Uefi;
+    match t.arch {
+        Arch::X86_64 if plain => VaKind::SysV,
+        Arch::AArch64 if plain && !t.is_like_darwin => VaKind::Aapcs64,
+        _ => VaKind::Ptr,
     }
 }

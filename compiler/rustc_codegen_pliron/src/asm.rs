@@ -4,8 +4,9 @@
 //! register/stack-slot allocator and wrapper generator are adapted here,
 //! MIT/Apache-2.0): every `asm!` becomes an out-of-line function that loads
 //! its inputs from a stack buffer, runs the template and stores the outputs
-//! back. The module's asm text is assembled by the system assembler and merged
-//! into the CGU object (see `lib.rs`).
+//! back. The module's asm text is assembled in-process by rsasm and merged
+//! into the CGU object (`pliron-clif-lower/src/objmerge.rs`); no external
+//! assembler runs.
 
 use std::fmt::Write;
 
@@ -15,7 +16,7 @@ use rustc_abi::{Align, Size};
 use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
 use rustc_codegen_ssa::MemFlags;
 use rustc_codegen_ssa::traits::*;
-use rustc_data_structures::fx::FxHashMap;
+use rustc_hash::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::interpret::Scalar as ConstScalar;
 use rustc_middle::ty::layout::LayoutOf;
@@ -58,6 +59,7 @@ impl<'tcx> CodegenCx<'tcx> {
                         .span_fatal(span, "unsupported asm symbol operand")
                 };
                 let off = o + off.bytes() as i64;
+                let sym = self.asm_sym(&sym);
                 if off != 0 {
                     format!("{sym}{off:+}")
                 } else {
@@ -68,12 +70,21 @@ impl<'tcx> CodegenCx<'tcx> {
     }
 
     fn asm_tls_sym(&self, def_id: DefId) -> String {
-        self.tcx
-            .symbol_name(Instance::mono(self.tcx, def_id))
-            .name
-            .to_string()
+        self.asm_sym(self.tcx.symbol_name(Instance::mono(self.tcx, def_id)).name)
     }
 
+    /// A symbol as asm source names it: with the object format's global
+    /// prefix (`_` on Mach-O), as LLVM's MC names are. `objmerge` maps
+    /// such raw names back onto the object writer's unprefixed ones.
+    pub(crate) fn asm_sym(&self, name: &str) -> String {
+        if self.tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::MachO {
+            format!("_{name}")
+        } else {
+            name.to_string()
+        }
+    }
+
+    // r[impl front.asm.syntax]
     pub fn push_global_asm(
         &self,
         template: &[InlineAsmTemplatePiece],
@@ -90,9 +101,13 @@ impl<'tcx> CodegenCx<'tcx> {
         if intel {
             s.push_str(".intel_syntax noprefix\n");
         }
+        // Templates are LLVM-flavored: `$$` is a literal `$`, which GAS
+        // intel-syntax treats as an immediate sigil rsasm doesn't know —
+        // keep it for AT&T immediates, drop it in intel mode.
+        let imm_sigil = if intel { "" } else { "$" };
         for piece in template {
             match piece {
-                InlineAsmTemplatePiece::String(t) => s.push_str(t),
+                InlineAsmTemplatePiece::String(t) => s.push_str(&t.replace("$$", imm_sigil)),
                 InlineAsmTemplatePiece::Placeholder {
                     operand_idx, span, ..
                 } => match operands[*operand_idx] {
@@ -118,46 +133,396 @@ impl<'tcx> CodegenCx<'tcx> {
     /// `link_name = "llvm.*"` intrinsics used by `core::arch`/`std_detect`.
     /// A few are implemented in assembly; the rest become weak stubs that
     /// trap if they're ever executed, so crates still build.
+    // r[impl front.intrinsic.stub]
     pub fn llvm_intrinsic_stub(&self, name: &str) -> String {
-        let sym: String = format!(
-            "__pliron_{}",
-            name.chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect::<String>()
-        );
         let mut st = self.st.borrow_mut();
+        let san: String = name
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        // COFF weak linkage needs COMDAT machinery; a per-module-unique name
+        // dedups the same way since nothing external defines these.
+        let coff =
+            self.tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Coff;
+        let sym = if coff {
+            st.counter += 1;
+            let cgu: String = st
+                .cgu
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            format!(
+                "__pliron_{}_{:x}_{cgu}_{}",
+                san,
+                self.tcx
+                    .stable_crate_id(rustc_hir::def_id::LOCAL_CRATE)
+                    .as_u64(),
+                st.counter
+            )
+        } else {
+            format!("__pliron_{san}")
+        };
         if !st.llvm_stubs.insert(sym.clone()) {
             return sym;
         }
         let x86 = matches!(self.tcx.sess.asm_arch, Some(InlineAsmArch::X86_64));
+        // Win64 integer args: rcx, rdx, r8 (SysV: rdi, rsi, rdx).
+        let win64 = x86
+            && self.tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Coff;
+        let fmt = self.tcx.sess.target.options.binary_format;
         let body = match name {
+            "llvm.x86.xgetbv" if x86 && win64 => {
+                "    xgetbv\n    shl rdx, 32\n    or rax, rdx\n    ret\n".to_string()
+            }
             "llvm.x86.xgetbv" if x86 => {
                 "    mov ecx, edi\n    xgetbv\n    shl rdx, 32\n    or rax, rdx\n    ret\n"
+                    .to_string()
             }
-            "llvm.x86.rdtsc" if x86 => "    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    ret\n",
+            "llvm.x86.rdtsc" if x86 => "    rdtsc\n    shl rdx, 32\n    or rax, rdx\n    ret\n".into(),
+            "pliron.clmul64" if x86 && win64 => {
+                "    movq xmm0, rcx\n    movq xmm1, rdx\n    pclmulqdq xmm0, xmm1, 0\n    movdqu [r8], xmm0\n    ret\n".into()
+            }
             "pliron.clmul64" if x86 => {
-                "    movq xmm0, rdi\n    movq xmm1, rsi\n    pclmulqdq xmm0, xmm1, 0\n    movdqu [rdx], xmm0\n    ret\n"
+                "    movq xmm0, rdi\n    movq xmm1, rsi\n    pclmulqdq xmm0, xmm1, 0\n    movdqu [rdx], xmm0\n    ret\n".into()
             }
-            "llvm.x86.sse2.pause" if x86 => "    pause\n    ret\n",
-            "llvm.x86.avx.vzeroupper" if x86 => "    vzeroupper\n    ret\n",
-            "llvm.x86.avx.vzeroall" if x86 => "    vzeroall\n    ret\n",
-            "llvm.x86.sse2.lfence" if x86 => "    lfence\n    ret\n",
-            "llvm.x86.sse2.mfence" if x86 => "    mfence\n    ret\n",
-            "llvm.x86.sse.sfence" if x86 => "    sfence\n    ret\n",
+            "llvm.x86.sse2.pause" if x86 => "    pause\n    ret\n".into(),
+            "llvm.x86.avx.vzeroupper" if x86 => "    vzeroupper\n    ret\n".into(),
+            "llvm.x86.avx.vzeroall" if x86 => "    vzeroall\n    ret\n".into(),
+            "llvm.x86.sse2.lfence" if x86 => "    lfence\n    ret\n".into(),
+            "llvm.x86.sse2.mfence" if x86 => "    mfence\n    ret\n".into(),
+            "llvm.x86.sse.sfence" if x86 => "    sfence\n    ret\n".into(),
             // A prefetch is only a hint, so doing nothing is a valid lowering.
-            n if n.starts_with("llvm.prefetch") => "    ret\n",
-            _ if x86 => "    ud2\n",
-            _ => "    brk #0x1\n",
+            n if n.starts_with("llvm.prefetch") => "    ret\n".into(),
+            _ if x86 => "    ud2\n".into(),
+            _ => aarch64_stub_body(name).unwrap_or_else(|| "    brk #0x1\n".to_string()),
         };
-        let syntax = if x86 { ".intel_syntax noprefix\n" } else { "" };
-        let back = if x86 { ".att_syntax\n" } else { "" };
+        push_stub(&mut st.asm, fmt, x86, &sym, &body);
+        sym
+    }
+}
+
+/// Weak hidden asm stub shared by `llvm.*` intrinsics etc. `body` is
+/// arch syntax (Intel flavor on x86 — the wrappers toggle
+/// `noprefix`/`att` around it).
+fn push_stub(
+    asm: &mut String,
+    fmt: rustc_target::spec::BinaryFormat,
+    x86: bool,
+    sym: &str,
+    body: &str,
+) {
+    use rustc_target::spec::BinaryFormat::*;
+    let syntax = if x86 { ".intel_syntax noprefix\n" } else { "" };
+    let back = if x86 { ".att_syntax\n" } else { "" };
+    if fmt == MachO {
         write!(
-            st.asm,
+            asm,
+            ".section __TEXT,__text,regular,pure_instructions\n.weak_definition {sym}\n.private_extern {sym}\n{sym}:\n{syntax}{body}{back}"
+        )
+        .unwrap();
+    } else if fmt == Coff {
+        write!(asm, ".text\n.globl {sym}\n{sym}:\n{syntax}{body}{back}").unwrap();
+    } else {
+        write!(
+            asm,
             ".section .text.{sym},\"ax\",@progbits\n.weak {sym}\n.hidden {sym}\n.type {sym},@function\n{sym}:\n{syntax}{body}{back}.size {sym}, .-{sym}\n.text\n"
         )
         .unwrap();
-        sym
     }
+}
+
+/// Real bodies for `llvm.aarch64.*` intrinsics that get executed on arm64
+/// (e.g. the NEON ops used by memchr); anything unknown still traps.
+/// Vector args arrive in v0, v1 and the result leaves in v0 per AAPCS64.
+fn aarch64_stub_body(name: &str) -> Option<String> {
+    match name {
+        "llvm.aarch64.isb" => return Some("    isb\n    ret\n".into()),
+        "llvm.aarch64.dmb" => return Some("    dmb ish\n    ret\n".into()),
+        "llvm.aarch64.dsb" => return Some("    dsb ish\n    ret\n".into()),
+        _ => {}
+    }
+    // FEAT_SHA1/SHA256/SHA512/AES (`llvm.aarch64.crypto.*`): sha2's and
+    // aes's hardware paths. Operands arrive in AAPCS order — vectors in
+    // v0..v2, sha1c/p/m's scalar `e` in w0 — and each body is the
+    // instruction on those registers (rsasm doesn't know the crypto
+    // mnemonics; words from clang -march=armv8.2-a+crypto+sha3).
+    if let Some(op) = name.strip_prefix("llvm.aarch64.crypto.") {
+        let words: &[u32] = match op {
+            "sha256h" => &[0x5e024020],    // sha256h q0, q1, v2.4s
+            "sha256h2" => &[0x5e025020],   // sha256h2 q0, q1, v2.4s
+            "sha256su0" => &[0x5e282820],  // sha256su0 v0.4s, v1.4s
+            "sha256su1" => &[0x5e026020],  // sha256su1 v0.4s, v1.4s, v2.4s
+            "sha1c" => &[0x1e270010, 0x5e010200], // fmov s16, w0; sha1c q0, s16, v1.4s
+            "sha1p" => &[0x1e270010, 0x5e011200], // fmov s16, w0; sha1p q0, s16, v1.4s
+            "sha1m" => &[0x1e270010, 0x5e012200], // fmov s16, w0; sha1m q0, s16, v1.4s
+            "sha1h" => &[0x1e270000, 0x5e280800, 0x1e260000], // fmov s0, w0; sha1h s0, s0; fmov w0, s0
+            "sha1su0" => &[0x5e023020],    // sha1su0 v0.4s, v1.4s, v2.4s
+            "sha1su1" => &[0x5e281820],    // sha1su1 v0.4s, v1.4s
+            "aese" => &[0x4e284820],       // aese v0.16b, v1.16b
+            "aesd" => &[0x4e285820],       // aesd v0.16b, v1.16b
+            "aesmc" => &[0x4e286800],      // aesmc v0.16b, v0.16b
+            "aesimc" => &[0x4e287800],     // aesimc v0.16b, v0.16b
+            "sha512h" => &[0xce628020],    // sha512h q0, q1, v2.2d
+            "sha512h2" => &[0xce628420],   // sha512h2 q0, q1, v2.2d
+            "sha512su0" => &[0xcec08020],  // sha512su0 v0.2d, v1.2d
+            "sha512su1" => &[0xce628820],  // sha512su1 v0.2d, v1.2d, v2.2d
+            _ => return None,
+        };
+        let mut body = String::new();
+        for w in words {
+            body.push_str(&format!("    .word 0x{w:08x}\n"));
+        }
+        body.push_str("    ret\n");
+        return Some(body);
+    }
+    // crc32b/h/w/x (IEEE) and crc32cb/ch/cw/cx (Castagnoli): crc in w0,
+    // data in w1 (x/cx take x1), result in w0. rsasm doesn't know the
+    // CRC32 mnemonics, so emit the encoding for `crc32* w0, w0, w1/x1`
+    // as a word: 0x1ac14000 | sz<<10 | C<<12 | sf<<31.
+    if let Some(sz) = name
+        .strip_prefix("llvm.aarch64.crc32c")
+        .or_else(|| name.strip_prefix("llvm.aarch64.crc32"))
+    {
+        let sz_i = match sz {
+            "b" => 0u32,
+            "h" => 1,
+            "w" => 2,
+            "x" => 3,
+            _ => return None,
+        };
+        let c = name.contains("crc32c") as u32;
+        let sf = (sz_i == 3) as u32;
+        let word = 0x1ac14000 | (sz_i << 10) | (c << 12) | (sf << 31);
+        return Some(format!("    .word 0x{word:08x}\n    ret\n"));
+    }
+    // Scalar/vector float rounding intrinsics surface as `llvm.<op>.<ty>`
+    // (e.g. `llvm.roundeven.v4f32`); each maps to one FRINT* form.
+    if let Some(s) = name.strip_prefix("llvm.") {
+        if let Some((op, ty)) = s.rsplit_once('.') {
+            let frint = match op {
+                "rint" => "frintx",
+                "nearbyint" => "frinti",
+                "floor" => "frintm",
+                "ceil" => "frintp",
+                "trunc" => "frintz",
+                "round" => "frinta",
+                "roundeven" => "frintn",
+                _ => "",
+            };
+            if !frint.is_empty() {
+                let ops = match ty {
+                    "f16" => "h0",
+                    "f32" => "s0",
+                    "f64" => "d0",
+                    "v4f16" => "v0.4h",
+                    "v8f16" => "v0.8h",
+                    "v2f32" => "v0.2s",
+                    "v4f32" => "v0.4s",
+                    "v2f64" => "v0.2d",
+                    _ => return None,
+                };
+                return Some(format!("    {frint} {ops}, {ops}\n    ret\n"));
+            }
+        }
+    }
+    let vec_suf = |ty: &str| -> Option<&'static str> {
+        Some(match ty {
+            "v16i8" => "16b",
+            "v8i8" => "8b",
+            "v8i16" => "8h",
+            "v4i16" => "4h",
+            "v4i32" => "4s",
+            "v2i32" => "2s",
+            "v2i64" => "2d",
+            "v1i64" => "1d",
+            "v4f32" => "4s",
+            "v2f32" => "2s",
+            "v2f64" => "2d",
+            "v8f16" => "8h",
+            "v4f16" => "4h",
+            _ => return None,
+        })
+    };
+    // `llvm.fptoui.sat.<ret>.<arg>` / `fptosi.sat` are saturating
+    // FCVTZU/FCVTZS; the scalar forms write a GPR while vectors stay in v0.
+    if let Some(s) = name
+        .strip_prefix("llvm.fptoui.sat.")
+        .or_else(|| name.strip_prefix("llvm.fptosi.sat."))
+    {
+        let cv = if name.contains("fptoui") { "fcvtzu" } else { "fcvtzs" };
+        let (ret, arg) = s.split_once('.')?;
+        if let Some(suf) = vec_suf(arg) {
+            return Some(format!("    {cv} v0.{suf}, v0.{suf}\n    ret\n"));
+        }
+        let (d, a) = match (ret, arg) {
+            ("i32", "f16") => ("w0", "h0"),
+            ("i32", "f32") => ("w0", "s0"),
+            ("i32", "f64") => ("w0", "d0"),
+            ("i64", "f16") => ("x0", "h0"),
+            ("i64", "f32") => ("x0", "s0"),
+            ("i64", "f64") => ("x0", "d0"),
+            _ => return None,
+        };
+        return Some(format!("    {cv} {d}, {a}\n    ret\n"));
+    }
+    let rest = name.strip_prefix("llvm.aarch64.neon.")?;
+    let (op, ty) = rest.rsplit_once('.')?;
+    // Reductions carry a scalar-type infix (`faddv.f32.v4f32`); widening and
+    // narrowing ops carry the *result* arrangement (`uaddlp.v8i16.v16i8`).
+    let (op, res_ty) = match op.split_once('.') {
+        Some((o, r)) => (o, Some(r)),
+        None => (op, None),
+    };
+    let suf = vec_suf(ty)?;
+    // Widening pairwise ops: `uaddlp v0.8h, v0.16b` (single input in v0),
+    // `uadalp v0.4s, v1.8h` (wide accumulator v0, narrow input v1).
+    if matches!(op, "uaddlp" | "saddlp" | "uadalp" | "sadalp") {
+        let wide = vec_suf(res_ty?)?;
+        let src = if op.ends_with("alp") { "v1" } else { "v0" };
+        return Some(format!("    {op} v0.{wide}, {src}.{suf}\n    ret\n"));
+    }
+    // Saturating narrows (`sqxtn`/`uqxtn`/`sqxtun`): the name's suffix is the
+    // destination arrangement; the source lanes are twice as wide.
+    if matches!(op, "sqxtn" | "uqxtn" | "sqxtun") {
+        let (d, s) = match suf {
+            "8b" => ("8b", "8h"),
+            "4h" => ("4h", "4s"),
+            "2s" => ("2s", "2d"),
+            _ => return None,
+        };
+        return Some(format!("    {op} v0.{d}, v0.{s}\n    ret\n"));
+    }
+    // Saturating shift-right narrows (`*shrn` narrow signed, `*shrun` narrow
+    // to unsigned): the shift count is the first *integer* arg, so it lands
+    // in w0 while the vector is in v0 — integer and vector args use separate
+    // banks. Broadcast its negation and shift; SRSHL/URSHL handle the
+    // rounding variants without a bias-add overflow corner case.
+    const SHRN: &[(&str, &str, &str)] = &[
+        ("sqshrn", "sshl", "sqxtn"),
+        ("sqrshrn", "srshl", "sqxtn"),
+        ("uqshrn", "ushl", "uqxtn"),
+        ("uqrshrn", "urshl", "uqxtn"),
+        ("sqshrun", "sshl", "sqxtun"),
+        ("sqrshrun", "srshl", "sqxtun"),
+        ("uqshrun", "ushl", "uqxtn"),
+        ("uqrshrun", "urshl", "uqxtn"),
+    ];
+    if let Some(&(_, sh, xt)) = SHRN.iter().find(|(n, ..)| *n == op) {
+        let (d, s, g) = match suf {
+            "8b" => ("8b", "8h", "w0"),
+            "4h" => ("4h", "4s", "w0"),
+            "2s" => ("2s", "2d", "x0"),
+            _ => return None,
+        };
+        return Some(format!(
+            "    dup v1.{s}, {g}\n    neg v1.{s}, v1.{s}\n    {sh} v0.{s}, v0.{s}, v1.{s}\n    {xt} v0.{d}, v0.{s}\n    ret\n"
+        ));
+    }
+    // 3-vector ops (elementwise and pairwise share the same encoding shape).
+    const BINARY: &[&str] = &[
+        "addp", "smaxp", "sminp", "umaxp", "uminp", "srhadd", "urhadd", "shadd", "uhadd", "sqadd",
+        "uqadd", "sqsub", "uqsub", "sshl", "ushl", "srshl", "urshl", "sqshl", "uqshl", "sqrshl",
+        "uqrshl", "sabd", "uabd", "saba", "uaba", "mls", "mla", "pmul", "sqdmulh", "sqrdmulh",
+        "cmeq", "cmge", "cmgt",
+        "cmhs", "cmhi", "cmtst", "fadd", "fsub", "fmul", "fdiv", "fmla", "fmls", "fmax", "fmin",
+        "fmaxnm", "fminnm", "faddp", "fmaxp", "fminp", "fmaxnmp", "fminnmp", "fcmeq", "fcmge",
+        "fcmgt", "facge", "facgt", "fabd", "frecps", "frsqrts",
+    ];
+    if BINARY.contains(&op) {
+        return Some(format!("    {op} v0.{suf}, v0.{suf}, v1.{suf}\n    ret\n"));
+    }
+    // Byte-table lookups (v16i8 only): tbl takes its table in v0..v{n-1} and
+    // the indices in the last arg; tbx is the same but v0 is the passthru
+    // destination, so the table is v1..v{n}.
+    if let Some(n) = op
+        .strip_prefix("tbl")
+        .or_else(|| op.strip_prefix("tbx"))
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| (1..=4).contains(&n))
+    {
+        if suf != "16b" {
+            return None;
+        }
+        if op.starts_with("tbl") {
+            let tbl = (0..n)
+                .map(|r| format!("v{r}.16b"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Some(format!("    tbl v0.16b, {{{tbl}}}, v{n}.16b\n    ret\n"));
+        }
+        let tbl = (1..=n)
+            .map(|r| format!("v{r}.16b"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!(
+            "    tbx v0.16b, {{{tbl}}}, v{}.16b\n    ret\n",
+            n + 1
+        ));
+    }
+    // 2-vector unary ops. The fcvt* converts share one arrangement between
+    // the int and fp suffixes (v4i32/v4f32 are both .4s), so the arg suffix
+    // works for both operands.
+    const UNARY: &[&str] = &[
+        "abs", "sqabs", "neg", "sqneg", "cls", "clz", "cnt", "rbit", "rev16", "rev32", "rev64",
+        "urecpe", "ursqrte", "fabs", "fneg", "fsqrt", "frinti", "frintm", "frintn", "frintp",
+        "frintx", "frintz", "frecpe", "frsqrte", "fcvtas", "fcvtau", "fcvtms", "fcvtmu",
+        "fcvtns", "fcvtnu", "fcvtps", "fcvtpu", "fcvtzs", "fcvtzu",
+    ];
+    if UNARY.contains(&op) {
+        return Some(format!("    {op} v0.{suf}, v0.{suf}\n    ret\n"));
+    }
+    // Saturating rounding doubling multiply accumulate/subtract high:
+    // acc in v0, multiplicands in v1 and v2.
+    if matches!(op, "sqrdmlah" | "sqrdmlsh") {
+        return Some(format!("    {op} v0.{suf}, v1.{suf}, v2.{suf}\n    ret\n"));
+    }
+    // NEON f32x4 sum; rsasm only knows the SVE `faddv`, so pairwise-add instead.
+    if op == "faddv" {
+        if ty != "v4f32" {
+            return None;
+        }
+        return Some("    faddp v0.4s, v0.4s, v0.4s\n    faddp s0, v0.2s\n    ret\n".into());
+    }
+    // Across-lane reductions: vector in v0, scalar result in the low lane.
+    const REDUCE: &[&str] = &[
+        "smaxv", "sminv", "umaxv", "uminv", "addv", "fmaxv", "fminv", "fmaxnmv", "fminnmv",
+    ];
+    const REDUCE_WIDE: &[&str] = &["saddlv", "uaddlv"];
+    let signed = op.starts_with('s');
+    let elem = suf.rsplit(|c: char| c.is_ascii_digit()).next()?;
+    if REDUCE.contains(&op) {
+        if ty.starts_with('v') && ty.ends_with("f32") {
+            // fmaxv &co. exist only for the 4s arrangement.
+            if ty != "v4f32" || op == "addv" {
+                return None;
+            }
+            return Some(format!("    {op} s0, v0.{suf}\n    ret\n"));
+        }
+        if !ty.starts_with('v') || ty == "v1i64" {
+            return None;
+        }
+        let extract = match elem {
+            "b" | "h" if signed => format!("    smov w0, v0.{elem}[0]\n"),
+            "b" | "h" => format!("    umov w0, v0.{elem}[0]\n"),
+            "s" => "    fmov w0, s0\n".to_string(),
+            "d" => "    fmov x0, d0\n".to_string(),
+            _ => return None,
+        };
+        return Some(format!("    {op} {elem}0, v0.{suf}\n{extract}    ret\n"));
+    }
+    if REDUCE_WIDE.contains(&op) {
+        let (wide, extract) = match elem {
+            "b" if signed => ("h", "    smov w0, v0.h[0]\n"),
+            "b" => ("h", "    umov w0, v0.h[0]\n"),
+            "h" if signed => ("s", "    fmov w0, s0\n"),
+            "h" => ("s", "    fmov w0, s0\n"),
+            "s" if signed => ("d", "    fmov x0, d0\n"),
+            "s" => ("d", "    fmov x0, d0\n"),
+            _ => return None,
+        };
+        return Some(format!("    {op} {wide}0, v0.{suf}\n{extract}    ret\n"));
+    }
+    None
 }
 
 struct Gen<'a, 'tcx> {
@@ -423,15 +788,36 @@ impl Gen<'_, '_> {
         }
     }
 
+    // r[impl native.asm.wrapper]
     fn wrapper(&self, name: &str) -> String {
+        let fmt = self.tcx.sess.target.options.binary_format;
+        let macho = fmt == rustc_target::spec::BinaryFormat::MachO;
+        let coff = fmt == rustc_target::spec::BinaryFormat::Coff;
         let mut s = String::new();
-        writeln!(s, ".globl {name}\n.hidden {name}\n.type {name},@function").unwrap();
-        writeln!(s, ".section .text.{name},\"ax\",@progbits\n{name}:").unwrap();
+        if macho {
+            writeln!(s, ".globl {name}\n.private_extern {name}").unwrap();
+            writeln!(
+                s,
+                ".section __TEXT,__text,regular,pure_instructions\n{name}:"
+            )
+            .unwrap();
+        } else if coff {
+            writeln!(s, ".globl {name}\n.text\n{name}:").unwrap();
+        } else {
+            writeln!(s, ".globl {name}\n.hidden {name}\n.type {name},@function").unwrap();
+            writeln!(s, ".section .text.{name},\"ax\",@progbits\n{name}:").unwrap();
+        }
         let x86 = self.arch == InlineAsmArch::X86_64;
         let att = self.options.contains(InlineAsmOptions::ATT_SYNTAX);
         let noreturn = self.options.contains(InlineAsmOptions::NORETURN);
         if x86 {
-            s.push_str(".intel_syntax noprefix\n    push rbp\n    mov rbp,rsp\n    push rbx\n    mov rbx,rdi\n");
+            // The frame arg arrives in the platform's first register.
+            let arg0 = if coff { "rcx" } else { "rdi" };
+            write!(
+                s,
+                ".intel_syntax noprefix\n    push rbp\n    mov rbp,rsp\n    push rbx\n    mov rbx,{arg0}\n"
+            )
+            .unwrap();
         } else {
             s.push_str("    stp fp, lr, [sp, #-32]!\n    mov fp, sp\n    str x19, [sp, #24]\n    mov x19, x0\n");
         }
@@ -453,9 +839,10 @@ impl Gen<'_, '_> {
         if x86 && att {
             s.push_str(".att_syntax\n");
         }
+        let imm_sigil = if att { "$" } else { "" };
         for piece in self.template {
             match piece {
-                InlineAsmTemplatePiece::String(t) => s.push_str(t),
+                InlineAsmTemplatePiece::String(t) => s.push_str(&t.replace("$$", imm_sigil)),
                 InlineAsmTemplatePiece::Placeholder {
                     operand_idx,
                     modifier,
@@ -504,12 +891,16 @@ impl Gen<'_, '_> {
         if x86 {
             s.push_str(".att_syntax\n");
         }
-        writeln!(s, ".size {name}, .-{name}\n.text\n").unwrap();
+        if !macho && !coff {
+            writeln!(s, ".size {name}, .-{name}\n.text\n").unwrap();
+        }
         s
     }
 }
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
+    // r[impl front.asm.wrapper]
+    // r[impl front.asm.limits]
     pub fn inline_asm(
         &mut self,
         template: &[InlineAsmTemplatePiece],

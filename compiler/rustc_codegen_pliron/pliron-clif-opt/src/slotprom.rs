@@ -1,0 +1,2327 @@
+//! Stack-slot SSA promotion — mem2reg for `explicit_slot`s
+//! (`PLIRON_SLOTPROM`).
+//!
+//! rustc's lowering leaves small aggregates in stack slots when ir-opt's
+//! SROA can't split them — a `HashMap`'s `{hasher, ctrl, mask, items, ..}`
+//! struct, a `Vec`'s `{ptr, cap, len}`, the `{l, scratch, offset}` cursor
+//! in ipnsort's partition loop. Every read/write then pays a real
+//! `load`/`store`; LLVM's mem2reg turns the same fields into loop-carried
+//! SSA values, which is exactly the stack traffic the disassembly diffs
+//! show in `hmget`'s probe loop and `quicksort`'s partition loop.
+//!
+//! A slot field is promoted when the slot's address never escapes — every
+//! use of every `stack_addr`-derived value is a load/store address or a
+//! const `iadd` feeding one — and the field's byte range partially
+//! overlaps no other access (a wide `load.i8x16` covering two i64 fields
+//! keeps all three on memory; disjoint fields promote independently).
+//!
+//! The rewrite is block-param SSA construction rather than phi nodes:
+//! per promoted field, `livein[b]` (an upward-exposed use, or a successor
+//! needing the value past a block that doesn't define it) gets a trailing
+//! block param and every predecessor edge appends the reaching value.
+//! Loads become aliases of the current value, stores update it and die.
+
+use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::flowgraph::ControlFlowGraph;
+use cranelift_codegen::ir::immediates::Offset32;
+use cranelift_codegen::ir::{
+    Block, BlockArg, Function, Inst, InstBuilder, InstructionData, MemFlagsData, Opcode, StackSlot,
+    Type, Value, ValueDef, types,
+};
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::loadfwd;
+use crate::webroot::{self, Web, Webs};
+
+/// Cap on promoted fields per function — param bloat bound.
+const MAX_FIELDS: usize = 48;
+/// Cap on memory accesses per slot before the slot is left alone
+/// (`PLIRON_SLOTPROM_ACCS` — big state-machine fns like miniz's
+/// `decompress` have 200+ accesses on their hot slots).
+const MAX_ACCS: usize = 128;
+/// Cap on blocks receiving a param for one field — keeps deep CFGs from
+/// growing signatures unboundedly (`PLIRON_SLOTPROM_LIVEIN`).
+const MAX_LIVEIN: usize = 256;
+/// Skip gigantic functions outright; the field×block matrices are
+/// quadratic-ish and a CGU this size is a rarity anyway.
+const MAX_BLOCKS: usize = 8192;
+
+/// A slot address passed to a call operand marked `nocap` (rustc's
+/// `captures(none)`, our inferred `nocapture`, or rustc's `noalias` —
+/// `&mut`/`&`-frozen reborrows whose scope ends at the call, so no
+/// retained copy can legally touch the memory afterward) is a *bounded*
+/// escape rather than a disqualifying one: the callee may read/write the
+/// slot's bytes during the call but can't retain a usable alias past it.
+/// Promoted fields then just need writeback stores before the call and
+/// reload loads on its return edges — a cold `reserve_rehash(&mut m)`
+/// inside a hot loop is the canonical case: eager per-iteration
+/// coherence writes become two bursts bracketing the call.
+///
+/// The sync set is conservative: every promoted field of the slot is
+/// written back and reloaded (the callee's operand extent isn't tracked
+/// here), and a call whose normal/exception edges don't land on
+/// single-pred trampoline blocks isn't syncable — the reload must run
+/// exactly on the call's return path.
+///
+/// Byte range + access type of one promotable slot field.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Field {
+    slot: StackSlot,
+    off: i64,
+    bytes: i64,
+    ty: Type,
+}
+
+/// `PLIRON_SLOTPROM_CONTAINER=0`: keep fields read by narrower loads in
+/// memory (the pre-container behaviour).
+static CONTAINER: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| !pliron_cfg::env_is("PLIRON_SLOTPROM_CONTAINER", "0"));
+
+/// One memory access against a slot's bytes.
+#[derive(Clone, Copy)]
+struct Acc {
+    off: i64,
+    bytes: i64,
+    /// `Some(ty)` for plain `load`/`store` (promotable kind, value type
+    /// `ty`); `None` for narrow/atomic accesses that pin bytes to memory
+    /// without being promotable.
+    ty: Option<Type>,
+    /// A plain `load` (a narrower one can read out of a container field).
+    load: bool,
+}
+
+/// Memory bytes each opcode touches when the address is slot-derived.
+/// `None` — not a plain tracked access at all.
+fn op_bytes(op: Opcode, ty: Type) -> Option<(i64, bool)> {
+    let b = match op {
+        Opcode::Load => return Some((i64::from(ty.bytes()), true)),
+        Opcode::Store => return Some((i64::from(ty.bytes()), true)),
+        Opcode::Uload8 | Opcode::Sload8 | Opcode::Istore8 => 1,
+        Opcode::Uload16 | Opcode::Sload16 | Opcode::Istore16 => 2,
+        Opcode::Uload32 | Opcode::Sload32 | Opcode::Istore32 => 4,
+        Opcode::Uload8x8
+        | Opcode::Sload8x8
+        | Opcode::Uload16x4
+        | Opcode::Sload16x4
+        | Opcode::Uload32x2
+        | Opcode::Sload32x2 => 8,
+        _ => return None,
+    };
+    Some((b, false))
+}
+
+/// The address operand of a load/store is promotable to slot `ss` at
+/// `off` when `w` proves the access hits exactly `(ss, off)`: a single
+/// slot member, no `other` alternatives, and any constant alternative
+/// (`nul`/`bad`) ruled out by `notrap` — the flag asserts the access
+/// can't trap, so a path delivering an invalid const is already UB.
+fn promo_member(w: &Web, notrap: bool) -> Option<(StackSlot, i64)> {
+    if w.other || w.slots.len() != 1 {
+        return None;
+    }
+    let (ss, o) = w.slots[0];
+    if o == webroot::ANY || ((w.nul || w.bad) && !notrap) {
+        return None;
+    }
+    Some((ss, o))
+}
+
+/// Record one memory access of `bytes` at `off + memop-offset`: promotes
+/// when the web proves a single exact slot site, otherwise pins every
+/// slot member's range (`ty: None` keeps the bytes on memory); an `ANY`
+/// member can't be bounded and escapes its slot.
+#[allow(clippy::too_many_arguments)]
+fn access(
+    w: &Web,
+    i: Inst,
+    func: &Function,
+    off: i64,
+    bytes: i64,
+    ty: Option<Type>,
+    accs: &mut FxHashMap<StackSlot, Vec<Acc>>,
+    esc: &mut Vec<StackSlot>,
+) {
+    match promo_member(w, loadfwd::notrap(func, i)) {
+        Some((ss, o)) => accs.entry(ss).or_default().push(Acc {
+            off: o.wrapping_add(off),
+            bytes,
+            ty,
+            load: func.dfg.insts[i].opcode() == Opcode::Load,
+        }),
+        None => {
+            for &(ss, o) in &w.slots {
+                if o == webroot::ANY {
+                    esc.push(ss);
+                } else {
+                    accs.entry(ss).or_default().push(Acc {
+                        off: o.wrapping_add(off),
+                        bytes,
+                        ty: None,
+                        load: false,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// The promotable site (slot, absolute offset) of inst `i`'s address
+/// operand `arg` as evaluated in block `b`, after `notrap` refinement.
+fn site(
+    webs: &Webs,
+    func: &Function,
+    i: Inst,
+    b: Block,
+    arg: Value,
+    offset: Offset32,
+) -> Option<(StackSlot, i64)> {
+    let w = webs.at(func, func.dfg.resolve_aliases(arg), b);
+    let (ss, o) = promo_member(&w, loadfwd::notrap(func, i))?;
+    Some((ss, o.wrapping_add(i64::from(i32::from(offset)))))
+}
+
+/// Every branch destination of try_call `i` is a dedicated single-pred
+/// trampoline (lowering builds `pre`/`normal` per call), so reloads
+/// inserted at its top run exactly on that call's return path.
+fn single_pred_dests(func: &Function, cfg: &ControlFlowGraph, i: Inst) -> bool {
+    let dfg = &func.dfg;
+    !dfg.insts[i]
+        .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+        .is_empty()
+        && dfg.insts[i]
+            .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+            .iter()
+            .all(|bc| cfg.pred_iter(bc.block(&dfg.value_lists)).count() == 1)
+}
+
+/// Do the `ext` bytes a call operand can reach at slot offset `off`
+/// overlap the field's `[f.off, f.off + f.bytes)` range? `u64::MAX`
+/// extents cover the whole slot.
+fn covers(f: &Field, off: i64, ext: u64) -> bool {
+    let end = off.saturating_add(ext.min(i64::MAX as u64) as i64);
+    off < f.off + f.bytes && f.off < end
+}
+
+/// A zero constant of field type, materialized at the top of `b` — the
+/// "undef" reaching value for entry-block reads (the original program
+/// read uninitialized slot bytes; any value refines that).
+fn undef(func: &mut Function, b: Block, ty: Type) -> Value {
+    let mut pos = FuncCursor::new(func).at_first_insertion_point(b);
+    if ty.is_int() && !ty.is_vector() {
+        if ty == types::I128 {
+            let z = pos.ins().iconst(types::I64, 0);
+            return pos.ins().iconcat(z, z);
+        }
+        return pos.ins().iconst(ty, 0);
+    }
+    if ty.is_vector() {
+        let lane = ty.lane_type();
+        let z = if lane.is_int() {
+            pos.ins().iconst(lane, 0)
+        } else {
+            match lane {
+                types::F32 => pos.ins().f32const(0.0),
+                _ => pos.ins().f64const(0.0),
+            }
+        };
+        return pos.ins().splat(ty, z);
+    }
+    match ty {
+        types::F32 => pos.ins().f32const(0.0),
+        types::F64 => pos.ins().f64const(0.0),
+        _ => {
+            let z = pos.ins().iconst(types::I64, 0);
+            pos.ins().bitcast(
+                ty,
+                cranelift_codegen::ir::MemFlagsData::new()
+                    .with_endianness(cranelift_codegen::ir::Endianness::Little),
+                z,
+            )
+        }
+    }
+}
+
+/// `keep_keyed`: leave slots carrying a `StackSlotKey` (variable slots
+/// under `-g -O0`) in memory, for the debugger. Otherwise a promoted
+/// field of such a slot hands its variable over to the SSA values: they
+/// get the field's labels from `dbg_slots` (`dbglabel`), and the slot
+/// loses its key — its memory no longer holds the whole variable.
+pub fn run(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    nocap: &FxHashMap<(Inst, u32), u64>,
+    keep_keyed: bool,
+    dbg_slots: &crate::dbglabel::DbgSlots,
+) -> usize {
+    run_lt(func, cfg, nocap, keep_keyed, dbg_slots, &[], None)
+}
+
+/// A lifetime marker slotprom may cut a promoted field's live range at:
+/// the slot's bytes are undefined right after `anchor` in `block` (at its
+/// top when `anchor` is `None`). Built by [`kills_of`].
+#[derive(Clone, Copy, Debug)]
+pub struct Kill {
+    pub slot: StackSlot,
+    pub anchor: Option<Inst>,
+    pub block: Block,
+}
+
+/// `PLIRON_SLOTPROM_LT=1`: the markers of `lifetimes` (lowering's
+/// `llvm.lifetime.{start,end}` records) whose position is still exact:
+/// a marker on exactly one slot (under the flag, lowering records a marker
+/// that covers only part of a slot as ambiguous: `marker_slots_lt`), with
+/// the anchor inst still in the marker's block (or no anchor, and the block still in the layout).
+/// Both kinds count: past an end marker and past a start marker alike
+/// the slot's bytes are undefined until the next store. A marker whose
+/// anchor moved or died is dropped; a dropped kill only leaves a live
+/// range longer, never wrong.
+pub fn kills_of(
+    func: &Function,
+    lifetimes: &[(Vec<StackSlot>, Option<Inst>, Block, bool)],
+) -> Vec<Kill> {
+    let mut out = Vec::new();
+    for (ds, anchor, b, _start) in lifetimes {
+        let &[s] = ds.as_slice() else { continue };
+        let exact = match *anchor {
+            Some(a) => func.layout.inst_block(a) == Some(*b),
+            None => func.layout.is_block_inserted(*b),
+        };
+        if exact && func.sized_stack_slots.is_valid(s) {
+            out.push(Kill {
+                slot: s,
+                anchor: *anchor,
+                block: *b,
+            });
+        }
+    }
+    out
+}
+
+/// [`run`], with lifetime kills and an optional block-frequency estimate
+/// (`weight`, for the sync cost check). A promoted field is not live
+/// across a kill of its slot. A kill acts as a store of "undefined": liveness
+/// stops there (so no block param carries a dead value around a loop
+/// into the next iteration), and a read after it, before any store, sees
+/// the field's undef value.
+pub fn run_lt(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    nocap: &FxHashMap<(Inst, u32), u64>,
+    keep_keyed: bool,
+    dbg_slots: &crate::dbglabel::DbgSlots,
+    kills: &[Kill],
+    weight: Option<&FxHashMap<Block, u32>>,
+) -> usize {
+    let Some(entry) = func.layout.entry_block() else {
+        return 0;
+    };
+    let nblocks = func.layout.blocks().count();
+    if func.sized_stack_slots.is_empty() || nblocks > MAX_BLOCKS {
+        return 0;
+    }
+    let max_accs = crate::env_get("PLIRON_SLOTPROM_ACCS")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MAX_ACCS);
+    let max_livein = crate::env_get("PLIRON_SLOTPROM_LIVEIN")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(MAX_LIVEIN);
+    // `PLIRON_SLOTPROM_EXT=0` reverts to whole-slot call coverage.
+    let ext_on = crate::pass_enabled("PLIRON_SLOTPROM_EXT");
+    let timer = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::slotprom", tracing::Level::INFO);
+    let t0 = timer.then(std::time::Instant::now);
+    let webs = Webs::new(func, cfg);
+    if timer {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::slotprom", "slotprom: webs {:?} ({} blocks)", t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()), nblocks)
+        };
+    }
+    let t1 = timer.then(std::time::Instant::now);
+
+    // Reachable blocks only — dead blocks' accesses stay on memory.
+    let mut reach: FxHashSet<Block> = FxHashSet::default();
+    let mut st = vec![entry];
+    while let Some(b) = st.pop() {
+        if reach.insert(b) {
+            st.extend(cfg.succ_iter(b));
+        }
+    }
+
+    // Per-slot access lists; `bad` = escaped slots.
+    let mut accs: FxHashMap<StackSlot, Vec<Acc>> = FxHashMap::default();
+    let mut bad: FxHashSet<StackSlot> = FxHashSet::default();
+    if keep_keyed {
+        bad.extend(func.sized_stack_slots.iter().filter(|(_, d)| d.key.is_some()).map(|(ss, _)| ss));
+    }
+    // Slot → bounded (`nocap`) call uses of its address: the call inst,
+    // the operand's offset in the slot, and the bytes the callee can
+    // reach through it (`arg_extent`; `u64::MAX` = unknown = whole
+    // slot). Promoted fields sync only where the call can touch them.
+    let mut sync_calls: FxHashMap<StackSlot, Vec<(Inst, i64, u64)>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        if !reach.contains(&b) {
+            continue;
+        }
+        for i in func.layout.block_insts(b) {
+            // A poisoned analysis poisons every query — the results are
+            // discarded below anyway, so stop scanning.
+            if webs.poisoned() {
+                break;
+            }
+            let nargs = func.dfg.inst_args(i).len();
+            for (k, v) in func.dfg.inst_values(i).enumerate() {
+                let v = func.dfg.resolve_aliases(v);
+                let w = webs.at(func, v, b);
+                if w.slots.is_empty() {
+                    continue;
+                }
+                let data = &func.dfg.insts[i];
+                let mut esc: Vec<StackSlot> = Vec::new();
+                match data {
+                    InstructionData::Load {
+                        opcode,
+                        arg,
+                        offset,
+                        ..
+                    } if k < nargs && func.dfg.resolve_aliases(*arg) == v => {
+                        let rty = func.dfg.value_type(func.dfg.first_result(i));
+                        match op_bytes(*opcode, rty) {
+                            Some((bytes, plain)) => access(
+                                &w,
+                                i,
+                                func,
+                                i64::from(i32::from(*offset)),
+                                bytes,
+                                plain.then_some(rty),
+                                &mut accs,
+                                &mut esc,
+                            ),
+                            None => esc.extend(w.slots.iter().map(|&(s, _)| s)),
+                        }
+                    }
+                    InstructionData::Store {
+                        opcode,
+                        args,
+                        offset,
+                        ..
+                    } if k < nargs => {
+                        if func.dfg.resolve_aliases(args[1]) == v {
+                            let vty = func.dfg.value_type(args[0]);
+                            match op_bytes(*opcode, vty) {
+                                Some((bytes, plain)) => access(
+                                    &w,
+                                    i,
+                                    func,
+                                    i64::from(i32::from(*offset)),
+                                    bytes,
+                                    plain.then_some(vty),
+                                    &mut accs,
+                                    &mut esc,
+                                ),
+                                None => esc.extend(w.slots.iter().map(|&(s, _)| s)),
+                            }
+                        } else {
+                            // The stored *value* may be a slot-derived
+                            // pointer — it outlives promotion.
+                            esc.extend(w.slots.iter().map(|&(s, _)| s));
+                        }
+                    }
+                    InstructionData::Binary {
+                        opcode: Opcode::Iadd | Opcode::Isub,
+                        ..
+                    }
+                    | InstructionData::Ternary {
+                        opcode: Opcode::Select,
+                        ..
+                    }
+                    | InstructionData::IntCompare { .. }
+                    | InstructionData::FloatCompare { .. } => {}
+                    _ if data.opcode().is_call()
+                        && k < nargs
+                        && !matches!(
+                            data.opcode(),
+                            Opcode::ReturnCall | Opcode::ReturnCallIndirect | Opcode::StackSwitch
+                        ) =>
+                    {
+                        // Operand `k`; the callee operand of an indirect
+                        // call isn't a pointee arg.
+                        let adj = usize::from(matches!(
+                            data.opcode(),
+                            Opcode::CallIndirect | Opcode::TryCallIndirect
+                        ));
+                        let ai = k.checked_sub(adj);
+                        let bounded = ai
+                            .is_some_and(|ai| nocap.contains_key(&(i, ai as u32)))
+                            && (!matches!(
+                                data.opcode(),
+                                Opcode::TryCall | Opcode::TryCallIndirect
+                            ) || single_pred_dests(func, cfg, i));
+                        for &(ss, off) in &w.slots {
+                            if bounded {
+                                let mut ext = ai
+                                    .and_then(|ai| nocap.get(&(i, ai as u32)).copied())
+                                    .unwrap_or(u64::MAX);
+                                // `ANY` (unknown offset) covers the slot.
+                                let mut off = off;
+                                if off == webroot::ANY || !ext_on {
+                                    off = 0;
+                                    ext = u64::MAX;
+                                }
+                                let ss_ = sync_calls.entry(ss).or_default();
+                                if !ss_.contains(&(i, off, ext)) {
+                                    ss_.push((i, off, ext));
+                                    if pliron_cfg::tracing_on()
+                                        && tracing::enabled!(target: "pliron::slotprom", tracing::Level::DEBUG)
+                                    {
+                                        if pliron_cfg::tracing_on() {
+                                            tracing::debug!(target: "pliron::slotprom", "slotprom: bounded call {i} on {ss}")
+                                        };
+                                    }
+                                }
+                            } else {
+                                if pliron_cfg::tracing_on()
+                                    && tracing::enabled!(target: "pliron::slotprom", tracing::Level::DEBUG)
+                                {
+                                    let adj = usize::from(matches!(
+                                        data.opcode(),
+                                        Opcode::CallIndirect | Opcode::TryCallIndirect
+                                    ));
+                                    let nc = k
+                                        .checked_sub(adj)
+                                        .is_some_and(|ai| nocap.contains_key(&(i, ai as u32)));
+                                    let spd = !matches!(
+                                        data.opcode(),
+                                        Opcode::TryCall | Opcode::TryCallIndirect
+                                    ) || single_pred_dests(func, cfg, i);
+                                    if pliron_cfg::tracing_on() {
+                                        tracing::debug!(target: "pliron::slotprom", "slotprom: unbounded {i} arg{k} nocap={nc} spd={spd}")
+                                    };
+                                }
+                                esc.push(ss);
+                            }
+                        }
+                    }
+                    // Branch args are benign: the receiving param is
+                    // itself a web member, so its own uses classify the
+                    // slot's fate.
+                    _ if k >= nargs => {}
+                    _ => esc.extend(w.slots.iter().map(|&(s, _)| s)),
+                }
+                for ss in esc {
+                    if pliron_cfg::tracing_on()
+                        && tracing::enabled!(target: "pliron::slotprom", tracing::Level::DEBUG)
+                        && !bad.contains(&ss)
+                    {
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::slotprom", "slotprom: {ss} escaped at {i} {:?} ({})",
+                                data.opcode(),
+                                func.name
+                            )
+                        };
+                    }
+                    bad.insert(ss);
+                }
+            }
+        }
+    }
+    for (ss, list) in &accs {
+        // An access outside the slot (dead code with a wild constant
+        // offset; fuzz seed 8631 overflowed `off + bytes` below) can't be
+        // a field: the slot stays in memory.
+        let size = i64::from(func.sized_stack_slots[*ss].size);
+        if list.len() > max_accs || list.iter().any(|a| a.off < 0 || a.off.checked_add(a.bytes).is_none_or(|e| e > size)) {
+            if pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::slotprom", tracing::Level::DEBUG)
+            {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::slotprom", "slotprom: {ss} rejected naccs={} size={size} ({})",
+                        list.len(),
+                        func.name)
+                };
+            }
+            bad.insert(*ss);
+        }
+    }
+    if timer {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::slotprom", "slotprom: accs scan {:?} ({} poisoned={})",
+                t1.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
+                func.name,
+                webs.poisoned()
+            )
+        };
+    }
+    let t2 = timer.then(std::time::Instant::now);
+    if webs.poisoned() {
+        return 0;
+    }
+    accs.retain(|s, _| !bad.contains(s));
+    if accs.is_empty() {
+        return 0;
+    }
+
+    // Split each slot's accesses into disjoint, uniformly-typed fields.
+    // A byte range partially overlapped by another access stays on memory
+    // (its bytes are still read/written through the slot), as do ranges
+    // touched by narrow ops or with mixed types.
+    let mut fields: Vec<Field> = Vec::new();
+    let mut slot_accs: FxHashMap<StackSlot, usize> = FxHashMap::default();
+    for (slot, list) in &accs {
+        slot_accs.insert(*slot, list.len());
+        let mut ranges: Vec<(i64, i64)> = Vec::new();
+        for a in list {
+            let rr = (a.off, a.bytes);
+            if !ranges.contains(&rr) {
+                ranges.push(rr);
+            }
+        }
+        for &(off, bytes) in &ranges {
+            let overlaps = |&&(o2, b2): &&(i64, i64)| (o2, b2) != (off, bytes) && o2 < off + bytes && off < o2 + b2;
+            if ranges.iter().any(|r| overlaps(&r)) {
+                // A container field (LLVM SROA's integer widening, read
+                // side): every overlapping access is a plain integer load
+                // strictly inside this range, and no wider range holds it.
+                // The narrow loads become shifts of the field's value:
+                // regex's `follow_epsilons` stored its six-bool flags arg
+                // (one i64) to a slot and read each bool back as a byte.
+                let inside = |a: &Acc| off <= a.off && a.off + a.bytes <= off + bytes;
+                let container = *CONTAINER
+                    && list.iter().filter(|a| overlaps(&&(a.off, a.bytes))).all(|a| {
+                        inside(a) && a.load && a.ty.is_some_and(|t| t.is_int())
+                    });
+                if !container {
+                    continue;
+                }
+            }
+            let mut ty = None;
+            let mut good = true;
+            for a in list.iter().filter(|a| a.off == off && a.bytes == bytes) {
+                match (ty, a.ty) {
+                    (None, Some(t)) => ty = Some(t),
+                    (Some(t), Some(t2)) if t == t2 => {}
+                    _ => {
+                        good = false;
+                        break;
+                    }
+                }
+            }
+            let wide_int = ty.is_some_and(|t| t.is_int() && i64::from(t.bytes()) == bytes);
+            let has_inner = ranges.iter().any(|&(o2, b2)| (o2, b2) != (off, bytes) && o2 < off + bytes && off < o2 + b2);
+            if has_inner && !wide_int {
+                good = false;
+            }
+            if good && let Some(ty) = ty {
+                fields.push(Field {
+                    slot: *slot,
+                    off,
+                    bytes,
+                    ty,
+                });
+            }
+        }
+    }
+    // Over the param-bloat bound the default is the all-or-nothing
+    // bail: wide-CFG functions pay a param move per live-in edge per
+    // field, so the bound doubles as a profitability guard (partial
+    // promotion measured +5.9KB .text on regex-syntax for no runtime
+    // gain). `PLIRON_SLOTPROM_EVICT=1` instead evicts whole slots —
+    // least-accessed first — until the survivors fit. A dropped slot's
+    // accesses simply stay on memory.
+    if fields.len() > MAX_FIELDS {
+        if !pliron_cfg::env_is("PLIRON_SLOTPROM_EVICT", "1") {
+            return 0;
+        }
+        let mut by_field: FxHashMap<StackSlot, usize> = FxHashMap::default();
+        for f in &fields {
+            *by_field.entry(f.slot).or_default() += 1;
+        }
+        let mut order: Vec<StackSlot> = by_field.keys().copied().collect();
+        order.sort_by_key(|s| (slot_accs.get(s).copied().unwrap_or(0), by_field[s]));
+        let mut drop = FxHashSet::default();
+        let mut n = fields.len();
+        for s in order {
+            if n <= MAX_FIELDS {
+                break;
+            }
+            n -= by_field[&s];
+            drop.insert(s);
+        }
+        fields.retain(|f| !drop.contains(&f.slot));
+        if pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::slotprom", tracing::Level::DEBUG)
+        {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::slotprom", "slotprom: evicted {} slots, nfields={} ({})",
+                    drop.len(),
+                    fields.len(),
+                    func.name)
+            };
+        }
+    }
+    if fields.is_empty() {
+        return 0;
+    }
+    // `PLIRON_SLOTPROM_FIELDS=N` promotes only the first N fields
+    // (bisect aid — `accs` iteration is FxHash-deterministic).
+    if let Some(n) = crate::env_get("PLIRON_SLOTPROM_FIELDS")
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        fields.truncate(n);
+    }
+
+    let mut blk_ix: FxHashMap<Block, u32> = FxHashMap::default();
+    let mut blocks_vec: Vec<Block> = Vec::new();
+    for (ix, b) in func.layout.blocks().enumerate() {
+        blk_ix.insert(b, ix as u32);
+        blocks_vec.push(b);
+    }
+
+    // Bounded calls read the slot's memory, so each counts as a use of
+    // the fields its operands can reach: without it a store-only field
+    // has an empty livein, loses its store, and is never written back
+    // before the call.
+
+    // Each access inst's slot site — field-invariant, so it is computed
+    // once here rather than per field inside the livein scan.
+    let mut sites: FxHashMap<Inst, (Option<(StackSlot, i64)>, bool)> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let s = match func.dfg.insts[i] {
+                InstructionData::Load {
+                    opcode: Opcode::Load,
+                    arg,
+                    offset,
+                    ..
+                } => Some((site(&webs, func, i, b, arg, offset), false)),
+                InstructionData::Store {
+                    opcode: Opcode::Store,
+                    args,
+                    offset,
+                    ..
+                } => Some((site(&webs, func, i, b, args[1], offset), true)),
+                _ => None,
+            };
+            if let Some(s) = s {
+                sites.insert(i, s);
+            }
+        }
+    }
+
+    // (slot, off) → field index and inst → its synced slots: the ue/def
+    // scan below walks each inst once for *all* fields rather than once
+    // per field.
+    let field_ix: FxHashMap<(StackSlot, i64), usize> = fields
+        .iter()
+        .enumerate()
+        .map(|(fi, f)| ((f.slot, f.off), fi))
+        .collect();
+    let mut slot_fields: FxHashMap<StackSlot, Vec<usize>> = FxHashMap::default();
+    for (fi, f) in fields.iter().enumerate() {
+        slot_fields.entry(f.slot).or_default().push(fi);
+    }
+    // Narrow loads inside a container field: inst → (field, byte delta).
+    let mut contained: FxHashMap<Inst, (usize, i64)> = FxHashMap::default();
+    for (&i, &(s, st)) in &sites {
+        let Some((ss, off)) = s else { continue };
+        if st {
+            continue;
+        }
+        let ty = func.dfg.value_type(func.dfg.first_result(i));
+        // A load at the field's own offset is contained when narrower (it
+        // shares the field's `(slot, off)` key; the whole-field rewrite
+        // skips it on the width check).
+        if field_ix.get(&(ss, off)).is_some_and(|&fi| fields[fi].bytes == i64::from(ty.bytes())) {
+            continue;
+        }
+        if let Some(&fi) = slot_fields.get(&ss).and_then(|fs| {
+            fs.iter().find(|&&fi| {
+                let f = &fields[fi];
+                f.ty.is_int() && ty.is_int() && f.off <= off && off + i64::from(ty.bytes()) <= f.off + f.bytes
+            })
+        }) {
+            contained.insert(i, (fi, off - fields[fi].off));
+        }
+    }
+    let mut sync_inst_slots: FxHashMap<Inst, Vec<(StackSlot, i64, u64)>> = FxHashMap::default();
+    for (slot, insts) in &sync_calls {
+        for &(i, off, ext) in insts {
+            sync_inst_slots.entry(i).or_default().push((*slot, off, ext));
+        }
+    }
+
+    // Lifetime kills of slots with fields: at a block's top, or right
+    // after an inst.
+    let mut kill_top: FxHashMap<Block, Vec<StackSlot>> = FxHashMap::default();
+    let mut kill_after: FxHashMap<Inst, Vec<StackSlot>> = FxHashMap::default();
+    for k in kills {
+        if !slot_fields.contains_key(&k.slot) {
+            continue;
+        }
+        match k.anchor {
+            None => kill_top.entry(k.block).or_default().push(k.slot),
+            Some(a) => kill_after.entry(a).or_default().push(k.slot),
+        }
+    }
+    // A kill counts as a store for liveness: the field's bytes are dead
+    // above it.
+    let kill_def = |slots: &[StackSlot], ix: usize, stored: &mut [bool], defs: &mut [Vec<bool>]| {
+        for ss in slots {
+            for &fi in &slot_fields[ss] {
+                stored[fi] = true;
+                defs[fi][ix] = true;
+            }
+        }
+    };
+
+    // Per field: upward-exposed use (ue) and any-store (def) per block,
+    // then livein[b] = ue[b] | (liveout[b] & !def[b]) to a fixpoint.
+    let mut ues: Vec<Vec<bool>> = vec![vec![false; nblocks]; fields.len()];
+    let mut defs: Vec<Vec<bool>> = vec![vec![false; nblocks]; fields.len()];
+    let mut stored: Vec<bool> = vec![false; fields.len()];
+    for b in func.layout.blocks() {
+        let ix = blk_ix[&b] as usize;
+        stored.fill(false);
+        if let Some(slots) = kill_top.get(&b) {
+            kill_def(slots, ix, &mut stored, &mut defs);
+        }
+        // The kill after the previous inst (the loop body `continue`s).
+        let mut pending: Option<&Vec<StackSlot>> = None;
+        for i in func.layout.block_insts(b) {
+            if let Some(slots) = pending.take() {
+                kill_def(slots, ix, &mut stored, &mut defs);
+            }
+            pending = kill_after.get(&i);
+            if let Some(slots) = sync_inst_slots.get(&i) {
+                for &(ss, off, ext) in slots {
+                    if let Some(fis) = slot_fields.get(&ss) {
+                        for &fi in fis {
+                            if !stored[fi] && covers(&fields[fi], off, ext) {
+                                ues[fi][ix] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            let Some(&(Some((ss, off)), st)) = sites.get(&i) else {
+                continue;
+            };
+            let Some(fi) = field_ix.get(&(ss, off)).copied().or_else(|| contained.get(&i).map(|c| c.0)) else {
+                continue;
+            };
+            if st {
+                stored[fi] = true;
+                defs[fi][ix] = true;
+            } else if !stored[fi] {
+                ues[fi][ix] = true;
+            }
+        }
+    }
+    let mut liveins: Vec<Vec<bool>> = Vec::new();
+    let mut kept: Vec<usize> = Vec::new();
+    for (fi, f) in fields.iter().enumerate() {
+        let ue = std::mem::take(&mut ues[fi]);
+        let def = &defs[fi];
+        // Backward-propagation worklist: a block is live-in when any
+        // successor is, unless it stores the field itself. One visit per
+        // edge — a chain CFG would otherwise cost a full block scan per
+        // fixpoint round (O(blocks²) per field).
+        let mut livein = ue;
+        let mut wl: Vec<u32> = Vec::new();
+        for (ix, &x) in livein.iter().enumerate() {
+            if x {
+                wl.push(ix as u32);
+            }
+        }
+        while let Some(six) = wl.pop() {
+            for p in cfg.pred_iter(blocks_vec[six as usize]) {
+                let p = p.block;
+                let Some(&pix) = blk_ix.get(&p) else {
+                    continue;
+                };
+                if !reach.contains(&p) || livein[pix as usize] || def[pix as usize] {
+                    continue;
+                }
+                livein[pix as usize] = true;
+                wl.push(pix);
+            }
+        }
+        // A synced field must round-trip through a store offset imm —
+        // one that doesn't fit stays on memory (sound: the callee just
+        // sees it there like today).
+        let fits = !sync_calls.contains_key(&f.slot) || i32::try_from(f.off).is_ok();
+        if fits && livein.iter().filter(|&&x| x).count() <= max_livein {
+            kept.push(fi);
+            liveins.push(livein);
+        }
+    }
+    if timer {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::slotprom", "slotprom: liveins {:?} ({} fields)",
+                t2.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
+                fields.len()
+            )
+        };
+    }
+    let t3 = timer.then(std::time::Instant::now);
+    // `PLIRON_SLOTPROM_SYNCCOST=1`: a slot whose bounded calls cost more
+    // sync traffic than promotion removes stays in memory. Each bounded
+    // call stores every kept field of its slot before it and reloads them
+    // all after it; promotion removes the field's own loads and stores.
+    // Both sides are weighted by the estimated block frequency (`weight`).
+    // `Ast::fmt`'s heap-visitor stack (two `Vec` headers, six fields,
+    // pushed and popped through `&mut` calls) went from 99 to 213 memory
+    // ops this way.
+    if let Some(weight) = weight
+        && !sync_calls.is_empty()
+    {
+        let w = |b: Option<Block>| b.map_or(0, |b| u64::from(weight.get(&b).copied().unwrap_or(1)));
+        let mut benefit: FxHashMap<StackSlot, u64> = FxHashMap::default();
+        let nkept: FxHashSet<StackSlot> = kept.iter().map(|&fi| fields[fi].slot).collect();
+        let kept_set: FxHashSet<usize> = kept.iter().copied().collect();
+        for (&i, &(s, _)) in &sites {
+            if let Some((ss, off)) = s
+                && let Some(fi) = field_ix.get(&(ss, off)).copied().or_else(|| contained.get(&i).map(|c| c.0))
+                && kept_set.contains(&fi)
+                && reach.contains(&func.layout.inst_block(i).unwrap_or(entry))
+            {
+                *benefit.entry(ss).or_default() += w(func.layout.inst_block(i));
+            }
+        }
+        let mut drop_slots: FxHashSet<StackSlot> = FxHashSet::default();
+        for (slot, insts) in &sync_calls {
+            if !nkept.contains(slot) {
+                continue;
+            }
+            let mut cost = 0u64;
+            for &(i, off, ext) in insts {
+                // The call syncs only the kept fields its operand can
+                // reach, not the whole slot.
+                let nk = kept
+                    .iter()
+                    .filter(|&&fi| fields[fi].slot == *slot && covers(&fields[fi], off, ext))
+                    .count() as u64;
+                if nk == 0 {
+                    continue;
+                }
+                let dfg = &func.dfg;
+                let reload = match dfg.insts[i].opcode() {
+                    Opcode::TryCall | Opcode::TryCallIndirect => dfg.insts[i]
+                        .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+                        .iter()
+                        .map(|bc| w(Some(bc.block(&dfg.value_lists))))
+                        .sum(),
+                    _ => w(func.layout.inst_block(i)),
+                };
+                cost += nk * (w(func.layout.inst_block(i)) + reload);
+            }
+            if cost >= benefit.get(slot).copied().unwrap_or(0) {
+                drop_slots.insert(*slot);
+            }
+        }
+        if !drop_slots.is_empty() {
+            let mut k2 = Vec::new();
+            let mut l2 = Vec::new();
+            for (fi, l) in kept.drain(..).zip(liveins.drain(..)) {
+                if !drop_slots.contains(&fields[fi].slot) {
+                    k2.push(fi);
+                    l2.push(l);
+                }
+            }
+            kept = k2;
+            liveins = l2;
+        }
+    }
+    if kept.is_empty() {
+        return 0;
+    }
+
+    // Per bounded call: the kept-field indices written back before it —
+    // only the ones the operand's extent can reach — and for try_call
+    // terminators the single-pred destination blocks whose tops get the
+    // reloads (normal + exception edges alike).
+    let mut sync: FxHashMap<Inst, Vec<usize>> = FxHashMap::default();
+    let mut reload_top: FxHashMap<Block, Vec<usize>> = FxHashMap::default();
+    for (slot, insts) in &sync_calls {
+        for &(i, off, ext) in insts {
+            let kis: Vec<usize> = kept
+                .iter()
+                .enumerate()
+                .filter(|&(_, &fi)| fields[fi].slot == *slot && covers(&fields[fi], off, ext))
+                .map(|(ki, _)| ki)
+                .collect();
+            if kis.is_empty() {
+                continue;
+            }
+            // A call can take several promoted slots — accumulate the
+            // field sets; a plain `insert` would drop all but the last.
+            sync.entry(i).or_default().extend(kis.iter().copied());
+            if matches!(
+                func.dfg.insts[i].opcode(),
+                Opcode::TryCall | Opcode::TryCallIndirect
+            ) {
+                let dfg = &func.dfg;
+                for bc in dfg.insts[i].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
+                    reload_top
+                        .entry(bc.block(&dfg.value_lists))
+                        .or_default()
+                        .extend(kis.iter().copied());
+                }
+            }
+        }
+    }
+    // Two operands of one call can cover the same field — sync it once.
+    for kis in sync.values_mut().chain(reload_top.values_mut()) {
+        kis.sort_unstable();
+        kis.dedup();
+    }
+
+    // `-g`: each kept field's variable labels; its slot drops its key.
+    let field_labels: Vec<&[u32]> = kept
+        .iter()
+        .map(|&fi| {
+            let f = fields[fi];
+            func.sized_stack_slots[f.slot]
+                .key
+                .and_then(|k| dbg_slots.get(&(k.bits(), f.off, f.bytes as u32)))
+                .map_or(&[][..], |v| &v[..])
+        })
+        .collect();
+    let mut dbg: Vec<(Value, u32)> = Vec::new();
+    for &fi in &kept {
+        func.sized_stack_slots[fields[fi].slot].key = None;
+    }
+
+    // New params: every reachable livein block gets one per kept field
+    // (entry gets a materialized undef instead — it has no preds).
+    let mut params: Vec<FxHashMap<u32, Value>> = vec![FxHashMap::default(); kept.len()];
+    // Every materialized undef: a sync writeback of one stores undefined
+    // bytes over undefined memory, a no-op (an sret temp passed to its
+    // callee got 64 bytes of zeroing before each call: pulldown's
+    // `Parser::next` -> `item_to_event`).
+    let mut undefs: FxHashSet<Value> = FxHashSet::default();
+    for (ki, &fi) in kept.iter().enumerate() {
+        for b in func.layout.blocks().collect::<Vec<_>>() {
+            let ix = blk_ix[&b] as usize;
+            if !liveins[ki][ix] {
+                continue;
+            }
+            let v = if b == entry {
+                let u = undef(func, b, fields[fi].ty);
+                undefs.insert(u);
+                u
+            } else {
+                let p = func.dfg.append_block_param(b, fields[fi].ty);
+                dbg.extend(field_labels[ki].iter().map(|&l| (p, l)));
+                p
+            };
+            params[ki].insert(ix as u32, v);
+        }
+    }
+
+    // A per-field undef defined in `entry` (dominates everything
+    // reachable): the reaching value for upward-exposed loads with no
+    // param and for edges out of blocks that never defined the field.
+    let fallback: Vec<Value> = kept
+        .iter()
+        .map(|&fi| undef(func, entry, fields[fi].ty))
+        .collect();
+    undefs.extend(fallback.iter().copied());
+
+    // field index → kept index: the per-inst site check can't afford
+    // linear `position` scans.
+    let mut kept_ix: FxHashMap<usize, usize> = FxHashMap::default();
+    for (ki, &fi) in kept.iter().enumerate() {
+        kept_ix.insert(fi, ki);
+    }
+    if timer {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::slotprom", "slotprom: plan {:?}", t3.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
+        };
+    }
+    let t4 = timer.then(std::time::Instant::now);
+
+    // Rewrite: alias loads, drop stores, append reaching values on edges.
+    let mut n = 0;
+    let mut writebacks: Vec<(Inst, usize)> = Vec::new();
+    // Post-call reloads → their field: right after one, that field's
+    // memory holds the reloaded value, and nothing touches it until the
+    // next synced call (promoted stores are dropped; that call reloads
+    // again). Only for the same field: the program may copy the value
+    // into another field, whose memory doesn't hold it (blind-sig).
+    let mut reloads: FxHashMap<Value, usize> = FxHashMap::default();
+    for b in func.layout.blocks().collect::<Vec<_>>() {
+        if !reach.contains(&b) {
+            continue;
+        }
+        let bix = blk_ix[&b] as usize;
+        let mut cur: Vec<Option<Value>> = vec![None; kept.len()];
+        for (ki, _) in kept.iter().enumerate() {
+            if liveins[ki][bix] {
+                cur[ki] = params[ki].get(&(bix as u32)).copied();
+            }
+        }
+        // Snapshot before emitting sync insts — the inserted
+        // loads/stores must not be re-walked as promotable accesses.
+        let insts = func.layout.block_insts(b).collect::<Vec<_>>();
+        // Post-call reloads: this block is a try_call's return
+        // trampoline — the callee may have rewritten the synced bytes.
+        // Runs unconditionally so a later sync writeback can't push a
+        // stale value over the callee's writes.
+        if let Some(kis) = reload_top.get(&b) {
+            let mut pos = FuncCursor::new(func).at_first_insertion_point(b);
+            let mut sas: FxHashMap<StackSlot, Value> = FxHashMap::default();
+            for &ki in kis {
+                let f = fields[kept[ki]];
+                let sa = *sas
+                    .entry(f.slot)
+                    .or_insert_with(|| pos.ins().stack_addr(types::I64, f.slot, 0));
+                let v = pos.ins().load(f.ty, MemFlagsData::new().with_notrap(), sa, f.off as i32);
+                dbg.extend(field_labels[ki].iter().map(|&l| (v, l)));
+                reloads.insert(v, ki);
+                cur[ki] = Some(v);
+            }
+        }
+        // A kill forgets the field's value: reads and edges after it
+        // take the undef fallback until the next store.
+        let forget = |slots: &[StackSlot], cur: &mut [Option<Value>]| {
+            for ss in slots {
+                for fi in &slot_fields[ss] {
+                    if let Some(&ki) = kept_ix.get(fi) {
+                        cur[ki] = None;
+                    }
+                }
+            }
+        };
+        if let Some(slots) = kill_top.get(&b) {
+            forget(slots, &mut cur);
+        }
+        for i in insts {
+            let ka = kill_after.get(&i);
+            if let Some(kis) = sync.get(&i) {
+                // Writeback before the call: the callee reads the
+                // operand's memory, so promoted fields become stores.
+                // (cur=None ⇒ the field's bytes are untouched on this
+                // path — nothing to push.)
+                let mut sas: FxHashMap<StackSlot, Value> = FxHashMap::default();
+                {
+                    let mut pos = FuncCursor::new(func).at_inst(i);
+                    for &ki in kis {
+                        let f = fields[kept[ki]];
+                        let sa = *sas
+                            .entry(f.slot)
+                            .or_insert_with(|| pos.ins().stack_addr(types::I64, f.slot, 0));
+                        if let Some(v) = cur[ki]
+                            && !undefs.contains(&v)
+                        {
+                            pos.ins()
+                                .store(MemFlagsData::new().with_notrap(), v, sa, f.off as i32);
+                            if let Some(st) = pos.prev_inst() {
+                                writebacks.push((st, ki));
+                            }
+                        }
+                    }
+                }
+                // call/call_indirect fall through in this block — reload
+                // what the callee may have written. try_call reloads
+                // live at its destination trampolines instead.
+                if matches!(
+                    func.dfg.insts[i].opcode(),
+                    Opcode::Call | Opcode::CallIndirect
+                ) {
+                    let mut pos = FuncCursor::new(func).after_inst(i);
+                    for &ki in kis {
+                        let f = fields[kept[ki]];
+                        let sa = *sas
+                            .entry(f.slot)
+                            .or_insert_with(|| pos.ins().stack_addr(types::I64, f.slot, 0));
+                        let v = pos.ins().load(f.ty, MemFlagsData::new().with_notrap(), sa, f.off as i32);
+                        dbg.extend(field_labels[ki].iter().map(|&l| (v, l)));
+                        reloads.insert(v, ki);
+                        cur[ki] = Some(v);
+                    }
+                }
+            }
+            match func.dfg.insts[i] {
+                InstructionData::Load {
+                    opcode: Opcode::Load,
+                    ..
+                } => {
+                    let ty = func.dfg.value_type(func.dfg.first_result(i));
+                    if let Some(&(Some((ss, off)), _)) = sites.get(&i)
+                        && let Some(&fi) = field_ix.get(&(ss, off))
+                        && fields[fi].bytes == i64::from(ty.bytes())
+                        && fields[fi].ty == ty
+                        && let Some(&ki) = kept_ix.get(&fi)
+                    {
+                        let cv = cur[ki].unwrap_or(fallback[ki]);
+                        let res = func.dfg.first_result(i);
+                        func.layout.remove_inst(i);
+                        func.dfg.clear_results(i);
+                        func.dfg.change_to_alias(res, cv);
+                        n += 1;
+                    } else if let Some(&(fi, delta)) = contained.get(&i)
+                        && let Some(&ki) = kept_ix.get(&fi)
+                    {
+                        // Little-endian: byte `delta` of the field is bits
+                        // `8*delta..`.
+                        let cv = cur[ki].unwrap_or(fallback[ki]);
+                        let res = func.dfg.first_result(i);
+                        let mut pos = FuncCursor::new(func).at_inst(i);
+                        let sh = if delta > 0 { pos.ins().ushr_imm_s(cv, delta * 8) } else { cv };
+                        let nv = if ty.bits() < fields[fi].ty.bits() { pos.ins().ireduce(ty, sh) } else { sh };
+                        func.layout.remove_inst(i);
+                        func.dfg.clear_results(i);
+                        func.dfg.change_to_alias(res, nv);
+                        n += 1;
+                    }
+                }
+                InstructionData::Store {
+                    opcode: Opcode::Store,
+                    args,
+                    ..
+                } => {
+                    let ty = func.dfg.value_type(args[0]);
+                    if let Some(&(Some((ss, off)), _)) = sites.get(&i)
+                        && let Some(&fi) = field_ix.get(&(ss, off))
+                        && fields[fi].bytes == i64::from(ty.bytes())
+                        && fields[fi].ty == ty
+                        && let Some(&ki) = kept_ix.get(&fi)
+                    {
+                        let v = func.dfg.resolve_aliases(args[0]);
+                        dbg.extend(field_labels[ki].iter().map(|&l| (v, l)));
+                        cur[ki] = Some(v);
+                        func.layout.remove_inst(i);
+                        n += 1;
+                    }
+                }
+                _ => {}
+            }
+            if let Some(slots) = ka {
+                forget(slots, &mut cur);
+            }
+        }
+        let Some(term) = func.layout.last_inst(b) else {
+            continue;
+        };
+        // Mutate the terminator's stored block-calls in place: copies
+        // would leave the original EntityList pointing at stale pool
+        // storage if `append_argument` has to grow the list.
+        // First resolve which destinations need which extra args while the
+        // value list pool is only borrowed immutably.
+        let adds: Vec<Vec<Value>> = {
+            let dfg = &func.dfg;
+            dfg.insts[term]
+                .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+                .iter()
+                .map(|bc| {
+                    let d = bc.block(&dfg.value_lists);
+                    let Some(&dix) = blk_ix.get(&d) else {
+                        return Vec::new();
+                    };
+                    if !reach.contains(&d) {
+                        return Vec::new();
+                    }
+                    kept.iter()
+                        .enumerate()
+                        .filter(|(ki, _)| liveins[*ki][dix as usize])
+                        .map(|(ki, _)| cur[ki].unwrap_or(fallback[ki]))
+                        .collect()
+                })
+                .collect()
+        };
+        let dfg = &mut func.dfg;
+        for (bc, vs) in dfg.insts[term]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+            .iter_mut()
+            .zip(adds)
+        {
+            for v in vs {
+                bc.append_argument(BlockArg::Value(v), &mut dfg.value_lists);
+            }
+        }
+    }
+    // `PLIRON_SLOTPROM_UNDEFPARAM=1`: drop writebacks that can't change
+    // memory. Memory equals the field's value when that value is an undef
+    // (memory is undefined too), a post-call reload (memory holds it until
+    // the next synced call), or a new param every incoming value of which
+    // is one of those (greatest fixpoint: loop-carried copies count).
+    // pulldown's `Parser::next` zeroed `item_to_event`'s 56-byte sret slot
+    // before every call (cparm later turns the undef param into an
+    // explicit 0, past telling apart), and `parse_block`'s special-byte
+    // loop wrote its callback's last result back before each call.
+    if !writebacks.is_empty() && pliron_cfg::env_is("PLIRON_SLOTPROM_UNDEFPARAM", "1") {
+        let mut pos_of: FxHashMap<Value, (Block, usize)> = FxHashMap::default();
+        let mut field_of: FxHashMap<Value, usize> = FxHashMap::default();
+        for (ki, m) in params.iter().enumerate() {
+            for &v in m.values() {
+                if let ValueDef::Param(b, k) = func.dfg.value_def(v) {
+                    pos_of.insert(v, (b, k));
+                    field_of.insert(v, ki);
+                }
+            }
+        }
+        let keys: FxHashSet<(Block, usize)> = pos_of.values().copied().collect();
+        let mut und: FxHashSet<Value> = pos_of.keys().copied().collect();
+        // Incoming args per (block, param index).
+        let mut inc: FxHashMap<(Block, usize), Vec<Option<Value>>> = FxHashMap::default();
+        for b in func.layout.blocks() {
+            let Some(t) = func.layout.last_inst(b) else { continue };
+            let dfg = &func.dfg;
+            for bc in dfg.insts[t].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
+                let d = bc.block(&dfg.value_lists);
+                let args: Vec<BlockArg> = bc.args(&dfg.value_lists).collect();
+                for (k, a) in args.iter().enumerate() {
+                    if keys.contains(&(d, k)) {
+                        let v = match a {
+                            BlockArg::Value(v) => Some(dfg.resolve_aliases(*v)),
+                            _ => None,
+                        };
+                        inc.entry((d, k)).or_default().push(v);
+                    }
+                }
+            }
+        }
+        loop {
+            let next: FxHashSet<Value> = und
+                .iter()
+                .copied()
+                .filter(|p| {
+                    inc.get(&pos_of[p]).is_none_or(|vs| {
+                        let ki = field_of[p];
+                        vs.iter().all(|v| {
+                            v.is_some_and(|v| {
+                                v == *p
+                                    || undefs.contains(&v)
+                                    || reloads.get(&v) == Some(&ki)
+                                    || (und.contains(&v) && field_of.get(&v) == Some(&ki))
+                            })
+                        })
+                    })
+                })
+                .collect();
+            if next.len() == und.len() {
+                break;
+            }
+            und = next;
+        }
+        for (st, ki) in writebacks {
+            let v = func.dfg.resolve_aliases(func.dfg.inst_args(st)[0]);
+            if (und.contains(&v) && field_of.get(&v) == Some(&ki)) || reloads.get(&v) == Some(&ki) {
+                func.layout.remove_inst(st);
+            }
+        }
+    }
+    if timer {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::slotprom", "slotprom: rewrite {:?}", t4.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
+        };
+    }
+    crate::dbglabel::add(&mut func.dfg, &dbg);
+    n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::ir::{
+        AbiParam, MemFlagsData, Signature, StackSlotData, StackSlotKind, UserFuncName,
+    };
+    use cranelift_codegen::isa::CallConv;
+
+    fn verify(func: &Function) {
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(func, &flags) {
+            panic!("slotprom produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    fn empty_nocap() -> FxHashMap<(Inst, u32), u64> {
+        FxHashMap::default()
+    }
+
+    fn memops(func: &Function) -> usize {
+        let mut n = 0;
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                match func.dfg.insts[i] {
+                    InstructionData::Load { .. } | InstructionData::Store { .. } => n += 1,
+                    _ => {}
+                }
+            }
+        }
+        n
+    }
+
+    /// A loop-carried i64 cell in an 8-byte explicit slot: init in the
+    /// entry block, load+store in the loop header, read on exit. After
+    /// promotion no plain load/store remains and the blocks that need
+    /// the value carry it as a param.
+    #[test]
+    fn promotes_loop_carried_field() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let h = func.dfg.make_block();
+        let body = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [b0, h, body, done] {
+            func.layout.append_block(b);
+        }
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let arg0 = func.dfg.append_block_param(b0, types::I64);
+        let flags = MemFlagsData::new();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a0 = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, arg0, a0, 0);
+        cur.ins().jump(h, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let x = cur.ins().load(types::I64, flags, a0, 0);
+        let one = cur.ins().iconst(types::I64, 1);
+        let more = cur.ins().icmp(IntCC::UnsignedGreaterThan, x, one);
+        cur.ins().brif(more, body, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(body);
+        let x2 = cur.ins().load(types::I64, flags, a0, 0);
+        let one2 = cur.ins().iconst(types::I64, 1);
+        let sub = cur.ins().isub(x2, one2);
+        cur.ins().store(flags, sub, a0, 0);
+        cur.ins().jump(h, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+        let r = cur.ins().load(types::I64, flags, a0, 0);
+        cur.ins().return_(&[r]);
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
+        assert!(n > 0, "expected promotion");
+        assert_eq!(memops(&func), 0, "no plain load/store should remain");
+        assert!(func.dfg.num_block_params(h) >= 1);
+        assert!(func.dfg.num_block_params(done) >= 1);
+        verify(&func);
+    }
+
+    /// Two disjoint fields (i64 at +0, i32 at +8) promote independently.
+    #[test]
+    fn keyed_slot_hands_its_variable_to_the_values() {
+        // `-g`: a keyed (variable) slot's promoted field labels what was
+        // stored in it — both stores and the merge param — and the slot
+        // loses its key, since its memory no longer holds the variable.
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let b1 = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [b0, b1, done] {
+            func.layout.append_block(b);
+        }
+        let x = func.dfg.append_block_param(b0, types::I64);
+        let ss = func.create_sized_stack_slot(StackSlotData::new_with_key(
+            StackSlotKind::ExplicitSlot,
+            8,
+            3,
+            cranelift_codegen::ir::StackSlotKey::new(5),
+        ));
+        let flags = MemFlagsData::new();
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        let one = cur.ins().iconst(types::I64, 1);
+        cur.ins().store(flags, one, a, 0);
+        cur.ins().brif(x, b1, &[], done, &[]);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b1);
+        cur.ins().store(flags, x, a, 0);
+        cur.ins().jump(done, &[]);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+        let r = cur.ins().load(types::I64, flags, a, 0);
+        cur.ins().return_(&[r]);
+
+        let mut dbg = crate::dbglabel::DbgSlots::default();
+        dbg.insert((5, 0, 8), vec![7]);
+        let cfg = ControlFlowGraph::with_function(&func);
+        assert!(run(&mut func, &cfg, &empty_nocap(), false, &dbg) > 0);
+        verify(&func);
+        assert!(func.sized_stack_slots[ss].key.is_none(), "key kept:\n{func}");
+        let labelled = |v| match func.dfg.values_labels.as_ref().and_then(|l| l.get(&v)) {
+            Some(cranelift_codegen::ir::ValueLabelAssignments::Starts(s)) => {
+                s.iter().any(|s| s.label.as_u32() == 7)
+            }
+            _ => false,
+        };
+        assert!(labelled(one) && labelled(x), "stores not labelled:\n{func}");
+        let p = *func.dfg.block_params(done).last().unwrap();
+        assert!(labelled(p), "merge param not labelled:\n{func}");
+    }
+
+    #[test]
+    fn promotes_disjoint_fields() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [b0, done] {
+            func.layout.append_block(b);
+        }
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
+        let flags = MemFlagsData::new();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        let five = cur.ins().iconst(types::I64, 5);
+        let nine = cur.ins().iconst(types::I32, 9);
+        cur.ins().store(flags, five, a, 0);
+        cur.ins().store(flags, nine, a, 8);
+        cur.ins().jump(done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+        let w = cur.ins().load(types::I64, flags, a, 0);
+        let n = cur.ins().load(types::I32, flags, a, 8);
+        let nw = cur.ins().uextend(types::I64, n);
+        let r = cur.ins().iadd(w, nw);
+        cur.ins().return_(&[r]);
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
+        assert!(n >= 4, "two stores + two loads should fold, got {n}");
+        assert_eq!(memops(&func), 0);
+        verify(&func);
+    }
+
+    /// An escaping address (passed to a call) keeps the slot on memory.
+    #[test]
+    fn escaped_slot_is_left_alone() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
+        let esig = func.import_signature(sig.clone());
+        let ext = func.dfg.ext_funcs.push(cranelift_codegen::ir::ExtFuncData {
+            name: cranelift_codegen::ir::ExternalName::user(Default::default()),
+            signature: esig,
+            colocated: false,
+            patchable: false,
+        });
+        let b0 = func.dfg.make_block();
+        for b in [b0] {
+            func.layout.append_block(b);
+        }
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let arg0 = func.dfg.append_block_param(b0, types::I64);
+        let flags = MemFlagsData::new();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, arg0, a, 0);
+        cur.ins().call(ext, &[a]);
+        let r = cur.ins().load(types::I64, flags, a, 0);
+        cur.ins().return_(&[r]);
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default()), 0);
+        assert_eq!(memops(&func), 2);
+        verify(&func);
+    }
+
+    /// A slot whose only escape is a `nocap` call operand still
+    /// promotes: writeback before the call, reload after it, and no
+    /// other memory ops survive.
+    #[test]
+    fn nocap_call_promotes_with_sync() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
+        let esig = func.import_signature(sig.clone());
+        let ext = func.dfg.ext_funcs.push(cranelift_codegen::ir::ExtFuncData {
+            name: cranelift_codegen::ir::ExternalName::user(Default::default()),
+            signature: esig,
+            colocated: false,
+            patchable: false,
+        });
+        let b0 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let arg0 = func.dfg.append_block_param(b0, types::I64);
+        let flags = MemFlagsData::new();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, arg0, a, 0);
+        let call = cur.ins().call(ext, &[a]);
+        let r = cur.ins().load(types::I64, flags, a, 0);
+        cur.ins().return_(&[r]);
+
+        let mut nocap = empty_nocap();
+        nocap.insert((call, 0), u64::MAX);
+        let cfg = ControlFlowGraph::with_function(&func);
+        let n = run(&mut func, &cfg, &nocap, false, &Default::default());
+        assert!(n > 0, "expected promotion");
+        // Only the sync pair (writeback store + reload) remains.
+        assert_eq!(memops(&func), 2);
+        verify(&func);
+    }
+
+    /// A field stored on a predecessor path and read only through a
+    /// bounded call's memory still has to reach the call: with no SSA
+    /// load there is no live-in param, but the callee reads the bytes, so
+    /// the writeback must re-materialize the reaching value. (rustc's
+    /// drop-glue chains: a copied struct's field is dropped through a
+    /// call, never re-loaded.)
+    #[test]
+    fn store_only_field_syncs_at_bounded_call() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
+        let esig = func.import_signature(sig.clone());
+        let ext = func.dfg.ext_funcs.push(cranelift_codegen::ir::ExtFuncData {
+            name: cranelift_codegen::ir::ExternalName::user(Default::default()),
+            signature: esig,
+            colocated: false,
+            patchable: false,
+        });
+        let b0 = func.dfg.make_block();
+        let b1 = func.dfg.make_block();
+        for b in [b0, b1] {
+            func.layout.append_block(b);
+        }
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let arg0 = func.dfg.append_block_param(b0, types::I64);
+        let flags = MemFlagsData::new();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, arg0, a, 0);
+        cur.ins().jump(b1, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b1);
+        let call = cur.ins().call(ext, &[a]);
+        let z = cur.ins().iconst(types::I64, 0);
+        cur.ins().return_(&[z]);
+
+        let mut nocap = empty_nocap();
+        nocap.insert((call, 0), u64::MAX);
+        let cfg = ControlFlowGraph::with_function(&func);
+        run(&mut func, &cfg, &nocap, false, &Default::default());
+        // The callee must see arg0 in *a: writeback store + post-call
+        // reload — if the store is silently dropped the callee reads
+        // uninitialized slot memory.
+        assert_eq!(memops(&func), 2, "missing writeback/reload pair");
+        verify(&func);
+    }
+
+    /// A slot passed as a callee's `sret` argument still gets its
+    /// writeback: the return value may cover only the front of the slot
+    /// (rustlantis returns into `RET.0` of a larger local), and the bytes
+    /// past it must reach memory before the reload after the call. Fuzz
+    /// seeds 26212/26694 lost a field at offset 8 of a 224-byte slot when
+    /// the writeback was skipped for every sret call.
+    #[test]
+    fn sret_arg_keeps_writeback_past_return_value() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
+        let mut csig = Signature::new(CallConv::Fast);
+        csig.params.push(AbiParam::special(types::I64, cranelift_codegen::ir::ArgumentPurpose::StructReturn));
+        let esig = func.import_signature(csig);
+        let ext = func.dfg.ext_funcs.push(cranelift_codegen::ir::ExtFuncData {
+            name: cranelift_codegen::ir::ExternalName::user(Default::default()),
+            signature: esig,
+            colocated: false,
+            patchable: false,
+        });
+        let b0 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 3));
+        let arg0 = func.dfg.append_block_param(b0, types::I64);
+        let flags = MemFlagsData::new();
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, arg0, a, 8);
+        let call = cur.ins().call(ext, &[a]);
+        let r = cur.ins().load(types::I64, flags, a, 8);
+        cur.ins().return_(&[r]);
+
+        let mut nocap = empty_nocap();
+        nocap.insert((call, 0), u64::MAX);
+        let cfg = ControlFlowGraph::with_function(&func);
+        run(&mut func, &cfg, &nocap, false, &Default::default());
+        let stores = func
+            .layout
+            .blocks()
+            .flat_map(|b| func.layout.block_insts(b))
+            .filter(|&i| func.dfg.insts[i].opcode() == Opcode::Store)
+            .count();
+        assert_eq!(stores, 1, "the writeback before the sret call must stay:\n{}", func.display());
+        verify(&func);
+    }
+
+    /// One call can take several promoted slots as bounded args: the
+    /// writeback set is keyed by call inst, so both slots' stores must
+    /// land before it — not just the last one iterated.
+    #[test]
+    fn two_bounded_args_both_sync() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
+        let esig = func.import_signature(sig.clone());
+        let ext = func.dfg.ext_funcs.push(cranelift_codegen::ir::ExtFuncData {
+            name: cranelift_codegen::ir::ExternalName::user(Default::default()),
+            signature: esig,
+            colocated: false,
+            patchable: false,
+        });
+        let b0 = func.dfg.make_block();
+        let b1 = func.dfg.make_block();
+        for b in [b0, b1] {
+            func.layout.append_block(b);
+        }
+        let ss0 =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let ss1 =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let arg0 = func.dfg.append_block_param(b0, types::I64);
+        let arg1 = func.dfg.append_block_param(b0, types::I64);
+        let flags = MemFlagsData::new();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a0 = cur.ins().stack_addr(types::I64, ss0, 0);
+        let a1 = cur.ins().stack_addr(types::I64, ss1, 0);
+        cur.ins().store(flags, arg0, a0, 0);
+        cur.ins().store(flags, arg1, a1, 0);
+        cur.ins().jump(b1, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b1);
+        let call = cur.ins().call(ext, &[a0, a1]);
+        let z = cur.ins().iconst(types::I64, 0);
+        cur.ins().return_(&[z]);
+
+        let mut nocap = empty_nocap();
+        nocap.insert((call, 0), u64::MAX);
+        nocap.insert((call, 1), u64::MAX);
+        let cfg = ControlFlowGraph::with_function(&func);
+        run(&mut func, &cfg, &nocap, false, &Default::default());
+        // Each arg's bytes reach the callee through memory: two
+        // writebacks before the call, two reloads after.
+        assert_eq!(memops(&func), 4, "missing writeback/reload pairs");
+        verify(&func);
+    }
+
+    /// The same call without the `nocap` mark is a disqualifying escape.
+    #[test]
+    fn unmarked_call_does_not_promote() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
+        let esig = func.import_signature(sig.clone());
+        let ext = func.dfg.ext_funcs.push(cranelift_codegen::ir::ExtFuncData {
+            name: cranelift_codegen::ir::ExternalName::user(Default::default()),
+            signature: esig,
+            colocated: false,
+            patchable: false,
+        });
+        let b0 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let arg0 = func.dfg.append_block_param(b0, types::I64);
+        let flags = MemFlagsData::new();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, arg0, a, 0);
+        cur.ins().call(ext, &[a]);
+        let r = cur.ins().load(types::I64, flags, a, 0);
+        cur.ins().return_(&[r]);
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default()), 0);
+        verify(&func);
+    }
+
+    /// A field whose bytes a narrower op also touches stays on memory:
+    /// `store.i32` at +8 plus `uload8` at +8 must not promote the i32
+    /// away underneath the byte read.
+    #[test]
+    fn narrow_access_pins_field() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let done = func.dfg.make_block();
+        for b in [b0, done] {
+            func.layout.append_block(b);
+        }
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 4));
+        let flags = MemFlagsData::new();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        let five = cur.ins().iconst(types::I64, 5);
+        let nine = cur.ins().iconst(types::I32, 9);
+        cur.ins().store(flags, five, a, 0);
+        cur.ins().store(flags, nine, a, 8);
+        cur.ins().jump(done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+        let byte = cur.ins().uload8(types::I32, flags, a, 8);
+        let w = cur.ins().uextend(types::I64, byte);
+        cur.ins().return_(&[w]);
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
+        // The i32 field overlaps the byte load; it must stay in memory
+        // (its store + the uload8 itself = 2 memory ops). The i64 field
+        // at +0 is disjoint and promotes away its store.
+        assert_eq!(memops(&func), 2);
+        verify(&func);
+    }
+
+    /// hashbrown's lazy-empty idiom: a param fed `&slot` on one edge and
+    /// `0` on the other, dereferenced only under the `p != 0` arm. Edge
+    /// restriction drops the null source, so the load promotes.
+    #[test]
+    fn nullable_param_guarded_load_promotes() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let join = func.dfg.make_block();
+        let useb = func.dfg.make_block();
+        let nullb = func.dfg.make_block();
+        for b in [b0, join, useb, nullb] {
+            func.layout.append_block(b);
+        }
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let x = func.dfg.append_block_param(b0, types::I64);
+        let p = func.dfg.append_block_param(join, types::I64);
+        let flags = MemFlagsData::new();
+        let nt = MemFlagsData::new().with_notrap();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, x, a, 0);
+        let z = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, x, z);
+        cur.ins().brif(c, join, &[z.into()], join, &[a.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(join);
+        let z2 = cur.ins().iconst(types::I64, 0);
+        let t = cur.ins().icmp(IntCC::Equal, p, z2);
+        cur.ins().brif(t, nullb, &[], useb, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(useb);
+        let r = cur.ins().load(types::I64, nt, p, 0);
+        cur.ins().return_(&[r]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(nullb);
+        let z3 = cur.ins().iconst(types::I64, 0);
+        cur.ins().return_(&[z3]);
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
+        assert!(n > 0, "guarded load through nullable param should promote");
+        assert_eq!(memops(&func), 0);
+        verify(&func);
+    }
+
+    /// A sibling param carrying `&slot` on the *null* edge and a heap
+    /// pointer on the non-null edge may be stored to memory on the
+    /// non-null arm: edge correlation proves the stored value can't be
+    /// the slot there, so the slot still promotes.
+    #[test]
+    fn correlated_sibling_store_is_safe() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let join = func.dfg.make_block();
+        let useb = func.dfg.make_block();
+        let nullb = func.dfg.make_block();
+        for b in [b0, join, useb, nullb] {
+            func.layout.append_block(b);
+        }
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let x = func.dfg.append_block_param(b0, types::I64);
+        let hp = func.dfg.append_block_param(b0, types::I64);
+        let p = func.dfg.append_block_param(join, types::I64);
+        let q = func.dfg.append_block_param(join, types::I64);
+        let flags = MemFlagsData::new();
+        let nt = MemFlagsData::new().with_notrap();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, x, a, 0);
+        let z = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, x, z);
+        // Null edge binds (0, &slot); non-null edge binds (&slot, heap).
+        cur.ins()
+            .brif(c, join, &[z.into(), a.into()], join, &[a.into(), hp.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(join);
+        let z2 = cur.ins().iconst(types::I64, 0);
+        let t = cur.ins().icmp(IntCC::Equal, p, z2);
+        cur.ins().brif(t, nullb, &[], useb, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(useb);
+        cur.ins().store(nt, q, hp, 0);
+        let r = cur.ins().load(types::I64, nt, p, 0);
+        cur.ins().return_(&[r]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(nullb);
+        let z3 = cur.ins().iconst(types::I64, 0);
+        cur.ins().return_(&[z3]);
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        let n = run(&mut func, &cfg, &empty_nocap(), false, &Default::default());
+        assert!(n > 0, "correlated sibling store must not escape the slot");
+        // Only the real heap store remains.
+        assert_eq!(memops(&func), 1);
+        verify(&func);
+    }
+
+    /// Same web without the correlation: the stored param is `&slot` on
+    /// the *non-null* edge too, so the store genuinely escapes.
+    #[test]
+    fn uncorrelated_sibling_store_escapes() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let join = func.dfg.make_block();
+        let useb = func.dfg.make_block();
+        let nullb = func.dfg.make_block();
+        for b in [b0, join, useb, nullb] {
+            func.layout.append_block(b);
+        }
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let x = func.dfg.append_block_param(b0, types::I64);
+        let hp = func.dfg.append_block_param(b0, types::I64);
+        let p = func.dfg.append_block_param(join, types::I64);
+        let q = func.dfg.append_block_param(join, types::I64);
+        let flags = MemFlagsData::new();
+        let nt = MemFlagsData::new().with_notrap();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, x, a, 0);
+        let z = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, x, z);
+        cur.ins()
+            .brif(c, join, &[z.into(), a.into()], join, &[a.into(), a.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(join);
+        let z2 = cur.ins().iconst(types::I64, 0);
+        let t = cur.ins().icmp(IntCC::Equal, p, z2);
+        cur.ins().brif(t, nullb, &[], useb, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(useb);
+        // `q` may be `&slot` on the non-null edge — storing it into an
+        // unrelated object escapes.
+        cur.ins().store(nt, q, hp, 0);
+        let r = cur.ins().load(types::I64, nt, p, 0);
+        cur.ins().return_(&[r]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(nullb);
+        let z3 = cur.ins().iconst(types::I64, 0);
+        cur.ins().return_(&[z3]);
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default()), 0);
+        verify(&func);
+    }
+
+    /// `to_exact_fixed_str` shape: four i64 fields are stored in one
+    /// block, then the slot address is passed (nocap) to a call in a
+    /// later join block that already carries its own params. The stored
+    /// values must be written back before the call even though the call
+    /// block's param list is not empty.
+    #[test]
+    fn writeback_through_join_with_params() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
+        let un =
+            func.declare_imported_user_function(cranelift_codegen::ir::UserExternalName::new(0, 0));
+        let mut csig = Signature::new(CallConv::Fast);
+        csig.params.push(AbiParam::new(types::I64));
+        csig.params.push(AbiParam::new(types::I64));
+        csig.returns.push(AbiParam::new(types::I64));
+        let esig = func.import_signature(csig);
+        let ext = func.dfg.ext_funcs.push(cranelift_codegen::ir::ExtFuncData {
+            name: cranelift_codegen::ir::ExternalName::user(un),
+            signature: esig,
+            colocated: false,
+            patchable: false,
+        });
+        let b0 = func.dfg.make_block();
+        let left = func.dfg.make_block();
+        let right = func.dfg.make_block();
+        let join = func.dfg.make_block();
+        let callb = func.dfg.make_block();
+        for b in [b0, left, right, join, callb] {
+            func.layout.append_block(b);
+        }
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 32, 3));
+        let x = func.dfg.append_block_param(b0, types::I64);
+        let jp = func.dfg.append_block_param(join, types::I64);
+        let flags = MemFlagsData::new();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, x, a, 0);
+        cur.ins().store(flags, x, a, 8);
+        cur.ins().store(flags, x, a, 16);
+        cur.ins().store(flags, x, a, 24);
+        let z = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, x, z);
+        cur.ins().brif(c, left, &[], right, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(left);
+        cur.ins().jump(join, &[x.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(right);
+        cur.ins().jump(join, &[z.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(join);
+        cur.ins().jump(callb, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(callb);
+        let call = cur.ins().call(ext, &[jp, a]);
+        let r = cur.ins().iconst(types::I64, 0);
+        cur.ins().return_(&[r]);
+
+        let mut nocap = empty_nocap();
+        nocap.insert((call, 1), u64::MAX);
+        let cfg = ControlFlowGraph::with_function(&func);
+        run(&mut func, &cfg, &nocap, false, &Default::default());
+        // The callee reads ss29 through `a`: 4 writeback stores before
+        // the call plus 4 reloads after it — none may be dropped.
+        assert_eq!(memops(&func), 8, "missing writeback/reload pairs:\n{func}");
+        verify(&func);
+    }
+
+    /// Without `notrap` a load through a `{slot, 0}` param can't promote:
+    /// the null edge isn't ruled out by anything else here (the guard
+    /// tests a different value), so the field stays in memory.
+    #[test]
+    fn unguarded_nullable_load_stays() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        let join = func.dfg.make_block();
+        for b in [b0, join] {
+            func.layout.append_block(b);
+        }
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let x = func.dfg.append_block_param(b0, types::I64);
+        let p = func.dfg.append_block_param(join, types::I64);
+        let flags = MemFlagsData::new();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, x, a, 0);
+        let z = cur.ins().iconst(types::I64, 0);
+        let c = cur.ins().icmp(IntCC::Equal, x, z);
+        cur.ins().brif(c, join, &[z.into()], join, &[a.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(join);
+        let r = cur.ins().load(types::I64, flags, p, 0);
+        cur.ins().return_(&[r]);
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        assert_eq!(run(&mut func, &cfg, &empty_nocap(), false, &Default::default()), 0);
+        assert_eq!(memops(&func), 2);
+        verify(&func);
+    }
+
+    /// `i` loop whose body reads the field on one path before any store
+    /// (`body -> ld`) and stores it on the other: without a kill the field
+    /// is live into `body`, so the loop header carries it as a param from
+    /// one iteration into the next. A lifetime kill at the top of `body`
+    /// (MIR's StorageLive per iteration) ends that range: the header keeps
+    /// only `i`, and the unstored read takes the undef value.
+    fn kill_loop(kill: bool) -> (Function, Block) {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let [b0, h, body, st, ld, done] = std::array::from_fn(|_| func.dfg.make_block());
+        for b in [b0, h, body, st, ld, done] {
+            func.layout.append_block(b);
+        }
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let arg0 = func.dfg.append_block_param(b0, types::I64);
+        let i = func.dfg.append_block_param(h, types::I64);
+        let flags = MemFlagsData::new();
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, arg0, a, 0);
+        let z = cur.ins().iconst(types::I64, 0);
+        cur.ins().jump(h, &[z.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+        let c = cur.ins().icmp_imm_u(IntCC::UnsignedLessThan, i, 10);
+        cur.ins().brif(c, body, &[], done, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(body);
+        let odd = cur.ins().band_imm_u(i, 1);
+        cur.ins().brif(odd, st, &[], ld, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(st);
+        cur.ins().store(flags, i, a, 0);
+        cur.ins().jump(ld, &[]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(ld);
+        let x = cur.ins().load(types::I64, flags, a, 0);
+        let n = cur.ins().iadd(i, x);
+        cur.ins().jump(h, &[n.into()]);
+
+        let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+        cur.ins().return_(&[i]);
+
+        let kills = [Kill {
+            slot: ss,
+            anchor: None,
+            block: body,
+        }];
+        let cfg = ControlFlowGraph::with_function(&func);
+        let k: &[Kill] = if kill { &kills } else { &[] };
+        let n = run_lt(&mut func, &cfg, &empty_nocap(), false, &Default::default(), k, None);
+        assert!(n > 0, "expected promotion");
+        assert_eq!(memops(&func), 0);
+        verify(&func);
+        (func, h)
+    }
+
+    #[test]
+    fn lifetime_kill_ends_loop_carried_field() {
+        let (f, h) = kill_loop(false);
+        assert_eq!(f.dfg.num_block_params(h), 2, "no kill: the field rides the header\n{f}");
+        let (f, h) = kill_loop(true);
+        assert_eq!(f.dfg.num_block_params(h), 1, "kill at body top: header keeps only `i`\n{f}");
+    }
+
+    /// A kill after an inst forgets the value only from there on: the
+    /// load before it still reads the store, the one after it reads undef
+    /// (here: not the stored argument).
+    #[test]
+    fn lifetime_kill_after_anchor() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let b0 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let arg0 = func.dfg.append_block_param(b0, types::I64);
+        let flags = MemFlagsData::new();
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        cur.ins().store(flags, arg0, a, 0);
+        let x = cur.ins().load(types::I64, flags, a, 0);
+        let anchor = cur.ins().iadd_imm_s(x, 1);
+        let y = cur.ins().load(types::I64, flags, a, 0);
+        cur.ins().return_(&[x, y]);
+        let anchor = func.dfg.value_def(anchor).unwrap_inst();
+        let kills = [Kill {
+            slot: ss,
+            anchor: Some(anchor),
+            block: b0,
+        }];
+        let cfg = ControlFlowGraph::with_function(&func);
+        run_lt(&mut func, &cfg, &empty_nocap(), false, &Default::default(), &kills, None);
+        assert_eq!(memops(&func), 0);
+        assert_eq!(func.dfg.resolve_aliases(x), arg0, "{func}");
+        assert_ne!(func.dfg.resolve_aliases(y), arg0, "{func}");
+        verify(&func);
+    }
+
+    /// `kills_of` keeps exact singleton markers only: a lost anchor, an
+    /// anchor that left its block, and an ambiguous (two-slot) record all
+    /// drop out.
+    #[test]
+    fn kills_of_keeps_exact_markers() {
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::Fast));
+        let b0 = func.dfg.make_block();
+        let b1 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        func.layout.append_block(b1);
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        let dead = cur.ins().iadd_imm_s(a, 0);
+        cur.ins().jump(b1, &[]);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b1);
+        cur.ins().return_(&[]);
+        let ai = func.dfg.value_def(a).unwrap_inst();
+        let di = func.dfg.value_def(dead).unwrap_inst();
+        func.layout.remove_inst(di);
+        let lts = vec![
+            (vec![ss], Some(ai), b0, true),
+            (vec![ss], None, b1, false),
+            (vec![ss], Some(di), b0, false),
+            (vec![ss], Some(ai), b1, false),
+            (vec![ss, ss], Some(ai), b0, false),
+        ];
+        let k = kills_of(&func, &lts);
+        assert_eq!(k.len(), 2);
+        assert_eq!((k[0].anchor, k[0].block), (Some(ai), b0));
+        assert_eq!((k[1].anchor, k[1].block), (None, b1));
+    }
+
+    /// A marker covers its whole slot only on the slot's own address with
+    /// a size that reaches its end.
+    #[test]
+    fn marker_whole_needs_the_base_and_full_size() {
+        use crate::slotmerge::{marker_slots_lt, marker_whole};
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), Signature::new(CallConv::Fast));
+        let b0 = func.dfg.make_block();
+        func.layout.append_block(b0);
+        let ss =
+            func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 16, 3));
+        let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+        let a = cur.ins().stack_addr(types::I64, ss, 0);
+        let a8 = cur.ins().iadd_imm_s(a, 8);
+        let ao = cur.ins().stack_addr(types::I64, ss, 8);
+        cur.ins().return_(&[]);
+        assert!(marker_whole(&func, a, None));
+        assert!(marker_whole(&func, a, Some(-1)));
+        assert!(marker_whole(&func, a, Some(16)));
+        assert!(!marker_whole(&func, a, Some(8)));
+        assert!(!marker_whole(&func, a8, None));
+        assert!(!marker_whole(&func, ao, None));
+        assert_eq!(marker_slots_lt(&func, a8, None, false), vec![ss]);
+        assert_eq!(marker_slots_lt(&func, a8, None, true), vec![ss, ss]);
+        assert_eq!(marker_slots_lt(&func, a, None, true), vec![ss]);
+    }
+
+    /// `PLIRON_SLOTPROM_SYNCCOST`: a field whose only uses sit next to a
+    /// bounded call (the writeback and reload would replace exactly the
+    /// store and load promotion removes) stays in memory; behind a cold
+    /// call in a loop that reads and writes it every iteration it is
+    /// promoted.
+    #[test]
+    fn sync_cost_weighs_calls_against_accesses() {
+        fn build(in_loop: bool) -> (Function, Inst) {
+            let mut sig = Signature::new(CallConv::Fast);
+            sig.params.push(AbiParam::new(types::I64));
+            sig.returns.push(AbiParam::new(types::I64));
+            let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig.clone());
+            let esig = func.import_signature(sig.clone());
+            let ext = func.dfg.ext_funcs.push(cranelift_codegen::ir::ExtFuncData {
+                name: cranelift_codegen::ir::ExternalName::user(Default::default()),
+                signature: esig,
+                colocated: false,
+                patchable: false,
+            });
+            let ss =
+                func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+            let flags = MemFlagsData::new();
+            let b0 = func.dfg.make_block();
+            func.layout.append_block(b0);
+            let arg0 = func.dfg.append_block_param(b0, types::I64);
+            let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+            let a = cur.ins().stack_addr(types::I64, ss, 0);
+            cur.ins().store(flags, arg0, a, 0);
+            if !in_loop {
+                let call = cur.ins().call(ext, &[a]);
+                let r = cur.ins().load(types::I64, flags, a, 0);
+                cur.ins().return_(&[r]);
+                return (func, call);
+            }
+            let [h, cold, latch, done] = std::array::from_fn(|_| func.dfg.make_block());
+            for b in [h, cold, latch, done] {
+                func.layout.append_block(b);
+            }
+            func.layout.set_cold(cold);
+            let mut cur = FuncCursor::new(&mut func).at_bottom(b0);
+            cur.ins().jump(h, &[]);
+            let mut cur = FuncCursor::new(&mut func).at_bottom(h);
+            let x = cur.ins().load(types::I64, flags, a, 0);
+            let x1 = cur.ins().iadd_imm_s(x, 1);
+            cur.ins().store(flags, x1, a, 0);
+            let c = cur.ins().icmp_imm_u(IntCC::Equal, x1, 1000);
+            cur.ins().brif(c, cold, &[], latch, &[]);
+            let mut cur = FuncCursor::new(&mut func).at_bottom(cold);
+            let call = cur.ins().call(ext, &[a]);
+            cur.ins().jump(latch, &[]);
+            let mut cur = FuncCursor::new(&mut func).at_bottom(latch);
+            let y = cur.ins().load(types::I64, flags, a, 0);
+            let c2 = cur.ins().icmp_imm_u(IntCC::UnsignedLessThan, y, 5000);
+            cur.ins().brif(c2, h, &[], done, &[]);
+            let mut cur = FuncCursor::new(&mut func).at_bottom(done);
+            cur.ins().return_(&[y]);
+            (func, call)
+        }
+        // Block weights as `s_slotprom` computes them.
+        fn weights(func: &Function) -> FxHashMap<Block, u32> {
+            let cfg = ControlFlowGraph::with_function(func);
+            let dt = cranelift_codegen::dominator_tree::DominatorTree::with_function(func, &cfg);
+            let mut la = cranelift_codegen::loop_analysis::LoopAnalysis::new();
+            la.compute(func, &cfg, &dt);
+            func.layout
+                .blocks()
+                .map(|b| {
+                    let w = 1u32 << (3 * la.loop_level(b).level().min(3));
+                    (b, if func.layout.is_cold(b) { (w / 8).max(1) } else { w })
+                })
+                .collect()
+        }
+        for (in_loop, want) in [(false, false), (true, true)] {
+            let (mut func, call) = build(in_loop);
+            let before = memops(&func);
+            let mut nocap = empty_nocap();
+            nocap.insert((call, 0), u64::MAX);
+            let w = weights(&func);
+            let cfg = ControlFlowGraph::with_function(&func);
+            let n = run_lt(&mut func, &cfg, &nocap, false, &Default::default(), &[], Some(&w));
+            assert_eq!(n > 0, want, "in_loop={in_loop}:\n{func}");
+            if !want {
+                assert_eq!(memops(&func), before);
+            }
+            verify(&func);
+            // Without the cost check both promote.
+            let (mut func, call) = build(in_loop);
+            let mut nocap = empty_nocap();
+            nocap.insert((call, 0), u64::MAX);
+            let cfg = ControlFlowGraph::with_function(&func);
+            assert!(run(&mut func, &cfg, &nocap, false, &Default::default()) > 0);
+        }
+    }
+}

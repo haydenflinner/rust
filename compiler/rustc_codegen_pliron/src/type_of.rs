@@ -45,10 +45,7 @@ pub fn exts_of<'tcx>(fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Exts {
                 e.params.push(ext(a));
                 e.params.push(ext(b));
             }
-            PassMode::Indirect {
-                meta_attrs: Some(_),
-                ..
-            } => {
+            PassMode::IndirectUnsized { .. } => {
                 e.params.push(ArgExt::None);
                 e.params.push(ArgExt::None);
             }
@@ -59,13 +56,10 @@ pub fn exts_of<'tcx>(fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> Exts {
                 e.params.push(ArgExt::None);
             }
             PassMode::Indirect {
-                meta_attrs: None,
                 mode: IndirectMode::OnStack,
                 ..
             } => e.params.push(ArgExt::ByVal(arg.layout.size.bytes() as u32)),
-            PassMode::Indirect {
-                meta_attrs: None, ..
-            } => e.params.push(ArgExt::None),
+            PassMode::Indirect { .. } => e.params.push(ArgExt::None),
         }
     }
     e
@@ -111,6 +105,7 @@ impl<'tcx> CodegenCx<'tcx> {
             Float::F32 => self.type_f32(),
             Float::F64 => self.type_f64(),
             Float::F128 => self.type_f128(),
+            Float::PpcF128 => self.type_ppcf128(),
         }
     }
     pub fn type_padding_filler(&self, size: Size, align: Align) -> TypeHandle {
@@ -147,6 +142,7 @@ impl<'tcx> CodegenCx<'tcx> {
         t
     }
 
+    // r[impl front.types.layout]
     fn uncached_layout_type(&self, layout: TyAndLayout<'tcx>) -> TypeHandle {
         match layout.backend_repr {
             BackendRepr::Scalar(_) => unreachable!(),
@@ -226,6 +222,7 @@ impl<'tcx> CodegenCx<'tcx> {
                 _ => panic!("unsupported float reg {r:?}"),
             },
             RegKind::Vector { .. } => self.type_vector(self.type_i8(), r.size.bytes()),
+            RegKind::PpcF128 => self.type_ppcf128(),
         }
     }
 }
@@ -263,6 +260,9 @@ impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
     }
     fn type_f128(&self) -> TypeHandle {
         FP128Type::get(&mut self.pctx.borrow_mut()).into()
+    }
+    fn type_ppcf128(&self) -> TypeHandle {
+        panic!("ppc_fp128 is PowerPC-only; pliron has no PowerPC target")
     }
     fn type_array(&self, ty: TypeHandle, len: u64) -> TypeHandle {
         ArrayType::get(&mut self.pctx.borrow_mut(), ty, len).into()
@@ -348,6 +348,7 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
         args.extend((0..rest_count).map(|_| unit));
         self.type_struct(&args, false)
     }
+    // r[impl front.abi.fnsig]
     fn fn_decl_backend_type(&self, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> TypeHandle {
         let mut args = Vec::new();
         let ret = match &fn_abi.ret.mode {
@@ -360,6 +361,7 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
                 args.push(self.type_ptr());
                 self.type_void()
             }
+            PassMode::IndirectUnsized { .. } => unreachable!("unsized return value"),
         };
         let nargs = if fn_abi.c_variadic {
             fn_abi.fixed_count as usize
@@ -375,10 +377,7 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
                     args.push(self.scalar_pair_element_backend_type(arg.layout, 1, true));
                     continue;
                 }
-                PassMode::Indirect {
-                    meta_attrs: Some(_),
-                    ..
-                } => {
+                PassMode::IndirectUnsized { .. } => {
                     let ptr_ty = Ty::new_mut_ptr(self.tcx, arg.layout.ty);
                     let pl = self.layout_of(ptr_ty);
                     args.push(self.scalar_pair_element_backend_type(pl, 0, true));
@@ -394,9 +393,7 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
                     }
                     self.cast_backend_type(cast)
                 }
-                PassMode::Indirect {
-                    meta_attrs: None, ..
-                } => self.type_ptr(),
+                PassMode::Indirect { .. } => self.type_ptr(),
             };
             args.push(t);
         }
@@ -415,6 +412,17 @@ impl<'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn immediate_backend_type(&self, layout: TyAndLayout<'tcx>) -> TypeHandle {
         match layout.backend_repr {
             BackendRepr::Scalar(s) if s.is_bool() => self.type_i1(),
+            // Like cg_llvm's `immediate_llvm_type`: an immediate pair holds
+            // the two *immediate* element types, so a bool half is i1. A
+            // `PassMode::Pair` return is built and unpacked with this type
+            // (`immediate_or_packed_pair` / `from_immediate_or_packed_pair`,
+            // which don't truncate), so the memory type `{i8, i8}` handed
+            // an i8 bool to the caller and `!b` became `b ^ 0xff`.
+            BackendRepr::ScalarPair { .. } => {
+                let a = self.scalar_pair_element_backend_type(layout, 0, true);
+                let b = self.scalar_pair_element_backend_type(layout, 1, true);
+                self.type_struct(&[a, b], false)
+            }
             _ => self.layout_type(layout),
         }
     }

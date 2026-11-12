@@ -30,7 +30,7 @@ pub fn compile<B: LowerBackend + TargetIsa>(
         crate::machinst::Lower::new(f, abi, emit_info, block_order, sigs, b.flags().clone())?;
 
     // Lower the IR.
-    let vcode = {
+    let mut vcode = {
         log::debug!(
             "Number of CLIF instructions to lower: {}",
             f.dfg.num_insts()
@@ -48,11 +48,37 @@ pub fn compile<B: LowerBackend + TargetIsa>(
     log::debug!("Number of lowered vcode blocks: {}", vcode.num_blocks());
     trace!("vcode from lowering: \n{:?}", vcode);
 
+    // PLIRON: `PLIRON_PREVCODE=<substr>` dumps pre-regalloc VCode for
+    // functions whose CLIF name contains <substr>; `all` matches every
+    // function. (CLIF names are `u0:N` — correlate to symbols with
+    // `PLIRON_CLIF` output.)
+    static PREVCODE: std::sync::OnceLock<Option<alloc::string::String>> =
+        std::sync::OnceLock::new();
+    static RA2_VERBOSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static RA2_EDITS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let prevcode_match = PREVCODE
+        .get_or_init(|| std::env::var("PLIRON_PREVCODE").ok())
+        .as_deref()
+        .map(|pat| {
+            pat == "all"
+                || (!pat.is_empty()
+                    && (format!("{}", f.name).contains(pat)
+                        || crate::PLIRON_FN_NAME.with(|s| s.borrow().contains(pat))))
+        })
+        .unwrap_or(false);
+    let ra2_verbose =
+        *RA2_VERBOSE.get_or_init(|| std::env::var_os("PLIRON_RA2_VERBOSE").is_some());
+    let ra2_edits = *RA2_EDITS.get_or_init(|| std::env::var_os("PLIRON_RA2_EDITS").is_some());
+    if prevcode_match || regalloc2::explain_on() {
+        eprintln!("==== prevcode {} ====\n{:?}", f.name, vcode);
+    }
+
     // Perform register allocation.
     {
         let _tt = timing::regalloc();
         let mut options = RegallocOptions::default();
-        options.verbose_log = b.flags().regalloc_verbose_logs();
+        options.verbose_log = b.flags().regalloc_verbose_logs()
+            || ra2_verbose;
 
         if cfg!(debug_assertions) {
             options.validate_ssa = true;
@@ -63,6 +89,8 @@ pub fn compile<B: LowerBackend + TargetIsa>(
             RegallocAlgorithm::SinglePass => Algorithm::Fastalloc,
         };
 
+        vcode.compute_remat_vregs();
+        vcode.compute_block_freq();
         regalloc2::run_with_ctx(&vcode, vcode.abi.machine_env(), &options, regalloc_ctx)
             .map_err(|err| {
                 log::error!(
@@ -75,6 +103,140 @@ pub fn compile<B: LowerBackend + TargetIsa>(
                 err
             })
             .expect("register allocation");
+
+        // PLIRON: `PLIRON_RA2_VERBOSE=1` dumps regalloc decision
+        // annotations for the same functions as `PLIRON_PREVCODE`.
+        if prevcode_match && ra2_verbose {
+            let mut anns: Vec<_> = regalloc_ctx
+                .debug_annotations
+                .iter()
+                .map(|(pp, v)| (*pp, v.clone()))
+                .collect();
+            anns.sort_by_key(|(pp, _)| (pp.inst().index(), pp.pos() as u8));
+            eprintln!("==== ra2annot {} ====", f.name);
+            for (pp, v) in anns {
+                for a in v {
+                    eprintln!("  {:?}: {}", pp, a);
+                }
+            }
+            eprintln!("==== ra2annot end ====");
+        }
+        // PLIRON: `PLIRON_RA2_EDITS=1` dumps regalloc-inserted moves
+        // (program point → edit) for the same functions as
+        // `PLIRON_PREVCODE`.
+        if prevcode_match && ra2_edits {
+            eprintln!("==== ra2edits {} ====", f.name);
+            for (pp, edit) in &regalloc_ctx.output.edits {
+                let inst = pp.inst();
+                // Find the vcode block containing this inst and show
+                // the inst's operand vregs -> allocs for context.
+                use regalloc2::Function as _;
+                let mut blk = None;
+                for b in 0..vcode.num_blocks() {
+                    let r = vcode.block_insns(regalloc2::Block::new(b));
+                    if r.len() > 0
+                        && inst.index() >= r.first().index()
+                        && inst.index() <= r.last().index()
+                    {
+                        blk = Some(b);
+                        break;
+                    }
+                }
+                let ops: Vec<String> = vcode
+                    .inst_operands(inst)
+                    .iter()
+                    .enumerate()
+                    .map(|(i, o)| {
+                        let alloc = regalloc_ctx
+                            .output
+                            .inst_allocs(inst)
+                            .get(i)
+                            .map(|a| format!("{:?}", a))
+                            .unwrap_or_else(|| "?".into());
+                        format!("v{}={}", o.vreg().vreg(), alloc)
+                    })
+                    .collect();
+                eprintln!(
+                    "  {:?} [blk{:?} inst{} <{}>]: {:?}",
+                    pp,
+                    blk,
+                    inst.index(),
+                    ops.join(" "),
+                    edit
+                );
+            }
+            eprintln!("==== ra2edits end ====");
+        }
+        // PLIRON: `PLIRON_RA2_STATS=1` prints one line per function with
+        // the regalloc-inserted edits classified by kind and position
+        // (`RA2STAT <fn> insts rr_term rr_entry rr_mid st_term st_entry
+        // st_mid ld_term ld_entry ld_mid ss nslots`): rr = reg->reg,
+        // st = spill store, ld = reload, ss = stack->stack; term = at the
+        // block's last inst (edge / block-param moves), entry = before its
+        // first inst, mid = anywhere else (call ABI, splits).
+        if std::env::var_os("PLIRON_RA2_STATS").is_some() {
+            use regalloc2::Function as _;
+            let n = vcode.num_insts();
+            let mut first = alloc::vec![false; n];
+            let mut last = alloc::vec![false; n];
+            for b in 0..vcode.num_blocks() {
+                let r = vcode.block_insns(regalloc2::Block::new(b));
+                if r.len() > 0 {
+                    first[r.first().index()] = true;
+                    last[r.last().index()] = true;
+                }
+            }
+            let mut c = [[0u32; 3]; 4];
+            for (pp, edit) in &regalloc_ctx.output.edits {
+                let regalloc2::Edit::Move { from, to } = edit;
+                let k = match (from.is_stack(), to.is_stack()) {
+                    (false, false) => 0,
+                    (false, true) => 1,
+                    (true, false) => 2,
+                    (true, true) => 3,
+                };
+                let i = pp.inst().index();
+                let pos = if last[i] {
+                    0
+                } else if first[i] && pp.pos() == regalloc2::InstPosition::Before {
+                    1
+                } else {
+                    2
+                };
+                c[k][pos] += 1;
+            }
+            let nslots = regalloc_ctx.output.num_spillslots;
+            let sym = crate::PLIRON_FN_NAME.with(|s| s.borrow().clone());
+            let name = if sym.is_empty() { alloc::format!("{}", f.name) } else { sym };
+            eprintln!(
+                "RA2STAT {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                name, n, c[0][0], c[0][1], c[0][2], c[1][0], c[1][1], c[1][2], c[2][0],
+                c[2][1], c[2][2], c[3][0] + c[3][1] + c[3][2], nslots, 0
+            );
+        }
+        // PLIRON: `PLIRON_RA2_ALLOC=1` dumps each vreg that regalloc2
+        // assigned a stack slot at least once (the actual spilled set).
+        if prevcode_match && std::env::var_os("PLIRON_RA2_ALLOC").is_some() {
+            use regalloc2::Function as _;
+            let mut spilled = std::collections::BTreeMap::new();
+            for i in 0..vcode.num_insts() {
+                let inst = regalloc2::Inst::new(i);
+                for (k, o) in vcode.inst_operands(inst).iter().enumerate() {
+                    if let Some(a) = regalloc_ctx.output.inst_allocs(inst).get(k) {
+                        if a.is_stack() {
+                            spilled
+                                .entry(o.vreg().vreg())
+                                .or_insert_with(|| format!("{:?}", a));
+                        }
+                    }
+                }
+            }
+            eprintln!("==== ra2alloc {} ====", f.name);
+            for (v, a) in &spilled {
+                eprintln!("  v{v} {a}");
+            }
+            eprintln!("==== ra2alloc end ====");
+        }
     }
 
     // Run the regalloc checker, if requested.
@@ -89,6 +251,17 @@ pub fn compile<B: LowerBackend + TargetIsa>(
                 err
             })
             .expect("register allocation checker");
+    }
+    // PLIRON: `PLIRON_RELOADPRE_CHECK=1` runs the checker on the
+    // allocation as `reload_pre` rewrites it at emission.
+    if std::env::var_os("PLIRON_RELOADPRE_CHECK").is_some()
+        && let Some(out) = vcode.post_alloc(&regalloc_ctx.output)
+    {
+        let mut checker = regalloc2::checker::Checker::new(&vcode, &vcode.abi.machine_env());
+        checker.prepare(&out);
+        if let Err(err) = checker.run() {
+            panic!("reload_pre: checker errors in {}:\n{err:?}", f.name);
+        }
     }
 
     Ok(vcode)

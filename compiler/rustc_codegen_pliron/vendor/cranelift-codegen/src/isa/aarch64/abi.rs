@@ -41,6 +41,62 @@ impl From<StackAMode> for AMode {
 
 // Returns the size of stack space needed to store the
 // `clobbered_callee_saved` registers.
+
+/// PLIRON: one callee-save slot of the clobber area, in upstream's push
+/// order (push `k` sits at `clobber_size - 16 * (k + 1)` above the bottom
+/// of the area).
+enum SaveSlot {
+    Int(Reg),
+    IntPair(Reg, Reg),
+    Vec(Reg),
+    VecPair(Reg, Reg),
+}
+
+/// PLIRON: `PLIRON_A64_FLATSAVE=0` keeps upstream's pre-indexed pushes.
+/// Otherwise callee saves are stored at fixed offsets after one `sp`
+/// adjustment (LLVM's prologue shape): each `stp ..., [sp, #-16]!` writes
+/// `sp` back, so a six-pair save (and its post-indexed restore) is a serial
+/// chain through `sp`. serde_json's `skip_to_escape` spent most of its
+/// early-return path in that chain.
+fn flat_save_slots(
+    call_conv: isa::CallConv,
+    frame_layout: &FrameLayout,
+) -> Option<Vec<SaveSlot>> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("PLIRON_A64_FLATSAVE").as_deref() != Ok("0"))
+        || call_conv == isa::CallConv::PreserveAll
+        || frame_layout.setup_area_size == 0
+        || frame_layout.tail_args_size != frame_layout.incoming_args_size
+    {
+        return None;
+    }
+    let (clobbered_int, clobbered_vec) = frame_layout.clobbered_callee_saves_by_class();
+    let mut v = Vec::new();
+    let ints = clobbered_int.chunks_exact(2);
+    if let [rd] = ints.remainder() {
+        v.push(SaveSlot::Int(rd.to_reg().into()));
+    }
+    for p in ints.rev() {
+        v.push(SaveSlot::IntPair(p[0].to_reg().into(), p[1].to_reg().into()));
+    }
+    let vecs = clobbered_vec.chunks_exact(2);
+    if let [rd] = vecs.remainder() {
+        v.push(SaveSlot::Vec(rd.to_reg().into()));
+    }
+    for p in vecs.rev() {
+        v.push(SaveSlot::VecPair(p[0].to_reg().into(), p[1].to_reg().into()));
+    }
+    (v.len() as u32 * 16 == frame_layout.clobber_size && !v.is_empty()).then_some(v)
+}
+
+/// Bytes the flat save allocates at once: the clobber area, plus the fixed
+/// frame when every save slot stays within `stp`'s +504 offset range.
+fn flat_alloc(frame_layout: &FrameLayout) -> (u32, bool) {
+    let fixed = frame_layout.fixed_frame_storage_size + frame_layout.outgoing_args_size;
+    let total = frame_layout.clobber_size + fixed;
+    if total <= 504 { (total, true) } else { (frame_layout.clobber_size, false) }
+}
+
 fn compute_clobber_size(
     call_conv: isa::CallConv,
     clobbered_callee_saves: &[Writable<RealReg>],
@@ -837,6 +893,58 @@ impl ABIMachineSpec for AArch64MachineDeps {
             });
         }
 
+        if let Some(slots) = flat_save_slots(call_conv, frame_layout) {
+            let (alloc, with_fixed) = flat_alloc(frame_layout);
+            let below = alloc - frame_layout.clobber_size;
+            insts.extend(Self::gen_sp_reg_adjust(-(alloc as i32)));
+            let n = slots.len() as u32;
+            for (k, slot) in slots.iter().enumerate() {
+                let off = i64::from(below + frame_layout.clobber_size - 16 * (k as u32 + 1));
+                let clobber_offset = 16 * (n - 1 - k as u32);
+                let pair = |ty| PairAMode::SignedOffset {
+                    reg: regs::stack_reg(),
+                    simm7: SImm7Scaled::maybe_from_i64(off, ty).unwrap(),
+                };
+                let (inst, saved): (Inst, SmallVec<[(Reg, u32); 2]>) = match *slot {
+                    SaveSlot::Int(rd) => (
+                        Inst::Store64 { rd, mem: AMode::SPOffset { off }, flags: MemFlagsData::trusted() },
+                        smallvec![(rd, 0)],
+                    ),
+                    SaveSlot::IntPair(rt, rt2) => (
+                        Inst::StoreP64 { rt, rt2, mem: pair(types::I64), flags: MemFlagsData::trusted() },
+                        smallvec![(rt, 0), (rt2, 8)],
+                    ),
+                    SaveSlot::Vec(rd) => (
+                        Inst::FpuStore64 { rd, mem: AMode::SPOffset { off }, flags: MemFlagsData::trusted() },
+                        smallvec![(rd, 0)],
+                    ),
+                    SaveSlot::VecPair(rt, rt2) => (
+                        Inst::FpuStoreP64 { rt, rt2, mem: pair(F64), flags: MemFlagsData::trusted() },
+                        smallvec![(rt, 0), (rt2, 8)],
+                    ),
+                };
+                insts.push(inst);
+                if flags.unwind_info() {
+                    for (r, d) in saved {
+                        insts.push(Inst::Unwind {
+                            inst: UnwindInst::SaveReg {
+                                clobber_offset: clobber_offset + d,
+                                reg: r.to_real_reg().unwrap(),
+                            },
+                        });
+                    }
+                }
+            }
+            let stack_size = frame_layout.fixed_frame_storage_size + frame_layout.outgoing_args_size;
+            if !with_fixed && stack_size > 0 {
+                insts.extend(Self::gen_sp_reg_adjust(-(stack_size as i32)));
+            }
+            if flags.unwind_info() && stack_size > 0 {
+                insts.push(Inst::Unwind { inst: UnwindInst::StackAlloc { size: stack_size } });
+            }
+            return insts;
+        }
+
         // We use pre-indexed addressing modes here, rather than the possibly
         // more efficient "subtract sp once then used fixed offsets" scheme,
         // because (i) we cannot necessarily guarantee that the offset of a
@@ -1025,6 +1133,39 @@ impl ABIMachineSpec for AArch64MachineDeps {
         let mut insts = SmallVec::new();
         let (clobbered_int, clobbered_vec) = frame_layout.clobbered_callee_saves_by_class();
 
+        if let Some(slots) = flat_save_slots(call_conv, frame_layout) {
+            let (alloc, with_fixed) = flat_alloc(frame_layout);
+            let stack_size = frame_layout.fixed_frame_storage_size + frame_layout.outgoing_args_size;
+            if !with_fixed && stack_size > 0 {
+                insts.extend(Self::gen_sp_reg_adjust(stack_size as i32));
+            }
+            let below = alloc - frame_layout.clobber_size;
+            for (k, slot) in slots.iter().enumerate() {
+                let off = i64::from(below + frame_layout.clobber_size - 16 * (k as u32 + 1));
+                let pair = |ty| PairAMode::SignedOffset {
+                    reg: regs::stack_reg(),
+                    simm7: SImm7Scaled::maybe_from_i64(off, ty).unwrap(),
+                };
+                let w = |r: Reg| Writable::from_reg(r);
+                insts.push(match *slot {
+                    SaveSlot::Int(rd) => {
+                        Inst::ULoad64 { rd: w(rd), mem: AMode::SPOffset { off }, flags: MemFlagsData::trusted() }
+                    }
+                    SaveSlot::IntPair(rt, rt2) => {
+                        Inst::LoadP64 { rt: w(rt), rt2: w(rt2), mem: pair(types::I64), flags: MemFlagsData::trusted() }
+                    }
+                    SaveSlot::Vec(rd) => {
+                        Inst::FpuLoad64 { rd: w(rd), mem: AMode::SPOffset { off }, flags: MemFlagsData::trusted() }
+                    }
+                    SaveSlot::VecPair(rt, rt2) => {
+                        Inst::FpuLoadP64 { rt: w(rt), rt2: w(rt2), mem: pair(F64), flags: MemFlagsData::trusted() }
+                    }
+                });
+            }
+            insts.extend(Self::gen_sp_reg_adjust(alloc as i32));
+            return insts;
+        }
+
         // Free the fixed frame if necessary.
         let stack_size = frame_layout.fixed_frame_storage_size + frame_layout.outgoing_args_size;
         if stack_size > 0 {
@@ -1177,6 +1318,25 @@ impl ABIMachineSpec for AArch64MachineDeps {
     }
 
     fn get_machine_env(flags: &settings::Flags, _call_conv: isa::CallConv) -> &MachineEnv {
+        if x17_allocatable() || x30_allocatable() {
+            static EXTRA_PINNED: std::sync::OnceLock<MachineEnv> = std::sync::OnceLock::new();
+            static EXTRA: std::sync::OnceLock<MachineEnv> = std::sync::OnceLock::new();
+            let (cell, pinned) = if flags.enable_pinned_reg() {
+                (&EXTRA_PINNED, true)
+            } else {
+                (&EXTRA, false)
+            };
+            return cell.get_or_init(|| {
+                let mut env = create_reg_env(pinned);
+                if x17_allocatable() {
+                    env.preferred_regs_by_class[0].add(xreg_preg(17));
+                }
+                if x30_allocatable() {
+                    env.preferred_regs_by_class[0].add(xreg_preg(30));
+                }
+                env
+            });
+        }
         if flags.enable_pinned_reg() {
             static MACHINE_ENV: MachineEnv = create_reg_env(true);
             &MACHINE_ENV
@@ -1187,24 +1347,12 @@ impl ABIMachineSpec for AArch64MachineDeps {
     }
 
     fn get_regs_clobbered_by_call(call_conv: isa::CallConv, is_exception: bool) -> PRegSet {
-        match (call_conv, is_exception) {
-            (isa::CallConv::Tail, true) => ALL_CLOBBERS,
-            (isa::CallConv::Winch, true) => ALL_CLOBBERS,
-            (isa::CallConv::Winch, false) => WINCH_CLOBBERS,
-            // Note that "PreserveAll" actually preserves nothing at
-            // the callsite if used for a `try_call`, because the
-            // unwinder ABI for `try_call`s is still "no clobbered
-            // register restores" for this ABI (so as to work with
-            // Wasmtime).
-            (isa::CallConv::PreserveAll, true) => ALL_CLOBBERS,
-            (isa::CallConv::SystemV, _) => DEFAULT_AAPCS_CLOBBERS,
-            // On Mach-O, the compact unwind info properly describes how are callee-save
-            // registers restored during unwinding.
-            (isa::CallConv::AppleAarch64, true) => DEFAULT_AAPCS_CLOBBERS,
-            (isa::CallConv::PreserveAll, _) => NO_CLOBBERS,
-            (_, false) => DEFAULT_AAPCS_CLOBBERS,
-            (_, true) => panic!("unimplemented clobbers for exn abi of {call_conv:?}"),
+        let mut set = clobbers_by_conv(call_conv, is_exception);
+        if x30_allocatable() {
+            // `bl`/`blr` write the link register.
+            set.add(xreg_preg(30));
         }
+        set
     }
 
     fn get_ext_mode(
@@ -1230,6 +1378,7 @@ impl ABIMachineSpec for AArch64MachineDeps {
         fixed_frame_storage_size: u32,
         outgoing_args_size: u32,
     ) -> FrameLayout {
+        let lr_clobbered = regs.iter().any(|r| r.to_reg() == link_reg().to_real_reg().unwrap());
         let mut regs: Vec<Writable<RealReg>> = regs
             .iter()
             .cloned()
@@ -1265,8 +1414,15 @@ impl ABIMachineSpec for AArch64MachineDeps {
                 || fixed_frame_storage_size > 0
                 || outgoing_args_size > 0;
 
+        // `PLIRON_X30`: a body that allocates the link register needs the
+        // frame record to save and restore it.
+        let uses_lr = x30_allocatable() && lr_clobbered;
+
         // Compute linkage frame size.
-        let setup_area_size = if needs_linkage_frame || function_calls == FunctionCalls::Regular {
+        let setup_area_size = if needs_linkage_frame
+            || uses_lr
+            || function_calls == FunctionCalls::Regular
+        {
             16 // FP, LR
         } else {
             0
@@ -1633,6 +1789,27 @@ const fn all_clobbers() -> PRegSet {
         .with(vreg_preg(29))
         .with(vreg_preg(30))
         .with(vreg_preg(31))
+}
+
+fn clobbers_by_conv(call_conv: isa::CallConv, is_exception: bool) -> PRegSet {
+    match (call_conv, is_exception) {
+        (isa::CallConv::Tail, true) => ALL_CLOBBERS,
+        (isa::CallConv::Winch, true) => ALL_CLOBBERS,
+        (isa::CallConv::Winch, false) => WINCH_CLOBBERS,
+        // Note that "PreserveAll" actually preserves nothing at
+        // the callsite if used for a `try_call`, because the
+        // unwinder ABI for `try_call`s is still "no clobbered
+        // register restores" for this ABI (so as to work with
+        // Wasmtime).
+        (isa::CallConv::PreserveAll, true) => ALL_CLOBBERS,
+        (isa::CallConv::SystemV, _) => DEFAULT_AAPCS_CLOBBERS,
+        // On Mach-O, the compact unwind info properly describes how are callee-save
+        // registers restored during unwinding.
+        (isa::CallConv::AppleAarch64, true) => DEFAULT_AAPCS_CLOBBERS,
+        (isa::CallConv::PreserveAll, _) => NO_CLOBBERS,
+        (_, false) => DEFAULT_AAPCS_CLOBBERS,
+        (_, true) => panic!("unimplemented clobbers for exn abi of {call_conv:?}"),
+    }
 }
 
 const DEFAULT_AAPCS_CLOBBERS: PRegSet = default_aapcs_clobbers();

@@ -466,10 +466,19 @@ pub(crate) fn emit(
             // If this is a try-call, jump to the continuation
             // (normal-return) block.
             if let Some(try_call) = call_info.try_call_info.as_ref() {
-                let jmp = Inst::JmpKnown {
-                    dst: try_call.continuation,
-                };
-                jmp.emit(sink, info, state);
+                if try_call.continuation_elide {
+                    // PLIRON: the callee cannot return (`TrapCode::NORETURN_CALL`)
+                    // and code follows: no trap, no jump.
+                } else if let Some(code) = try_call.continuation_trap {
+                    // The continuation is a lone `trap`: emit it inline
+                    // (`callq; ud2`) instead of jumping to a cold block.
+                    asm::inst::ud2_zo::new(code).emit(sink, info, state);
+                } else {
+                    let jmp = Inst::JmpKnown {
+                        dst: try_call.continuation,
+                    };
+                    jmp.emit(sink, info, state);
+                }
             }
         }
 
@@ -546,10 +555,19 @@ pub(crate) fn emit(
             );
 
             if let Some(try_call) = call_info.try_call_info.as_ref() {
-                let jmp = Inst::JmpKnown {
-                    dst: try_call.continuation,
-                };
-                jmp.emit(sink, info, state);
+                if try_call.continuation_elide {
+                    // PLIRON: the callee cannot return (`TrapCode::NORETURN_CALL`)
+                    // and code follows: no trap, no jump.
+                } else if let Some(code) = try_call.continuation_trap {
+                    // The continuation is a lone `trap`: emit it inline
+                    // (`callq; ud2`) instead of jumping to a cold block.
+                    asm::inst::ud2_zo::new(code).emit(sink, info, state);
+                } else {
+                    let jmp = Inst::JmpKnown {
+                        dst: try_call.continuation,
+                    };
+                    jmp.emit(sink, info, state);
+                }
             }
         }
 
@@ -719,43 +737,107 @@ pub(crate) fn emit(
             // $start_of_jump_table:
             // -- jump table entries
 
-            // Load base address of jump table.
-            let start_of_jumptable = sink.get_label();
-            asm::inst::leaq_rm::new(tmp1, Amode::rip_relative(start_of_jumptable))
-                .emit(sink, info, state);
+            // PLIRON: deferred narrow table (`PLIRON_JT_NARROW=1`), written
+            // after all code by `MachBuffer::finish` with 1-, 2- or 4-byte
+            // entries holding `target - lowest target` (the default is the
+            // last entry; lowering clamps the index to it):
+            //   lea  tmp1, [rip + table]
+            //   movzbl/movzwl/movl tmp2, [tmp1 + idx*w]   (NOP-padded)
+            //   lea  tmp1, [rip + lowest_target]
+            //   add  tmp1, tmp2
+            //   jmp  *tmp1
+            // Both `lea`s and the load are encoded in a scratch buffer and
+            // copied in (the scratch label fixups are dropped); the buffer
+            // patches the displacements and the load at `finish`.
+            if sink.can_defer_jump_table(LabelUse::JmpRel32) {
+                let scratch = |inst: &dyn Fn(&mut MachBuffer<Inst>, &mut EmitState)| {
+                    let mut buf = MachBuffer::<Inst>::new();
+                    inst(&mut buf, &mut state.clone());
+                    SmallVec::<[u8; 8]>::from_slice(buf.emitted_bytes())
+                };
+                let lea = scratch(&|buf, st| {
+                    let l = buf.get_label();
+                    asm::inst::leaq_rm::new(tmp1, Amode::rip_relative(l)).emit(buf, info, st);
+                });
+                let load = |mode: ExtMode, shift: u8| {
+                    scratch(&|buf, st| {
+                        Inst::movzx_rm_r(
+                            mode.clone(),
+                            RegMem::mem(Amode::imm_reg_reg_shift(
+                                0,
+                                Gpr::unwrap_new(tmp1.to_reg()),
+                                Gpr::unwrap_new(idx),
+                                shift,
+                            )),
+                            tmp2,
+                        )
+                        .emit(buf, info, st)
+                    })
+                };
+                let mut load_enc = [load(ExtMode::BL, 0), load(ExtMode::WL, 1), load(ExtMode::LQ, 2)];
+                let len = load_enc.iter().map(|e| e.len()).max().unwrap();
+                for e in &mut load_enc {
+                    e.resize(len, 0x90);
+                }
+                sink.put_data(&lea);
+                let table_use = (sink.cur_offset() - 4, LabelUse::JmpRel32);
+                let load_off = sink.cur_offset();
+                sink.put_data(&load_enc[2]);
+                sink.put_data(&lea);
+                let base_use = (sink.cur_offset() - 4, LabelUse::JmpRel32);
+                asm::inst::addq_rm::new(tmp1, tmp2).emit(sink, info, state);
+                asm::inst::jmpq_m::new(tmp1.to_reg()).emit(sink, info, state);
+                sink.defer_jump_table(MachDeferredJumpTable {
+                    targets: targets
+                        .iter()
+                        .chain(core::iter::once(default_target))
+                        .copied()
+                        .collect(),
+                    table_use,
+                    base_use,
+                    load_off,
+                    load_enc,
+                    scale: 1,
+                });
+            } else {
+                // Load base address of jump table.
+                let start_of_jumptable = sink.get_label();
+                asm::inst::leaq_rm::new(tmp1, Amode::rip_relative(start_of_jumptable))
+                    .emit(sink, info, state);
 
-            // Load value out of the jump table. It's a relative offset to the target block, so it
-            // might be negative; use a sign-extension.
-            let inst = Inst::movsx_rm_r(
-                ExtMode::LQ,
-                RegMem::mem(Amode::imm_reg_reg_shift(
-                    0,
-                    Gpr::unwrap_new(tmp1.to_reg()),
-                    Gpr::unwrap_new(idx),
-                    2,
-                )),
-                tmp2,
-            );
-            inst.emit(sink, info, state);
+                // Load value out of the jump table. It's a relative offset to the target block, so it
+                // might be negative; use a sign-extension.
+                let inst = Inst::movsx_rm_r(
+                    ExtMode::LQ,
+                    RegMem::mem(Amode::imm_reg_reg_shift(
+                        0,
+                        Gpr::unwrap_new(tmp1.to_reg()),
+                        Gpr::unwrap_new(idx),
+                        2,
+                    )),
+                    tmp2,
+                );
+                inst.emit(sink, info, state);
 
-            // Add base of jump table to jump-table-sourced block offset.
-            asm::inst::addq_rm::new(tmp1, tmp2).emit(sink, info, state);
+                // Add base of jump table to jump-table-sourced block offset.
+                asm::inst::addq_rm::new(tmp1, tmp2).emit(sink, info, state);
 
-            // Branch to computed address.
-            asm::inst::jmpq_m::new(tmp1.to_reg()).emit(sink, info, state);
+                // Branch to computed address.
+                asm::inst::jmpq_m::new(tmp1.to_reg()).emit(sink, info, state);
 
-            // Emit jump table (table of 32-bit offsets).
-            sink.bind_label(start_of_jumptable, state.ctrl_plane_mut());
-            let jt_off = sink.cur_offset();
-            for &target in targets.iter().chain(core::iter::once(default_target)) {
-                let word_off = sink.cur_offset();
-                // off_into_table is an addend here embedded in the label to be later patched at
-                // the end of codegen. The offset is initially relative to this jump table entry;
-                // with the extra addend, it'll be relative to the jump table's start, after
-                // patching.
-                let off_into_table = word_off - jt_off;
-                sink.use_label_at_offset(word_off, target, LabelUse::PCRel32);
-                sink.put4(off_into_table);
+                // Emit jump table (table of 32-bit offsets).
+                sink.bind_label(start_of_jumptable, state.ctrl_plane_mut());
+                let jt_off = sink.cur_offset();
+                for &target in targets.iter().chain(core::iter::once(default_target)) {
+                    let word_off = sink.cur_offset();
+                    // off_into_table is an addend here embedded in the label to be later patched at
+                    // the end of codegen. The offset is initially relative to this jump table entry;
+                    // with the extra addend, it'll be relative to the jump table's start, after
+                    // patching.
+                    let off_into_table = word_off - jt_off;
+                    sink.use_label_at_offset(word_off, target, LabelUse::PCRel32);
+                    sink.put4(off_into_table);
+                }
             }
         }
 
@@ -1871,8 +1953,18 @@ pub(crate) fn emit(
                     // necessary to communicate Cranelift's internal offsets to the
                     // assembler; due to when Cranelift determines these offsets, this
                     // happens quite late (i.e., here during emission).
+                    // PLIRON: the base of an IncomingArg amode is RSP, so the
+                    // offset must cover the active frame plus the linkage area
+                    // (pushed FP + return address when framed; just the return
+                    // address when frameless).
                     incoming_arg_offset: i32::try_from(
-                        frame.tail_args_size + frame.setup_area_size,
+                        frame.active_size()
+                            + frame.tail_args_size
+                            + if frame.setup_area_size == 0 {
+                                8
+                            } else {
+                                frame.setup_area_size
+                            },
                     )
                     .unwrap(),
                     slot_offset: i32::try_from(frame.outgoing_args_size).unwrap(),

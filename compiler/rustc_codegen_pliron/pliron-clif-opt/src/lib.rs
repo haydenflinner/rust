@@ -1,0 +1,96 @@
+//! Cranelift-IR optimization passes extracted from `rustc_codegen_pliron`.
+//!
+//! These passes operate on `cranelift_codegen::ir::Function` and have no
+//! `rustc_private` dependency, so this crate builds on stable Rust and can
+//! host `.clif` filetests and differential tests without relinking the
+//! backend dylib.
+
+pub mod armmerge;
+pub mod scev;
+pub mod brhint;
+pub mod ranges;
+pub mod vrp;
+pub mod bcheck;
+pub mod bunroll;
+pub mod latchspec;
+pub mod mergejump;
+pub mod bittab;
+pub mod brifsel;
+pub mod demand;
+pub mod ivdown;
+pub mod ivptr;
+pub mod memcmpk;
+pub mod mintrip;
+pub mod bytescan;
+pub mod brchain;
+pub mod celim;
+pub mod dbglabel;
+pub mod cicm;
+pub mod clifpeep;
+pub mod cmp3;
+pub mod cmpmerge;
+pub mod commute;
+pub mod config;
+pub mod constdedup;
+pub mod copypair;
+pub mod diffcheck;
+pub mod divconst;
+pub mod dse;
+pub mod edgefwd;
+pub mod edgesel;
+pub mod edgesink;
+pub mod edgespec;
+pub mod esplit;
+pub mod ifconv;
+pub mod foldcommon;
+pub mod indvars;
+pub mod ivalign;
+pub mod ivrefold;
+pub mod ivretro;
+pub mod jumpthread;
+pub mod licm;
+pub mod ldmerge;
+pub mod loadfwd;
+pub mod loopdel;
+pub mod loopidiom;
+pub mod lowbit;
+pub mod looprot;
+pub mod loopvec;
+pub mod memspec;
+pub mod niche;
+pub mod paramsink;
+pub mod pipeline;
+pub mod proots;
+pub mod punroll;
+pub mod pushin;
+pub mod rangefold;
+pub mod reassoc;
+pub mod rebase;
+pub mod lsr;
+pub mod hreassoc;
+pub mod revnorm;
+pub mod slotmerge;
+pub mod slotprom;
+pub mod slp;
+pub mod splink;
+pub mod stepcache;
+pub mod stmerge;
+pub mod stubhoist;
+pub mod switchmap;
+pub mod taildup;
+pub mod tailmerge;
+pub mod tailmergep;
+pub mod tailrec;
+pub(crate) mod trace;
+pub mod unreach;
+pub mod unroll;
+pub(crate) mod uses;
+pub mod vecsel;
+pub mod veclegalize;
+pub mod vmap;
+pub mod webroot;
+pub mod zipiv;
+pub mod ivcmp;
+pub mod invparam;
+
+pub use config::{bisect, env_get, env_is, env_set, pass_enabled};

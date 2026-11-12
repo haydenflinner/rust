@@ -1,0 +1,21 @@
+[package]
+name = "pliron-bench"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+autobenches = false
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+# benchfmt::Suite + CountingAlloc + pprof; vendored, see vendor/benchfmt.rs/PLIRON_PATCH.md.
+benchfmt = { path = "../vendor/benchfmt.rs", features = ["pprof"] }
+# varint_postcard kernel; same versions as the backend's own (src/lto.rs).
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+
+[[bench]]
+name = "kernels"
+harness = false

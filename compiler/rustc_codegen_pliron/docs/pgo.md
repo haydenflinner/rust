@@ -1,0 +1,197 @@
+# Pliron PGO
+
+Profile-guided optimization for the pure-Rust backend. One design covers
+native (Cranelift) and wasm (waffle) targets; the profile format is shared.
+
+## What LLVM does, and what we do differently
+
+LLVM PGO: `-fprofile-instr-generate` inserts counter increments in IR,
+a C runtime (`profiler_builtins`) writes `.profraw` at exit,
+`llvm-profdata` merges to `.profdata`, `-fprofile-use` annotates IR with
+`!prof` metadata. Weak points we improve on:
+
+- **Staleness.** LLVM keys counters by index inside a name-hashed
+  function; a CFG edit silently misattributes counts (a warning at best).
+  Ours keys each function's record by `symbol_hash + cfg_fingerprint`:
+  a stale entry simply doesn't match and is ignored — never misapplied.
+- **Tooling.** No `llvm-profdata` step: `pliron.prof` is a single
+  self-describing, self-merging file. Feed it straight back.
+- **Wasm.** LLVM instrumentation PGO on wasm effectively doesn't exist
+  (no profile runtime). We own the object format and the linker, so the
+  same `.prof` format works on both targets.
+- **Consumers.** Profile is a first-class input to our own passes —
+  profile-guided inlining, cold-block layout — and eventually the
+  e-graph/relational passes (frequency-weighted extraction), which LLVM
+  has no equivalent of.
+
+## Profile format
+
+`pliron.prof` (little-endian, self-describing, mergeable by union):
+
+```
+magic        u64   "PLPROF01"
+nfuncs       u64
+repeat nfuncs:
+  sym_hash   u64   FxHash of the symbol name
+  fingerprint u64  hash of CFG shape at instrument time
+  nblocks    u32
+  nedges     u32
+  counts     u64[nblocks + nedges]   block-entry counts, then edge counts
+```
+
+`fingerprint` = hash over `(nblocks, per-block successor-count sequence)`
+computed when counters are placed. The use-side build recomputes it on
+the same pre-pipeline CFG, so matching is exact; a function whose shape
+changed keeps its old record harmlessly un-merged.
+
+Merging: keyed union add on `(sym_hash, fingerprint)`. The runtime merges
+on write, so repeated runs accumulate without a merge tool. Multiple
+files can be concatenated by `pliron-prof merge`.
+
+## Instrumentation (`PLIRON_PGO=<dir>`)
+
+Runs in `finish_pre` (`src/cgupool.rs`), before IR-opt (`iropt_head`)
+and, at `-O0`, after the always-inline round, so counters attribute to
+*source-level* functions. The instrumentation itself is
+`pliron-ir-opt/src/pgo.rs`.
+The inliner clones counter ops during the profiled build, so hot
+executions inside inlined clones still accrue to the source function's
+counters — same attribution model as LLVM.
+
+Per CGU, three data objects plus one constructor stub:
+
+- `__pliron_prof_ctrs.<cgu>` — `u64[n]` zeroed, section `pliron_prof_ctrs`
+  (writable). Counter `i` is `ctr[i]++`: `load`/`add`/`store` placed at
+  the head of the target block, each op marked `st.volatile` so later
+  passes (incl. the CLIF pipeline) can't reorder or elide them.
+- `__pliron_prof_recs.<cgu>` — serialized func records (sym_hash,
+  fingerprint, first counter index, nblocks, nedges), `pliron_prof_recs`.
+- `__pliron_prof_hdr.<cgu>` — `{magic, recs ptr, recs len, ctrs ptr,
+  ctrs len, cgu hash}` with relocations to the other two, `pliron_prof`.
+- `__pliron_prof_ctor.<cgu>` — three lines of rsasm
+  (`lea hdr; jmp __pliron_prof_register`) plus an init slot, emitted
+  through `st.asm`/objmerge: `.init_array` on ELF,
+  `__DATA,__mod_init_func` on Mach-O (weak + private_extern; sectnames
+  are capped at 16 bytes, so the names blob lands in `pliron_pnames`),
+  `.CRT$XCU` on COFF (the `__initterm` band the MSVC CRT calls).
+  `__pliron_prof_register` is declared as a normal import so the splice
+  resolves it like any other callee — undefined, it pulls the runtime
+  out of `libpliron_prof.a`; link without it and you get a clean
+  "undefined symbol" naming the missing runtime.
+
+Counter placement: one entry counter per block, plus an edge counter on
+each edge that block counts alone can't disambiguate (successor with
+more than one predecessor — emitted in a split edge block). Block counts
+give hot/cold + callsite frequencies; edge counts give branch polarity
+and loop trip counts.
+
+## Runtime (`tools/pliron-prof`)
+
+The runtime is `tools/pliron-prof-rt` (pure Rust, `no_std`, libc
+externs only); `tools/pliron-prof` is the host-side CLI. It must not link std: the archive is pulled
+into links that already carry a Rust std (rustc itself, proc-macro
+.so's) and bundled std objects collide on `__rdl_*`/`__rust_*` symbols
+— the same reason it can't reference `core`/`compiler_builtins`
+members, so the code is raw-pointer only (no indexing, no allocation).
+
+- `__pliron_prof_register(hdr)` — appends the CGU header pointer to a
+  static table and installs `atexit(flush)` once.
+- `flush` — writes a raw dump (`PLRAW01`: per-CGU `len | hdr | recs |
+  ctrs`) to `PLIRON_PROFILE_FILE` (default `pliron-<pid>.prof`).
+  Merging lives in the CLI so the runtime never allocates.
+- `pliron-prof` bin — `merge`/`dump` fold raw dumps (and `.prof`
+  files) into a `pliron.prof`, for host-side inspection and for
+  profiles pulled out of wasm guests.
+
+The gen build links it via `-Clink-arg=<path>/libpliron_prof_rt.a`
+(test.sh and compat scripts wire this automatically); cc-wild thins
+the archive to the runtime object before linking it under
+`PLIRON_PGO`.
+
+## Consumption (`PLIRON_PGO_USE=<file>`)
+
+Loaded in `finish_pre` (`src/cgupool.rs`), before IR-opt
+(`pgo::load`); each function's record is matched by
+`(sym_hash, fingerprint)` and stored in `st.prof`. Per-block counts land
+in `st.prof_bcount` and per-successor edge counts in `st.prof_edges`;
+the inliner's clone path scales both into clones by callsite count /
+callee entry count. Lowering copies block counts onto CLIF blocks
+(`Pipe::prof`) for the CLIF passes.
+
+Consumers:
+
+1. **Cold layout** (`lower.rs` `cold_blocks`): a reachable block with a
+   recorded count of 0 is cold — joins the existing
+   `#[cold]`/`expect`/unreachable rules and feeds `set_cold_block`, so
+   cold code moves out of line on native.
+2. **Inlining** (`pliron-ir-opt/src/inline.rs`): a callsite whose block
+   count is 0 is rejected outright (unless the callee is
+   `#[inline(always)]`); a callsite with count >= 4 adds twice the base
+   limit to its threshold.
+3. **Branch expectations** (`pgo::load`): a two-way `cond_br` with at
+   least 8 samples and a 4:1 or stronger bias seeds `st.expect`, so the
+   existing expect-consumers behave as if the user annotated it.
+4. **Loops** (`pliron-clif-opt`): `unroll` skips loops whose header
+   count is 0; `punroll` estimates the trip count from header vs entry
+   counts to pick its width; `loopvec` also reads the counts.
+   `PLIRON_PGO_LOOP=0` hides the profile from these passes.
+5. **Switch lowering** (`brchain.rs`, under `PLIRON_JT_SHAPE`, default
+   on): chain tests are ordered hottest first and a dominant case is
+   peeled ahead of the table (`history/2026-10-27-jump-tables.md`).
+
+Possible later consumers (design only):
+
+- **Value and indirect-call profiles**: order jump-table lookups by hit
+  frequency; checked speculative devirtualization (the `dv` hooks
+  `inline.rs` already has).
+- **Frequency-weighted e-graph extraction**: cost × block frequency as
+  the extraction cost model — pick the variant that's fastest on the
+  hot path, not uniformly smallest.
+- **Cross-crate profiles**: counts stored in rlib metadata so consumers
+  inline callees with real frequencies without a ThinLTO-style import.
+- **Sampling mode**: a PC→block map so periodic PC samples approximate
+  counts with zero instrumentation overhead.
+
+## Wasm
+
+Instrumentation is target-independent — the same `pgo.rs` ops lower to
+waffle like anything else — so gen mode emits identical globals. What
+differs is how counts leave the guest:
+
+- The counter arrays and records land in linear memory via the normal
+  data-segment path; `pliron-wasm-ld` roots every `__pliron_prof_*`
+  data object (they'd otherwise be GC'd), and synthesizes a
+  `[count][u32 addrs...]` table of all `__pliron_prof_hdr.*` objects,
+  exported as the i32 global `__pliron_prof_hdrs`.
+- No wasm-side runtime at all: the host (node/JS) reads the table after
+  the run, walks each header, and writes the same `.prof` format —
+  `tests/wasm/pgo_extract.mjs` is the reference extractor. The `ctrs`
+  field is a 4-byte linear-address reloc in an i64 slot (upper bytes
+  stay zero), so the `{u64 magic, u64 ctrs, u64 nctrs, u64 recs_len}`
+  wire layout is identical to native.
+- This makes browser-native JIT feedback ("which functions did the user
+  actually run") trivially collectible — something LLVM instrumentation
+  PGO cannot do on wasm at all.
+- `.init_array` ctor objects still work on wasm (`__wasm_call_ctors`
+  exists), so a wasm-side flush function can be added later for
+  long-running guests that want periodic snapshotted profiles.
+
+## Knobs
+
+| env | effect |
+| --- | --- |
+| `PLIRON_PGO=<dir>` | instrument build; profile written to `<dir>/pliron-<pid>.prof` (or `$PLIRON_PROFILE_FILE`) |
+| `PLIRON_PGO_USE=<file>` | consume profile before the pipeline |
+| `PLIRON_PGO_COUNTERS=block` | block counters only (edge counters are additive); default is block+edge |
+| `PLIRON_PGO_ATOMIC=1` | `atomicrmw` counter ops instead of load/add/store (races lose counts by default, same as LLVM) |
+| `PLIRON_PGO_LOOP=0` | the CLIF loop passes ignore the profile (ablation) |
+
+## Non-goals (for now)
+
+- `-Cprofile-generate`/`-Cprofile-use` flag compatibility and
+  `llvm-profdata` interop (we can read `.profraw`/`profdata` later if it
+  matters).
+- Sampling/coverage mode: emit a `pliron.blk` PC→block map per object
+  and attribute `perf`/SIGPROF samples to blocks (AutoFDO-style,
+  zero-overhead collection).
+- Function-level `#[pgo]` hot/cold section splitting.

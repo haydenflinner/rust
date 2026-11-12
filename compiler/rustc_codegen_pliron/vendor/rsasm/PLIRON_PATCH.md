@@ -15,3 +15,71 @@ Changed:
 
 `modifier_symbols` already marked these TLS and adds
 `_GLOBAL_OFFSET_TABLE_` where needed, matching gas behavior.
+
+Pliron patch: AArch64 CRC32 instructions.
+
+`crc32{,c}{b,h,w,x}` (FEAT_CRC32) were unknown mnemonics; zlib-rs's ACLE
+path writes them in `asm!` (uiua build, 2026-10-21).
+
+Changed:
+- src/arch/aarch64/insn.rs: `crc32` encoder (two-source data-processing,
+  opcode `010 C sz`; `x` forms take Xm and set sf), listed in `handwritten`.
+- tests/aarch64.rs: `crc32` encodings checked against llvm-mc; three of the
+  mnemonics join the random-operand fuzz list.
+
+Pliron patch: AArch64 table covers the scalar extensions.
+
+`tools/tables/aarch64.py` kept a scalar (GPR-only) form only when the same
+mnemonic also had a SIMD/SVE form, so the atomics and pointer auth were
+neither generated nor hand-written: portable-atomic's `asm!` (`ldar`,
+`swpp`, `.arch_extension lse`) failed rune's build. The filter now keeps
+every mnemonic the backend does not encode by hand. Regenerated with llvm-mc
+22.1.8: 5879 -> 6443 forms (LSE/LSE128 atomics, acquire/release and
+exclusive loads/stores, RCPC/RCPC3, pointer auth, RCW, MOPS-free scalar
+extras), 0 lines in the wrong form.
+
+Changed:
+- tools/tables/aarch64.py: the post-sweep filter keeps mnemonics with no
+  handwritten encoder; `crc32*`/`casp*` join HANDWRITTEN; `EXCLUDED` drops
+  `ldraa`/`ldrab` (the writeback forms' split signed offset put 8 checked
+  lines in the wrong form).
+- src/arch/aarch64/table_data.rs, tools/mc-diff/*: regenerated.
+- src/arch/aarch64/insn.rs: `casp{,a,l,al}` by hand (even/odd register pairs,
+  the second register unencoded — not a relation the fitter can measure).
+- src/arch/aarch64/mod.rs: `.arch_extension` accepted (every extension is on).
+- tests/aarch64.rs: `casp_pairs`, `atomics_from_the_table`,
+  `arch_extension_is_accepted`, against llvm-mc encodings.
+
+Pliron patch: leading-zero local label references.
+
+`01b` (GAS numeric local label `01`, as rust-lang/rust
+tests/ui/asm/binary_asm_labels_allowed.rs writes it) was rejected as an
+invalid octal literal: the local-ref path skipped runs with a leading zero.
+src/lexer.rs `lex_number` now takes such runs as a reference to the label
+with the run's octal value, which is how GAS reads it and how the `01:`
+definition lexes.
+
+Pliron patch: Mach-O call frame information.
+
+`.cfi_*` in an object for Mach-O (wasmtime-internal-fiber's stack-switch
+functions) was refused: "DWARF and call frame information are not written
+to Mach-O objects yet". Changed:
+- src/dwarf/cfi.rs `frame_section`: the `.eh_frame` table is named
+  `__TEXT,__eh_frame` for Mach-O output.
+- src/output/macho.rs `precreated`: `__TEXT,__eh_frame` gets llvm-mc's
+  `S_COALESCED` + `no_toc|strip_static_syms|live_support`.
+- src/output/macho/relocations.rs: an arm64 PC-relative *data* field to
+  another atom (an FDE's 4-byte `pc_begin`) has no relocation of its own;
+  write it as `sym - <here>` — `UNSIGNED sym` + `SUBTRACTOR` of a local
+  label at the start of the fixup's fragment, with the field's distance
+  from it folded into the addend — as llvm-mc does. Instruction fields
+  (`adr`) stay refused.
+
+Pliron patch: Mach-O `.pushsection`.
+
+`.pushsection __DATA,__ctor_force,regular,no_dead_strip` (emitted by the
+`ctor`/`linktime` crates for every static constructor) failed with "expected a
+string of section flags": the generic table's `.pushsection` only parses the
+ELF operand form. src/output/macho/directives.rs `macho_directive` now handles
+`.pushsection` itself (push the section stack, then the Mach-O `SEG,SECT,..`
+parse of `.section`). Test: tests/macho.rs `pushsection_takes_the_mach_o_operand_form`.

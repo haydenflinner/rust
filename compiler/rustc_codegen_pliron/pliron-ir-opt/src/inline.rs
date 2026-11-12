@@ -1,0 +1,3801 @@
+//! Pliron-level inliner. Cranelift does no inlining, so small callees defined
+//! in the same CGU are copied into their call sites before lowering. Callees are
+//! processed bottom-up, so inlined bodies are inlined transitively; at invoke sites
+//! the callee's calls become invokes to the same landing pad.
+//! `PLIRON_INLINE=<max ops>` tunes the size limit; `0` disables it.
+//!
+//! `PLIRON_INLINE_MODEL` (default on; `0` = the old fixed thresholds) weighs
+//! per-callsite cost vs. savings: see [`run`]. `PLIRON_INLINE_VERBOSE=1` logs
+//! every callsite verdict with its score under either model.
+
+use cranelift_module::Linkage;
+use pliron::basic_block::BasicBlock;
+use pliron::builtin::op_interfaces::{BranchOpInterface, CallOpCallable, CallOpInterface};
+use pliron::context::{Context, Ptr};
+use pliron::irbuild::cloning::{IrMapping, clone_blocks_into};
+use pliron::irbuild::inserter::OpInsertionPoint;
+use pliron::irbuild::listener::DummyListener;
+use pliron::irbuild::rewriter::{IRRewriter, Rewriter};
+use pliron::linked_list::ContainsLinkedList;
+use pliron::op::{Op, op_cast};
+use pliron::operation::OpDbg;
+use pliron::operation::Operation;
+use pliron::r#type::{Typed, TypedHandle};
+use pliron::value::Value;
+use pliron_llvm::ops::{
+    AddrSpaceCastOp, AllocaOp, AtomicCmpxchgOp, AtomicLoadOp, AtomicRmwOp, AtomicStoreOp,
+    BitcastOp, BrOp, CallIntrinsicOp, CallOp, CondBrOp, ConstantOp, ExtractValueOp, FreezeOp, FuncOp, GetElementPtrOp,
+    IndirectBrOp, InsertValueOp, LoadOp, PoisonOp, ReturnOp, StoreOp, SwitchOp, UndefOp,
+    UnreachableOp,
+};
+use pliron_llvm::types::FuncType;
+use pliron::location::Located;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::has_body;
+use crate::state::{ConstVal, State, leaf_arg};
+use crate::types::{leaf_range, size_align};
+
+// r[impl iropt.inline.knobs]
+const DEFAULT_LIMIT: usize = 320;
+/// `PLIRON_DEADFREE`: purge `State` side tables after this many freed ops
+/// (a purge is linear in the tables, so not after every free).
+const FREE_PURGE: usize = 20_000;
+pub const SMALL_LIMIT: usize = 40;
+/// The `small` limit for wasm: still the flat no-bonus rules, but the
+/// 40-op cap left iterator/UTF-8 helpers out of line in every hot loop —
+/// +67% geomean on `bench/wasm` vs LLVM for ~6% less code. 512 is the
+/// measured sweet spot: `hashbrown`'s `hash_one` (SipHash + probe glue)
+/// sits just over `DEFAULT_LIMIT`, and inlining it drops hashmap from
+/// +81% to +16% and hmget from +163% to +43% (geomean 1.08); 768 buys
+/// nothing further and lets `tokenize` slip back to parity.
+pub const WASM_LIMIT: usize = 512;
+/// wasm loop-callsite bonus (x the flat limit): a call every iteration
+/// pays the call+prologue cost every iteration, so a fatter callee is
+/// worth it there — hashbrown's `hash_one` (SipHash, ~926 ops in cgu.0)
+/// sits just over `WASM_LIMIT` but inlining it into `get`'s probe loop
+/// is where most of the `bench/wasm` hashmap gap lives. Kept off for
+/// -Os/-Oz, where growth is the point of `small`.
+pub const WASM_HOT: usize = 3;
+/// Above this size, cold callsites under `PLIRON_INLINE_WASM_COLDKEEP`
+/// (default off, `=1` on) only give allowlisted callees (hash/num/str/ast-parse)
+/// the full `WASM_LIMIT`; everything else uses this flat cold cap — same
+/// cliff as `PLIRON_INLINE_WASM_COLD=384`, but tokenize/parse helpers in
+/// the band still inline. Denylist experiments (fmt-junk, alloc/math/sort)
+/// each grew CODE ~1 KiB. (docs/history/2026-10-28-solo50.md).
+pub const WASM_COLDKEEP_THRESH: usize = 384;
+
+/// Callees tokenize/parse_only need above the cold cap. Keep patterns
+/// tight: bare `3num` matched `fmt::num` (+19 KiB); `7unicode` is too wide.
+pub fn wasm_cold_keep(sym: &str) -> bool {
+    // Path fragments in v0 mangling — crate/module boundaries only.
+    sym.contains("4core4hash")
+        || sym.contains("4hash3sip")
+        || sym.contains("4hash6Hasher")
+        || sym.contains("4hash11BuildHasher")
+        || sym.contains("std4hash")
+        || sym.contains("4core3num")
+        || sym.contains("6bignum")
+        || sym.contains("7dec2flt")
+        || sym.contains("from_ascii")
+        || sym.contains("4core3str")
+        || sym.contains("3str11validations")
+        || sym.contains("4core4char")
+        // regex-syntax tokenize: Parser::bump/char_at/peek, utf8_decode.
+        || sym.contains("ast5parse")
+        || sym.contains("11utf8_decode")
+}
+
+/// rustc's drop paths (`drop_in_place<T>` monomorphizations lower to the
+/// `4core3ptr9drop_glue` v0 fragment; same test as `memcpyopt`'s).
+fn is_drop_glue(sym: &str) -> bool {
+    sym.contains("4core3ptr9drop_glue") || sym.contains("13drop_in_place")
+}
+
+// Cost-model weights (`PLIRON_INLINE_MODEL`): a callsite is inlined when
+// `cost <= threshold`.
+/// Each call inside the callee costs this much on top of its own op: inlining
+/// moves the call into the caller, it doesn't remove it. LLVM charges a call
+/// roughly 5-10 instructions' worth; at 3, dispatchers like a 40-variant
+/// enum's drop glue (126 ops, 40 calls) passed the base limit and every
+/// `Option<Box<Pat>>` overwrite in syn pulled the whole tree in. 20: bench
+/// kernels' alternating A/B geomean 1.001 vs 10, a regex-syntax
+/// parse+translate driver flat, syn CPU −25% on top of the loop-bonus cap.
+const CALL_OP_W: usize = 20;
+/// Bonus per use a constant actual can fold (a scalar arg feeding arithmetic,
+/// compares, selects, casts, ...).
+const FOLD_USE: usize = 25;
+/// Bonus per memory op a by-ref arg reaches through GEP/bitcast chains when
+/// the actual is a local slot or a constant address: the inlined loads/stores
+/// become direct (SROA/`loadfwd`/`constload` material).
+const MEM_USE: usize = 20;
+/// `#[cold]` callees pollute the caller's hot layout: cost doubles.
+const COLD_W: usize = 2;
+/// Threshold cap (x the base limit) so the bonus terms can't grow without
+/// bound; a single callsite never budgets more than this.
+const MAX_T: usize = 32;
+/// Default per-caller budget (x the base limit) of non-free inlined ops
+/// (`PLIRON_INLINE_GROWTH`).
+const GROWTH_MULT: usize = 25;
+
+pub fn blocks(ctx: &Context, f: Ptr<Operation>) -> Vec<Ptr<BasicBlock>> {
+    // Bodiless `llvm.func` ops (extern decls like `rust_eh_personality`)
+    // legitimately have no regions — callers iterating all funcs see an
+    // empty body rather than a panic.
+    let Some(r) = f.deref(ctx).regions(ctx).next() else {
+        return Vec::new();
+    };
+    r.deref(ctx).iter(ctx).collect()
+}
+
+pub fn ops(ctx: &Context, b: Ptr<BasicBlock>) -> Vec<Ptr<Operation>> {
+    b.deref(ctx).iter(ctx).collect()
+}
+
+/// Lazy `ops` — no `Vec` collect for read-only scans. The iterated
+/// block's op list must not be mutated while iterating.
+pub fn ops_iter<'a>(
+    ctx: &'a Context,
+    b: Ptr<BasicBlock>,
+) -> impl Iterator<Item = Ptr<Operation>> + 'a {
+    b.deref(ctx).iter(ctx)
+}
+
+/// Lazy `blocks` — no `Vec` collect for read-only scans. The function's
+/// region-0 block list must not be mutated while iterating.
+pub fn blocks_iter<'a>(
+    ctx: &'a Context,
+    f: Ptr<Operation>,
+) -> impl Iterator<Item = Ptr<BasicBlock>> + 'a {
+    let r = f.deref(ctx).regions(ctx).next();
+    r.into_iter().flat_map(move |r| r.deref(ctx).iter(ctx))
+}
+
+/// `ops` into a caller-owned buffer so per-block walks allocate once.
+pub fn ops_into(ctx: &Context, b: Ptr<BasicBlock>, out: &mut Vec<Ptr<Operation>>) {
+    out.clear();
+    out.extend(b.deref(ctx).iter(ctx));
+}
+
+pub fn direct_callee<'a>(ctx: &Context, st: &'a State, op: Ptr<Operation>) -> Option<&'a String> {
+    // `st.calls` memoizes the resolved callee at scan time — one hash
+    // probe instead of the attr-dict get + ident lookup every pass was
+    // repeating per call site. The callee attr is constructor-only, so
+    // the memo can't go stale; ops without an entry fall back below.
+    if let Some(sym) = st.calls.get(op).and_then(|ci| ci.callee.as_ref()) {
+        return Some(sym);
+    }
+    let c = Operation::get_op::<CallOp>(op, ctx)?;
+    // Borrow the callee attr directly: `callee()` clones it into an owned
+    // Identifier (one String alloc) and the obvious lookup then spends a
+    // second on `to_string()` — per call op, per rescan round.
+    if let Some(id) = c.get_attr_llvm_call_callee(ctx) {
+        return st.ident_to_sym.get(AsRef::<str>::as_ref(id.as_ref()));
+    }
+    match c.callee(ctx) {
+        CallOpCallable::Direct(_) => unreachable!("checked above"),
+        // An indirect call through a provable function address (a monomorphized
+        // closure shim like hashbrown's `make_hasher`) is direct for inlining:
+        // `devirt` rewrites these later, but that runs after the main pass.
+        CallOpCallable::Indirect(p) => match st.consts.get(p) {
+            Some(ConstVal::Sym { sym, off: 0 }) => st.funcs.get_key_value(sym).map(|(k, _)| k),
+            // `consts` is codegen-time; passes that rewrite the callee
+            // operand leave the Sym const on an aliased-away value, so
+            // fall through to the operand's definition before giving up.
+            _ => indirect_callee(ctx, st, p),
+        },
+    }
+}
+
+/// Resolve an indirect-call operand to a known function through its
+/// definition chain: `llvm.addressof` and aliases of `sym_addr` values.
+fn indirect_callee<'a>(ctx: &Context, st: &'a State, mut p: Value) -> Option<&'a String> {
+    for _ in 0..8 {
+        if let Some(ConstVal::Sym { sym, off: 0 }) = st.consts.get(p) {
+            return st.funcs.get_key_value(sym).map(|(k, _)| k);
+        }
+        let d = p.defining_op()?;
+        if let Some(a) = Operation::get_op::<pliron_llvm::ops::AddressOfOp>(d, ctx) {
+            let id = a.get_global_name(ctx);
+            let sym = st.ident_to_sym.get(AsRef::<str>::as_ref(id.as_ref()));
+            return sym.and_then(|s| st.funcs.get_key_value(s).map(|(k, _)| k));
+        }
+        // Transparent defs (casts/bitwise ops on the pointer) — keep walking.
+        if Operation::is_op::<BitcastOp>(d, ctx) || Operation::is_op::<AddrSpaceCastOp>(d, ctx) {
+            p = d.deref(ctx).get_operand(ctx, 0);
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+/// Callee-body facts the callsite score is computed from.
+struct CInfo {
+    op: Ptr<Operation>,
+    eh: bool,
+    /// Op count.
+    n: usize,
+    /// Call ops inside the body (`CALL_OP_W` extra cost each under the model).
+    ncalls: usize,
+    /// Of those, calls that can run on a warm path: not to a `#[cold]`
+    /// callee and not noreturn (bounds-check and overflow panics). The
+    /// loop gate (`PLIRON_INLINE_LOOPCALLS`) counts these: inlining a body
+    /// whose only calls are panics moves no call traffic into the loop
+    /// (brotli's `EvaluateNode`: 18 calls, 13 of them panics).
+    nwarm: usize,
+    /// Ops outside the blocks that end in a noreturn call (bounds-check and
+    /// overflow panic blocks): the body a warm path can execute. Under
+    /// `PLIRON_INLINE_WARMCALLS=2` the cost is `nwarm_ops + CALL_OP_W *
+    /// nwarm`, LLVM's shape: a cold panic block is code size, not work.
+    nwarm_ops: usize,
+    /// Params feeding an indirect call's target (see `devirt_params`).
+    dvirt: Vec<usize>,
+    /// Params reaching a branch condition (see `cond_params`).
+    conds: Vec<usize>,
+    /// Per-param memory-op uses a direct actual makes resolvable.
+    mem: Vec<u32>,
+    /// Per-param other foldable uses.
+    fold: Vec<u32>,
+}
+
+/// Legality plus the body facts the callsite score needs, from ONE walk of
+/// the callee body (the legality count, the indirect-call targets, and the
+/// branch-condition roots used to be three separate scans; the small
+/// def-chain DFSs they feed stay per-feature). The fixed thresholds only
+/// profile callees a devirt/fold multiplier could rescue (as the old `dv` map
+/// did); the model profiles every plausibly inlinable body.
+// r[impl iropt.inline.scope]
+fn callee_info(
+    ctx: &Context,
+    st: &State,
+    sym: &str,
+    model: bool,
+    limit: usize,
+    bonus: usize,
+    fold: usize,
+) -> Option<CInfo> {
+    let f = &st.funcs[sym];
+    if f.no_inline || f.linkage == Linkage::Preemptible || !has_body(ctx, f.op) {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::inline", "callee {sym}: no_inline={} linkage={:?} has_body={}",
+            f.no_inline, f.linkage, has_body(ctx, f.op))
+        };
+        return None;
+    }
+    let (mut n, mut ncalls, mut nwarm, mut nwarm_ops, mut eh) = (0, 0, 0, 0, false);
+    let mut dvirt_tgt = Vec::new();
+    let mut cond_roots = Vec::new();
+    for b in blocks_iter(ctx, f.op) {
+        let mut bn = 0usize;
+        let mut panic_block = false;
+        for op in b.deref(ctx).iter(ctx) {
+            n += 1;
+            bn += 1;
+            let intr = st.intrinsics.get(op);
+            if intr.is_some_and(|s| s.starts_with("llvm.va_") || s.starts_with("pliron.va."))
+                || direct_callee(ctx, st, op).is_some_and(|c| c == sym)
+            {
+                return None;
+            }
+            eh |= st.invokes.contains(op) || intr.is_some_and(|s| s.starts_with("pliron.eh"));
+            if let Some(c) = Operation::get_op::<CallOp>(op, ctx) {
+                ncalls += 1;
+                let noret = st.calls.get(op).is_some_and(|i| i.noret);
+                let cold = direct_callee(ctx, st, op).is_some_and(|c| st.funcs.get(c).is_some_and(|f| f.cold));
+                if !noret && !cold {
+                    nwarm += 1;
+                }
+                panic_block |= noret;
+                // Indirect target is operand 0; `callee()` would clone the
+                // attr for a direct call only to discard it here.
+                if c.get_attr_llvm_call_callee(ctx).is_none() {
+                    dvirt_tgt.push(op.deref(ctx).get_operand(ctx, 0));
+                }
+            }
+            if Operation::is_op::<CondBrOp>(op, ctx)
+                || (model && Operation::is_op::<SwitchOp>(op, ctx))
+            {
+                cond_roots.push(op.deref(ctx).get_operand(ctx, 0));
+            }
+        }
+        if !panic_block {
+            nwarm_ops += bn;
+        }
+    }
+    if eh && !crate::pass_enabled("PLIRON_INLINE_EH") {
+        return None;
+    }
+    let mut ci = CInfo {
+        op: f.op,
+        eh,
+        n,
+        ncalls,
+        nwarm,
+        nwarm_ops,
+        dvirt: Vec::new(),
+        conds: Vec::new(),
+        mem: Vec::new(),
+        fold: Vec::new(),
+    };
+    let want = if model {
+        n <= limit.saturating_mul(MAX_T)
+    } else {
+        n > limit && n <= limit.saturating_mul(bonus.max(fold))
+    };
+    if !want {
+        return Some(ci);
+    }
+    let params: Vec<Value> = match blocks_iter(ctx, f.op).next() {
+        Some(entry) => entry.deref(ctx).arguments(ctx).collect(),
+        None => return Some(ci),
+    };
+    if model || bonus > 1 {
+        ci.dvirt = devirt_params(ctx, &params, &dvirt_tgt);
+    }
+    if model || fold > 1 {
+        ci.conds = cond_params(ctx, &params, &cond_roots);
+    }
+    if model {
+        (ci.mem, ci.fold) = param_uses(ctx, st, f.op);
+    }
+    Some(ci)
+}
+
+// Side-table annotation bits for [`CalleeTags`]. A callee's annotations
+// are discovered once (lazily, on first inline) and replayed for every
+// later inline of that body — otherwise each clone pays ~15 `ColMap`
+// probes per op plus two `Vec` collects per block all over again.
+const OP_CALLS: u16 = 1 << 0;
+const OP_INTRINSICS: u16 = 1 << 1;
+const OP_RMW: u16 = 1 << 2;
+const OP_EXPECT: u16 = 1 << 3;
+const OP_PROF_EDGES: u16 = 1 << 4;
+const OP_VOLATILE: u16 = 1 << 5;
+const OP_NONNULL: u16 = 1 << 6;
+const OP_INBOUNDS: u16 = 1 << 7;
+const OP_BOOL01: u16 = 1 << 8;
+const OP_FROZEN_LOADS: u16 = 1 << 9;
+const OP_RETURN: u16 = 1 << 10;
+
+const V_ALLOCAS: u8 = 1;
+const V_PROMOTED: u8 = 1 << 1;
+const V_CONSTS: u8 = 1 << 2;
+const V_RFROZEN: u8 = 1 << 3;
+const V_RNOALIAS: u8 = 1 << 4;
+const V_RFROZEN_OP: u8 = 1 << 5;
+/// Carries debug-info variable pieces (`Context::dbg_notes`).
+const V_DBGNOTE: u8 = 1 << 6;
+/// Has `State::lt_slices` (`PLIRON_LTUNDEF`): the clone's entry lists the
+/// clones of its slices.
+const V_LTSLICES: u8 = 1 << 7;
+
+const B_REGION: u8 = 1;
+const B_PARENT: u8 = 1 << 1;
+const B_BCOUNT: u8 = 1 << 2;
+
+/// Which `State` side tables carry an entry for each block/op/value of a
+/// callee body. Built by one body walk and cached per callee op; a body
+/// that is itself rewritten as a caller drops its entry (see the
+/// `tagcache.remove` after each caller's fixpoint).
+#[derive(Default)]
+struct CalleeTags {
+    /// `blocks(ctx, callee)` — cached so each inline skips the collect.
+    src: Vec<Ptr<BasicBlock>>,
+    blocks: Vec<(Ptr<BasicBlock>, u8)>,
+    ops: Vec<(Ptr<Operation>, u16)>,
+    vals: Vec<(Value, u8)>,
+    /// Min/max/count of value uids, op ords and block ords in the region-0
+    /// walk — bounds for the dense `IrMapping` (out-of-range keys spill to
+    /// hashing; counts bound the dense fill ratio).
+    vb: (usize, usize, usize),
+    ob: (usize, usize, usize),
+    bb: (usize, usize, usize),
+}
+
+fn tag_value(tags: &mut CalleeTags, st: &State, notes: Option<&FxHashMap<Value, NoteIds>>, v: Value) {
+    // (`notes`: `Context::dbg_notes`, when there are any.)
+    let mut m = 0;
+    if notes.is_some_and(|n| n.contains_key(&v)) {
+        m |= V_DBGNOTE;
+    }
+    if st.allocas.contains(v) {
+        m |= V_ALLOCAS;
+    }
+    if st.promoted.contains(v) {
+        m |= V_PROMOTED;
+    }
+    if st.consts.contains(v) {
+        m |= V_CONSTS;
+    }
+    if st.lt_slices.contains(v) {
+        m |= V_LTSLICES;
+    }
+    if st.region_frozen.contains(v) {
+        m |= V_RFROZEN;
+    }
+    if st.region_noalias.contains(v) {
+        m |= V_RNOALIAS;
+    }
+    if st.region_frozen_op.contains(v) {
+        m |= V_RFROZEN_OP;
+    }
+    if m != 0 {
+        tags.vals.push((v, m));
+    }
+}
+
+type NoteIds = smallvec::SmallVec<[u32; 2]>;
+
+fn callee_tags(ctx: &Context, st: &State, callee: Ptr<Operation>) -> CalleeTags {
+    let src = blocks(ctx, callee);
+    let notes_ref = ctx.dbg_notes.borrow();
+    let notes = (!notes_ref.is_empty()).then_some(&*notes_ref);
+    let mut tags = CalleeTags::default();
+    let (mut vlo, mut vhi, mut nv) = (usize::MAX, 0usize, 0usize);
+    let (mut olo, mut ohi, mut no) = (usize::MAX, 0usize, 0usize);
+    let (mut blo, mut bhi) = (usize::MAX, 0usize);
+    for &b in &src {
+        blo = blo.min(b.ord());
+        bhi = bhi.max(b.ord());
+        let mut bm = 0;
+        if st.region_blocks.contains(b) {
+            bm |= B_REGION;
+        }
+        if st.region_parent.contains(b) {
+            bm |= B_PARENT;
+        }
+        if st.prof_bcount.contains(b) {
+            bm |= B_BCOUNT;
+        }
+        if bm != 0 {
+            tags.blocks.push((b, bm));
+        }
+        for a in b.deref(ctx).arguments(ctx) {
+            let u = a.uid() as usize;
+            vlo = vlo.min(u);
+            vhi = vhi.max(u);
+            nv += 1;
+            tag_value(&mut tags, st, notes, a);
+        }
+        for op in b.deref(ctx).iter(ctx) {
+            let o = op.ord();
+            olo = olo.min(o);
+            ohi = ohi.max(o);
+            no += 1;
+            let mut m = 0;
+            if st.calls.contains(op) {
+                m |= OP_CALLS;
+            }
+            if st.intrinsics.contains(op) {
+                m |= OP_INTRINSICS;
+            }
+            if st.rmw.contains(op) {
+                m |= OP_RMW;
+            }
+            if st.expect.contains(op) {
+                m |= OP_EXPECT;
+            }
+            if st.prof_edges.contains(op) {
+                m |= OP_PROF_EDGES;
+            }
+            if st.volatile.contains(op) {
+                m |= OP_VOLATILE;
+            }
+            if st.nonnull.contains(op) {
+                m |= OP_NONNULL;
+            }
+            if st.inbounds.contains(op) {
+                m |= OP_INBOUNDS;
+            }
+            if st.bool01.contains(op) {
+                m |= OP_BOOL01;
+            }
+            if st.frozen_loads.contains(op) {
+                m |= OP_FROZEN_LOADS;
+            }
+            if Operation::is_op::<ReturnOp>(op, ctx) {
+                m |= OP_RETURN;
+            }
+            if m != 0 {
+                tags.ops.push((op, m));
+            }
+            for v in op.deref(ctx).results(ctx) {
+                let u = v.uid() as usize;
+                vlo = vlo.min(u);
+                vhi = vhi.max(u);
+                nv += 1;
+                tag_value(&mut tags, st, notes, v);
+            }
+        }
+    }
+    // usize::MAX lo means the callee had no entity of that kind — the
+    // range then wraps to nothing and every key hashes.
+    tags.vb = (vlo.min(vhi), vhi, nv);
+    tags.ob = (olo.min(ohi), ohi, no);
+    tags.bb = (blo.min(bhi), bhi, src.len());
+    tags.src = src;
+    tags
+}
+
+/// Per entry-param use shape: `mem` = loads/stores/mem intrinsics reached
+/// through GEP/bitcast chains (a by-ref arg whose actual is a local slot or a
+/// constant becomes direct access the cleanup passes can resolve); `fold` =
+/// other uses a constant actual can fold. Call/branch/return uses earn
+/// neither — calls are priced by `ncalls`, block args don't fold in place.
+fn param_uses(ctx: &Context, st: &State, f: Ptr<Operation>) -> (Vec<u32>, Vec<u32>) {
+    let bs = blocks(ctx, f);
+    let Some(&entry) = bs.first() else {
+        return (Vec::new(), Vec::new());
+    };
+    let nparams = entry.deref(ctx).arguments(ctx).count();
+    let (mut mem, mut fold) = (vec![0u32; nparams], vec![0u32; nparams]);
+    for (i, p) in entry.deref(ctx).arguments(ctx).enumerate() {
+        let (mut work, mut seen, mut budget) = (vec![p], FxHashSet::default(), 64);
+        while let Some(v) = work.pop() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            for u in v.uses_iter(ctx) {
+                let o = u.user_op();
+                let ui = u.find_index(ctx);
+                if (Operation::is_op::<GetElementPtrOp>(o, ctx)
+                    || Operation::is_op::<BitcastOp>(o, ctx))
+                    && ui == 0
+                {
+                    if seen.insert(o.deref(ctx).get_result(ctx, 0)) {
+                        work.push(o.deref(ctx).get_result(ctx, 0));
+                    }
+                } else if Operation::is_op::<LoadOp>(o, ctx)
+                    || Operation::is_op::<AtomicLoadOp>(o, ctx)
+                    || ((Operation::is_op::<StoreOp>(o, ctx)
+                        || Operation::is_op::<AtomicStoreOp>(o, ctx))
+                        && ui != 0)
+                    || st
+                        .intrinsics.get(o)
+                        .is_some_and(|s| s.starts_with("llvm.mem") && ui <= 1)
+                {
+                    mem[i] += 1;
+                } else if !(Operation::is_op::<CallOp>(o, ctx)
+                    || Operation::is_op::<BrOp>(o, ctx)
+                    || Operation::is_op::<CondBrOp>(o, ctx)
+                    || Operation::is_op::<SwitchOp>(o, ctx)
+                    || Operation::is_op::<IndirectBrOp>(o, ctx)
+                    || Operation::is_op::<ReturnOp>(o, ctx)
+                    || Operation::is_op::<UnreachableOp>(o, ctx))
+                {
+                    fold[i] += 1;
+                }
+            }
+        }
+    }
+    (mem, fold)
+}
+
+/// Whether `v` is a scalar constant the model credits: literal bits, zero, or
+/// a symbol address (vtables and fn pointers fold indirect calls; global
+/// addresses make by-ref memory direct).
+fn const_arg(st: &State, v: &Value) -> bool {
+    matches!(
+        st.consts.get(*v),
+        Some(ConstVal::Bits(_) | ConstVal::Zero | ConstVal::Sym { .. })
+    )
+}
+
+/// Successor blocks, counting invoke landing-pad edges.
+fn bsuccs(ctx: &Context, st: &State, b: Ptr<BasicBlock>) -> Vec<Ptr<BasicBlock>> {
+    let mut v = Vec::new();
+    // Invokes are non-terminator CallOps — they need the whole block scan;
+    // successor lists live only on the terminator (`iter().last()` is O(1)).
+    for op in b.deref(ctx).iter(ctx) {
+        v.extend(st.invokes.get(op).map(|&(l, _)| l));
+    }
+    if let Some(t) = b.deref(ctx).iter(ctx).last() {
+        v.extend(t.deref(ctx).successors(ctx));
+    }
+    v
+}
+
+/// Blocks of `f` that can reach themselves: the callsite-context "in a loop"
+/// signal (an inlined body there runs once per iteration, so a little extra
+/// code is worth it). One Tarjan pass — a block loops iff its SCC has more
+/// than one member or it has a self-edge; the quadratic per-block DFS this
+/// replaces took ~100ms per rebuild on a post-inline `main`.
+fn loop_blocks(ctx: &Context, st: &State, f: Ptr<Operation>) -> FxHashSet<Ptr<BasicBlock>> {
+    // One ptr→local-ordinal map, then the whole Tarjan state is dense
+    // Vecs — five hash structures shrank to one.
+    let mut bs = blocks(ctx, f);
+    let n = bs.len();
+    let mut ord: FxHashMap<Ptr<BasicBlock>, usize> =
+        bs.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let mut index = vec![u32::MAX; n];
+    let mut low = vec![0u32; n];
+    let mut onstack = vec![false; n];
+    let mut selfedge = vec![false; n];
+    let mut tstack: Vec<usize> = Vec::new();
+    let mut out = FxHashSet::default();
+    let mut next = 0u32;
+    for i in 0..n {
+        let ro = i;
+        if index[ro] != u32::MAX {
+            continue;
+        }
+        let mut work: Vec<(usize, Vec<Ptr<BasicBlock>>)> = Vec::new();
+        index[ro] = next;
+        low[ro] = next;
+        next += 1;
+        tstack.push(ro);
+        onstack[ro] = true;
+        work.push((ro, bsuccs(ctx, st, bs[ro])));
+        while let Some((v, succs)) = work.last_mut() {
+            let v = *v;
+            let Some(w) = succs.pop() else {
+                work.pop();
+                if low[v] == index[v] {
+                    let mut scc = Vec::new();
+                    while let Some(w) = tstack.pop() {
+                        onstack[w] = false;
+                        scc.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    if scc.len() > 1 {
+                        out.extend(scc.iter().map(|&o| bs[o]));
+                    } else if selfedge[scc[0]] {
+                        out.insert(bs[scc[0]]);
+                    }
+                }
+                if let Some(&(u, _)) = work.last() {
+                    low[u] = low[u].min(low[v]);
+                }
+                continue;
+            };
+            // A successor can be a block `blocks` didn't list (a
+            // terminator referencing outside region 0) — the old code
+            // treated it as a fresh node; grow the dense state to match.
+            let wo = match ord.get(&w) {
+                Some(&o) => o,
+                None => {
+                    let o = bs.len();
+                    bs.push(w);
+                    ord.insert(w, o);
+                    index.push(u32::MAX);
+                    low.push(0);
+                    onstack.push(false);
+                    selfedge.push(false);
+                    o
+                }
+            };
+            if wo == v {
+                selfedge[v] = true;
+            } else if index[wo] == u32::MAX {
+                index[wo] = next;
+                low[wo] = next;
+                next += 1;
+                tstack.push(wo);
+                onstack[wo] = true;
+                work.push((wo, bsuccs(ctx, st, w)));
+            } else if onstack[wo] {
+                low[v] = low[v].min(low[wo]);
+            }
+        }
+    }
+    out
+}
+
+/// Parameter indices of `f` that (through loads / GEPs) feed an indirect call's
+/// target: a constant address there (a vtable, a fn pointer) lets `devirt`
+/// make the call direct once `f` is inlined, as LLVM's inline-cost bonus does.
+/// `targets` is the indirect-call operand-0s `callee_info` already collected.
+fn devirt_params(ctx: &Context, params: &[Value], targets: &[Value]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for &t in targets {
+        let mut p = t;
+        for _ in 0..4 {
+            if let Some(i) = params.iter().position(|&a| a == p) {
+                if !out.contains(&i) {
+                    out.push(i);
+                }
+                break;
+            }
+            match p.defining_op() {
+                Some(d)
+                    if Operation::is_op::<LoadOp>(d, ctx)
+                        || Operation::is_op::<GetElementPtrOp>(d, ctx) =>
+                {
+                    p = d.deref(ctx).get_operand(ctx, 0);
+                }
+                _ => break,
+            }
+        }
+    }
+    out
+}
+
+/// Parameter indices of `f` that reach a conditional branch's condition
+/// through a short def chain: a scalar-constant argument there folds the
+/// branch in the inlined clone, so the callsite gets a size-limit bonus.
+/// `roots` is the branch-condition operands `callee_info` already collected
+/// (it decides whether `switch` conditions are included).
+fn cond_params(ctx: &Context, params: &[Value], roots: &[Value]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for &root in roots {
+        let mut work = vec![root];
+        let mut seen: FxHashSet<Value> = FxHashSet::default();
+        let mut budget = 32;
+        while let Some(v) = work.pop() {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
+            if let Some(i) = params.iter().position(|&a| a == v) {
+                if !out.contains(&i) {
+                    out.push(i);
+                }
+                continue;
+            }
+            if !seen.insert(v) {
+                continue;
+            }
+            let Some(d) = v.defining_op() else {
+                continue;
+            };
+            for oi in 0..d.deref(ctx).get_num_operands() {
+                work.push(d.deref(ctx).get_operand(ctx, oi));
+            }
+        }
+    }
+    out
+}
+
+fn call_counts(ctx: &Context, st: &State) -> FxHashMap<String, usize> {
+    let mut n: FxHashMap<String, usize> = FxHashMap::default();
+    for (sym, f) in &st.funcs {
+        if !has_body(ctx, f.op) || st.dead_fns.contains(sym) {
+            continue;
+        }
+        for b in blocks_iter(ctx, f.op) {
+            for op in b.deref(ctx).iter(ctx) {
+                if let Some(c) = direct_callee(ctx, st, op) {
+                    if let Some(n) = n.get_mut(c) {
+                        *n += 1;
+                    } else {
+                        n.insert(c.clone(), 1);
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Callers among *optimizable* bodies: stripped (`dead_fns`) and emit-only
+/// (`dead_unopt`) bodies don't count — a dead caller's call shouldn't keep
+/// its callee in the optimization pipeline (the callee still emits, so
+/// the emit-only call always links).
+fn live_counts(ctx: &Context, st: &State) -> FxHashMap<String, usize> {
+    let mut n: FxHashMap<String, usize> = FxHashMap::default();
+    for (sym, f) in &st.funcs {
+        if !has_body(ctx, f.op)
+            || st.dead_fns.contains(sym)
+            || st.dead_unopt.contains(sym)
+        {
+            continue;
+        }
+        for b in blocks_iter(ctx, f.op) {
+            for op in b.deref(ctx).iter(ctx) {
+                if let Some(c) = direct_callee(ctx, st, op) {
+                    if let Some(n) = n.get_mut(c) {
+                        *n += 1;
+                    } else {
+                        n.insert(c.clone(), 1);
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Callee -> callsite-owner syms adjacency plus the `single`-inline inputs,
+/// built once and kept exact across the runs that share it: inlining
+/// `caller -> callee` removes one entry from `callers_of[callee]` and adds
+/// `caller` to every callee the inlined body brought with it (`taken` is a
+/// `st.consts` fact — a body can't introduce a new use of a symbol it
+/// didn't already reference, so it needs no maintenance here).
+pub struct Adj {
+    /// One entry per direct-call site (a caller holding two sites to the
+    /// same callee appears twice, like `call_counts`).
+    pub callers_of: FxHashMap<String, Vec<String>>,
+    /// Symbols whose address is referenced outside calls.
+    taken: FxHashSet<String>,
+}
+
+impl Adj {
+    fn build(ctx: &Context, st: &State) -> Self {
+        let mut callers_of: FxHashMap<String, Vec<String>> = FxHashMap::default();
+        for (sym, f) in &st.funcs {
+            if !has_body(ctx, f.op)
+                || st.dead_fns.contains(sym)
+                || st.dead_unopt.contains(sym)
+            {
+                continue;
+            }
+            for b in blocks_iter(ctx, f.op) {
+                for op in b.deref(ctx).iter(ctx) {
+                    if let Some(c) = direct_callee(ctx, st, op) {
+                        callers_of.entry(c.clone()).or_default().push(sym.clone());
+                    }
+                }
+            }
+        }
+        Adj {
+            callers_of,
+            taken: crate::address_taken(ctx, st),
+        }
+    }
+
+    /// `call` (`sym -> cs`) was inlined: the site is gone, and `cs`'s own
+    /// calls now live in `sym` (its out-of-line copy still exists — its
+    /// calls stay).
+    fn inlined(&mut self, ctx: &Context, st: &State, sym: &str, cs: &str) {
+        if let Some(v) = self.callers_of.get_mut(cs) {
+            if let Some(p) = v.iter().position(|x| x == sym) {
+                v.swap_remove(p);
+            }
+        }
+        for m in callees(ctx, st, cs) {
+            self.callers_of.entry(m).or_default().push(sym.to_string());
+        }
+    }
+}
+
+/// What a `run` changed, for driving the next round's caller filter.
+#[derive(Default)]
+pub struct Delta {
+    /// Callers that received inlined code.
+    pub callers: FxHashSet<String>,
+    /// Callees that lost a callsite — their remaining callers may now see
+    /// the single-callsite free inline.
+    pub callees: FxHashSet<String>,
+}
+
+/// Marks local fns that nothing references any more (typically fully inlined)
+/// so lowering skips them. Iterates because a dead fn's calls don't count.
+/// `PLIRON_DEADFN=0` disables it.
+// r[impl iropt.inline.dead]
+pub fn dead_fns(ctx: &Context, st: &mut State) {
+    let taken = crate::address_taken(ctx, st);
+    loop {
+        let counts = call_counts(ctx, st);
+        let dead: Vec<String> = st
+            .funcs
+            .iter()
+            .filter(|(n, f)| {
+                f.linkage == Linkage::Local
+                    && has_body(ctx, f.op)
+                    && !st.dead_fns.contains(n.as_str())
+                    && (st.xcgufn_kill || !st.xcgu_copies.contains(n.as_str()))
+                    && !taken.contains(n.as_str())
+                    && !counts.contains_key(n.as_str())
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        if dead.is_empty() {
+            break;
+        }
+        st.dead_fns.extend(dead);
+    }
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "deadfn {}: {} of {} fns not lowered",
+                st.cgu,
+                st.dead_fns.len(),
+                st.funcs.len()
+            )
+        };
+    }
+    // Protected (`xcgu_copies`) fns that trip the same dead test get a
+    // cheaper sentence than stripping: `dead_unopt` emits them through
+    // only the `Gate::Always` correctness lowerings. They stay "live"
+    // for `call_counts` — an invisible caller still links and runs a
+    // correct (unoptimized) body, and their own callees keep counting.
+    mark_dead_unopt(ctx, st);
+}
+
+/// `PLIRON_XCGU_HOME=1`: a cross-CGU copy that inlining left called (or
+/// address-taken) becomes a declaration of its home definition again. Its
+/// callers then reach the home body, which was optimized with its own
+/// callees in reach; the copy is usually worse. blind-sig: with bigger
+/// copies (`PLIRON_XCGU_SIZE=100`) `SmallVec::extend` was copied into every
+/// CGU, too big to inline anywhere, and each copy called `reserve`,
+/// `size_hint` and the `Cloned` fold out of line (no bodies here), where
+/// the home copy has them inlined. Runs right after inlining, before any
+/// pass that relies on seeing every caller of a `Local` fn (spec, sret2reg,
+/// deadarg, the internal call ABI). Returns the copies converted.
+// r[impl par.xcgu.home]
+pub fn home_copies(ctx: &mut Context, st: &mut State) -> usize {
+    if st.xcgu_home.is_empty() {
+        return 0;
+    }
+    // A callerless copy converts too: refs `direct_callee`/`address_taken`
+    // can't see (copy-to-copy calls are the known gap) bind to the
+    // same-named hidden-external home def either way, so erasing is never
+    // a link risk under `home_linkable` — and it stops an unreferenced
+    // local body being emitted for nothing.
+    let back: Vec<(String, Ptr<Operation>)> = st
+        .xcgu_home
+        .iter()
+        .filter_map(|n| {
+            let f = st.funcs.get(n.as_str())?;
+            (f.linkage == Linkage::Local
+                && has_body(ctx, f.op)
+                && !st.dead_fns.contains(n.as_str()))
+            .then(|| (n.clone(), f.op))
+        })
+        .collect();
+    for (n, op) in &back {
+        erase_body(ctx, *op);
+        if let Some(f) = st.funcs.get_mut(n.as_str()) {
+            f.linkage = Linkage::Import;
+        }
+    }
+    if !back.is_empty() {
+        st.purge_dead(ctx);
+    }
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        tracing::info!(target: "pliron::stats", "xcgu-home {}: {} copies call home", st.cgu, back.len());
+    }
+    back.len()
+}
+
+/// Mark `xcgu_copies` members nothing live references as `dead_unopt`:
+/// `Local` + bodied + no `live_counts` caller + not `live`-address-taken,
+/// iterated to a fixpoint (a marked caller's calls stop counting).
+///
+/// The mark only ever costs optimization, never correctness: a marked
+/// fn still emits a (raw, `Gate::Always`-lowered) body, so a caller
+/// `direct_callee` can't see — or one a later pass newly creates —
+/// still links and runs. And the mark can't become stale: a marked fn
+/// is untaken, so no `Sym` const of it exists for a later devirt/spec
+/// rewrite to aim a new call at.
+///
+/// Call sites: `dead_fns` (final catch-all) plus, under
+/// `PLIRON_EARLYDEAD`, the `iropt_head` entry and the post-devirt
+/// point — every `bodied`/`opt_body` pass after that skips the marked
+/// bodies entirely.
+// r[impl par.xcgu.keep]
+pub fn mark_dead_unopt(ctx: &Context, st: &mut State) -> usize {
+    if !st.deadunopt_on || st.xcgu_copies.is_empty() {
+        return 0;
+    }
+    let before = st.dead_unopt.len();
+    loop {
+        let taken = crate::address_taken_ex(ctx, st, true);
+        let counts = live_counts(ctx, st);
+        let dead: Vec<String> = st
+            .funcs
+            .iter()
+            .filter(|(n, f)| {
+                f.linkage == Linkage::Local
+                    && has_body(ctx, f.op)
+                    && st.xcgu_copies.contains(n.as_str())
+                    && !st.dead_fns.contains(n.as_str())
+                    && !st.dead_unopt.contains(n.as_str())
+                    && !taken.contains(n.as_str())
+                    && !counts.contains_key(n.as_str())
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        if dead.is_empty() {
+            break;
+        }
+        for n in dead {
+            st.dead_unopt_ops.insert(st.funcs[&n].op);
+            st.dead_unopt.insert(n);
+        }
+    }
+    let marked = st.dead_unopt.len() - before;
+    if marked > 0 && pliron_cfg::tracing_on() {
+        tracing::info!(target: "pliron::stats",
+            "deadunopt {}: +{} = {} of {} fns minimal-pipelined",
+            st.cgu,
+            marked,
+            st.dead_unopt.len(),
+            st.funcs.len()
+        );
+    }
+    marked
+}
+
+/// Unlink and free every block of `f`'s body; returns the op count freed.
+/// The `llvm.func` op itself stays, bodiless (a declaration as far as
+/// `has_body` goes) — callers must also mark it in `dead_fns` so lowering
+/// never declares or emits it.
+pub fn erase_body(ctx: &mut Context, f: Ptr<Operation>) -> usize {
+    let bs = blocks(ctx, f);
+    let n: usize = bs.iter().map(|&b| b.deref(ctx).iter(ctx).count()).sum();
+    for &b in &bs {
+        BasicBlock::drop_all_uses(b, ctx);
+    }
+    for b in bs {
+        BasicBlock::erase(b, ctx);
+    }
+    n
+}
+
+/// `PLIRON_DEADFREE=1`: free, not just mark, the `Local` fns nothing
+/// references — no direct caller in any remaining body (`call_counts`),
+/// address not taken — xcgu copies included (`PLIRON_XCGUFN_KILL`'s
+/// rule; the counting blindspot that made it unsafe was fixed in
+/// `indirect_callee`, and the historical repro links byte-identical).
+/// Iterated: a freed body's calls stop counting. In syn about 43% of the
+/// ops a CGU holds at publish were such bodies (mostly xcgu copies
+/// inlining had used up), kept until the CGU dropped; freed arena slots
+/// are reused by later clones instead of growing the arena.
+/// Returns (fns, ops) freed.
+// r[impl par.xcgu.deadfree]
+pub fn free_dead(ctx: &mut Context, st: &mut State) -> (usize, usize) {
+    let (mut fns, mut ops) = (0usize, 0usize);
+    loop {
+        let taken = crate::address_taken(ctx, st);
+        let counts = call_counts(ctx, st);
+        let dead: Vec<(String, Ptr<Operation>)> = st
+            .funcs
+            .iter()
+            .filter(|(n, f)| {
+                f.linkage == Linkage::Local
+                    && has_body(ctx, f.op)
+                    && !taken.contains(n.as_str())
+                    && !counts.contains_key(n.as_str())
+            })
+            .map(|(n, f)| (n.clone(), f.op))
+            .collect();
+        if dead.is_empty() {
+            break;
+        }
+        for (n, op) in dead {
+            ops += erase_body(ctx, op);
+            fns += 1;
+            st.dead_fns.insert(n);
+        }
+        st.purge_dead(ctx);
+    }
+    (fns, ops)
+}
+
+/// Functions with bodies, callees before callers (cycles broken arbitrarily).
+/// `filter` restricts both the roots and which callees the DFS descends
+/// into — a restricted run still orders its callees before their callers.
+// r[impl iropt.inline.order]
+fn post_order(ctx: &Context, st: &State, filter: Option<&FxHashSet<String>>) -> Vec<String> {
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut out = Vec::new();
+    let roots: Vec<&String> = match filter {
+        Some(f) => f.iter().collect(),
+        None => st.funcs.keys().collect(),
+    };
+    for root in roots {
+        if !has_body(ctx, st.funcs[root].op)
+            || st.dead_unopt.contains(root.as_str())
+            || !seen.insert(root.clone())
+        {
+            continue;
+        }
+        let mut stack = vec![(root.clone(), callees(ctx, st, root), 0usize)];
+        while let Some((sym, cs, i)) = stack.last_mut() {
+            if let Some(c) = cs.get(*i).cloned() {
+                *i += 1;
+                if filter.is_none_or(|f| f.contains(&c))
+                    && has_body(ctx, st.funcs[&c].op)
+                    && seen.insert(c.clone())
+                {
+                    let cc = callees(ctx, st, &c);
+                    stack.push((c, cc, 0));
+                }
+            } else {
+                out.push(sym.clone());
+                stack.pop();
+            }
+        }
+    }
+    out
+}
+
+fn callees(ctx: &Context, st: &State, sym: &str) -> Vec<String> {
+    blocks_iter(ctx, st.funcs[sym].op)
+        .flat_map(|b| b.deref(ctx).iter(ctx))
+        .filter_map(|op| direct_callee(ctx, st, op).cloned())
+        .filter(|c| st.funcs.contains_key(c))
+        .collect()
+}
+
+/// `small`: size-sensitive output (wasm, -Copt-level=s/z) keeps the old 40-op limit and no
+/// single-caller inlining; rustc.wasm tripled in code size (past V8's 1 GB module cap) without it.
+///
+/// The cost model (`PLIRON_INLINE_MODEL`, default on; `0` = the fixed
+/// thresholds) inlines a callsite when `cost <= threshold`:
+///
+/// - cost = the callee's op count, plus `CALL_OP_W` per nested call (inlining
+///   moves, doesn't remove, them), times `COLD_W` for `#[cold]` callees.
+/// - threshold = the `PLIRON_INLINE` base, x10 for `#[inline(always)]` or a
+///   local callee with a single callsite (its out-of-line copy then dies),
+///   x`PLIRON_INLINE_DEVIRT` when a constant-address actual feeds an
+///   indirect-call param, x`PLIRON_INLINE_FOLD` when a constant actual feeds
+///   a branch condition, plus `FOLD_USE`/`MEM_USE` per use a constant or
+///   local-slot actual resolves, plus `PLIRON_INLINE_LOOP`/4 of the base when
+///   the callsite sits in a loop and the callee is leaf-ish (at most
+///   `PLIRON_INLINE_LOOPCALLS` warm calls of its own, default 2: calls that
+///   can run, not `#[cold]` or noreturn panics (`PLIRON_INLINE_WARMCALLS=0`
+///   counts every call); brotli's `EvaluateNode` has 18 calls, one of them
+///   warm) — all capped at `MAX_T`x the base.
+/// - `PLIRON_INLINE_GROWTH` (default `GROWTH_MULT`x the base) caps the
+///   non-free ops one caller may absorb; `PLIRON_INLINE_CALLER_MAX` still
+///   bounds total size. `small` disables every bonus and the budget.
+/// `hot` (small mode only): callsites inside a loop get `hot`x the flat
+/// `limit` as their threshold — see [`WASM_HOT`]. 0 disables.
+///
+/// `callers` restricts which callers get (re)scored: the incremental
+/// rounds pass the callers previous runs/devirt touched instead of
+/// rescanning the whole module. A caller outside the filter can't inline
+/// anything anyway — `only` still gates which of its *pre-existing* sites
+/// may go. `adj` is the callsite adjacency, reused across back-to-back
+/// rounds; pass an empty `Option` to force a rebuild when other passes ran
+/// in between. Returns the `Delta` the next round's filter is built from.
+// r[impl iropt.inline.model]
+// r[impl iropt.inline.budget]
+// r[impl iropt.inline.free]
+// r[impl iropt.inline.fanin]
+// r[impl iropt.inline.hot]
+pub fn run(
+    ctx: &mut Context,
+    st: &mut State,
+    small: bool,
+    small_limit: usize,
+    hot: usize,
+    only: Option<&FxHashSet<Ptr<Operation>>>,
+    always_only: bool,
+    callers: Option<&FxHashSet<String>>,
+    adj: &mut Option<Adj>,
+) -> Delta {
+    let limit = crate::env_get("PLIRON_INLINE")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if small { small_limit } else { DEFAULT_LIMIT });
+    // -O0 still honours `#[inline(always)]` like LLVM's AlwaysInliner: wasm-bindgen
+    // needs its describe markers inlined into each monomorphised shim.
+    let limit = if always_only { usize::MAX / 16 } else { limit };
+    if limit == 0 {
+        return Delta::default();
+    }
+    // Local fns with one direct call site and no address use get 10x the limit:
+    // inlining them removes the out-of-line copy (`PLIRON_INLINE_ONCE=0` disables).
+    let once = !always_only && crate::env_get("PLIRON_INLINE_ONCE").map_or(!small, |v| v != "0");
+    // `PLIRON_INLINE_FANIN=<m>` (0 = off; default 8 via DEFAULT_VALUES):
+    // a callee is inlined at a plain site only while `its size x its
+    // remaining call sites <= m x the site's threshold` — a fat helper
+    // called from everywhere stays one out-of-line body (syn's
+    // `drop_glue<Vec<Attribute>>`). Sites in loops, `#[inline(always)]`
+    // and single-site callees are exempt. Skipped in `small`/wasm mode:
+    // keeping helpers out of line there grew regex-wasm CODE
+    // (440→489 KiB with FANIN=8); the waffle inliner re-duplicates them.
+    let fanin: usize = if always_only || small {
+        0
+    } else {
+        crate::env_get("PLIRON_INLINE_FANIN")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    };
+    // `PLIRON_INLINE_CLEAN=1`: DCE + block merge on each caller once its
+    // inlining is done, before it is cloned into its own callers.
+    let pure = (!always_only && crate::env_is("PLIRON_INLINE_CLEAN", "1"))
+        .then(crate::cleanup::Pure::new);
+    let mut cleaned = crate::cleanup::Cleaned::default();
+    // `PLIRON_INLINE_PAIR=<k>` (0 = off): a callee reachable from at
+    // most `k` calling functions gets `pair_mul`x its callsite limit —
+    // when every remaining site inlines, the out-of-line body dies, so
+    // the net module delta is about one body (LLVM's last-call-to-
+    // static bonus generalized to the last few sites; brotli's
+    // `alloc_if<ZopfliNode>`, 2 callers, cost 596 vs 320, and
+    // pulldown-cmark's `scalar_iterate_special_bytes`, 2 callers, cost
+    // 5704 vs single-site 3840 — both inlined by LLVM). The bonus
+    // multiplies whatever the callsite earned (flat, single-site or
+    // loop), so a warm big body can only win on top of an existing
+    // bonus. Address-taken/`#[cold]` callees are excluded; `fanin`
+    // still bounds the total growth. Opt-in: +3.9% regex-syntax .text
+    // at k=2 for ~5% pulldown-cmark runtime — kept as a knob, not
+    // default.
+    let pair: usize = if small {
+        0
+    } else {
+        crate::env_get("PLIRON_INLINE_PAIR")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    };
+    let pair_mul: usize = 2;
+    if once || callers.is_some() || st.deadfree || fanin > 0 || pair > 0 {
+        adj.get_or_insert_with(|| Adj::build(ctx, st));
+    }
+    let single: FxHashSet<String> = if once {
+        let adj = adj.as_ref().unwrap();
+        st.funcs
+            .iter()
+            .filter(|(n, f)| {
+                f.linkage == Linkage::Local
+                    && !adj.taken.contains(n.as_str())
+                    && adj.callers_of.get(n.as_str()).is_some_and(|v| v.len() == 1)
+            })
+            .map(|(n, _)| n.clone())
+            .collect()
+    } else {
+        FxHashSet::default()
+    };
+    // PLIRON_INLINE_BU=0: one flat round, non-invoke sites only (the old heuristic).
+    let bottom_up = !always_only && crate::pass_enabled("PLIRON_INLINE_BU");
+    let simp_late = crate::env_is("PLIRON_INLINE_SIMP", "2");
+    // `=3`: only loop-free callers (a looping body that measures smaller
+    // gets inlined into its callers: serde's escape loop into
+    // `serialize_field`, +8% json).
+    let simp_noloop = crate::env_is("PLIRON_INLINE_SIMP", "3");
+    let mut simp = (bottom_up && (crate::env_is("PLIRON_INLINE_SIMP", "1") || simp_late || simp_noloop))
+        .then(|| (crate::cleanup::Pure::new(), crate::constload::ImageCache::default()));
+    let mut simp_n = 0usize;
+    // EH-invoke inlining grows code ~14% (regex-syntax), so size-sensitive output skips it.
+    let eh_invoke = crate::env_get("PLIRON_INLINE_EH_INVOKE").map_or(!small, |v| v != "0");
+    let cap: usize = crate::env_get("PLIRON_INLINE_CALLER_MAX")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000);
+    // Callees up to `bonus`x the limit whose indirect call target comes from a
+    // parameter are inlined where that argument is a constant address
+    // (`PLIRON_INLINE_DEVIRT=<x>`; e.g. hashbrown's `find_or_find_insert_index_inner`
+    // taking `&mut dyn FnMut`).
+    let bonus: usize = crate::env_get("PLIRON_INLINE_DEVIRT")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if small { 0 } else { 4 });
+    // Similarly, callees up to `fold`x the limit whose param reaches a branch
+    // condition are inlined where that argument is a scalar constant, which
+    // folds the branch in the clone (`PLIRON_INLINE_FOLD=<x>`).
+    let fold: usize = crate::env_get("PLIRON_INLINE_FOLD")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if small { 0 } else { 2 });
+    // `#[inline]` callees get up to `hint`x the limit (`PLIRON_INLINE_HINT`):
+    // rustc's hint means "small or hot leaf" — std's `hash_one`/iterator
+    // adapters sit just over the base limit but must inline to match LLVM.
+    let hint: usize = crate::env_get("PLIRON_INLINE_HINT")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if small { 0 } else { 4 });
+    // Cap how many sites may inline one callee per run — a fat helper
+    // cloned into every caller duplicates its body module-wide
+    // (`PLIRON_INLINE_MAXDUP`; 0 = unbounded). `#[inline(always)]`
+    // bypasses: it's a semantic requirement.
+    let maxdup: usize = crate::env_get("PLIRON_INLINE_MAXDUP")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut dup: FxHashMap<String, usize> = FxHashMap::default();
+    // `PLIRON_INLINE_LOOPY=<n>` (small mode; 0/unset = off): a callee over
+    // `n` ops with loops of its own, called outside every caller loop,
+    // stays out of line unless free. Its loops amortize the call; each
+    // inlined copy only adds code (`mul_pow10` took five 414-op
+    // `mul_digits` copies under the flat `WASM_LIMIT`).
+    let loopy_min: usize = crate::env_get("PLIRON_INLINE_LOOPY")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // `PLIRON_INLINE_LOOPY_NATIVE=1` (opt-in): the same rule outside small
+    // mode. A looping callee pasted into a non-loop site moves its loop
+    // into a bigger frame (serde's escape loop in `serialize_field`, regex's
+    // `follow_epsilons` in `next_state`) and saves only the one call.
+    let loopy_native = crate::env_is("PLIRON_INLINE_LOOPY_NATIVE", "1");
+    let mut has_loop: FxHashMap<String, bool> = FxHashMap::default();
+    // The profitability model (`PLIRON_INLINE_MODEL=0` gives the fixed
+    // thresholds). `small` stays on the legacy rules: wasm/-Os/-Oz must not
+    // grow code on heuristics tuned for speed.
+    let model = crate::pass_enabled("PLIRON_INLINE_MODEL") && !small;
+    // `PLIRON_INLINE_LOOPCALLS=<n>` (default 4): the in-loop bonus only
+    // for callees with at most `n` calls of their own — small mode's
+    // leaf-ish rule. A callee that carries many calls just moves them into
+    // the loop: parser loops (`while input.peek(..)`) took 25-call drop
+    // glues at 3x the base threshold. syn CPU -65%, kernels neutral.
+    // Default 2 since 11-03, counting warm calls only (`PLIRON_INLINE_WARMCALLS`
+    // below); it was 4 against all calls, which bounds-check panics inflate.
+    let loop_calls: usize = crate::env_get("PLIRON_INLINE_LOOPCALLS")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    // `PLIRON_INLINE_WARMCALLS`: `0` counts every call, so the bonus only
+    // rescues leaf-ish bodies — a callee carrying panic calls it never
+    // executes still moves those into the loop (regex-syntax's parser
+    // loops inlined `bump`/`char`, 9 and 6 calls each: −9% parse_only,
+    // −5% .text). `1` gates on the warm calls only; `2` keeps that gate and
+    // instead prices the callee by its warm ops and warm calls (see
+    // `CInfo::nwarm_ops`): a documented negative (regex +2%, binary +4%).
+    let warm_mode: u8 = crate::env_get("PLIRON_INLINE_WARMCALLS").and_then(|v| v.parse().ok()).unwrap_or(3);
+    let warm_gate = warm_mode == 1;
+    let warm_cost = warm_mode == 2;
+    // `3` (the default) keeps the all-calls gate but also lets a
+    // warm-call-sparse call-carrier earn the loop bonus when its warm
+    // body alone fits the base limit and it passes the `fanin` growth
+    // bound: brotli's
+    // `EvaluateNode` (18 calls, 1 warm — the rest are `panic_bounds_check`
+    // scaffolding — 297 warm ops, 3 callers, all in the zopfli node loop;
+    // LLVM inlines it) gets the bonus, while regex's `bump`/`char`
+    // (61–132 callers — the d21d9da growth regression) and `peek` (387
+    // warm ops — a real worker, not a small body plus scaffolding) stay
+    // out. The warm calls are what run each iteration; fanin bounds the
+    // total growth across the callee's remaining sites.
+    let warm_fanin = warm_mode == 3;
+    // `PLIRON_INLINE_CALLW`: per-nested-call cost weight (`CALL_OP_W`).
+    let call_w: usize = crate::env_get("PLIRON_INLINE_CALLW")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(CALL_OP_W);
+    // `PLIRON_INLINE_HIST=0` lets a site cloned out of an inlined body
+    // inline a callee already on its clone chain (`State::inline_hist`).
+    let hist = crate::pass_enabled("PLIRON_INLINE_HIST");
+    // `PLIRON_INLINE_SCC` (`=0` disables): a site cloned out of an inlined body may not
+    // inline a callee in its caller's own (nontrivial) call-graph SCC —
+    // LLVM's CGSCC rule for edges inlining created inside an SCC. Original
+    // sites still inline one level; re-entering the recursion stops.
+    let recstack = crate::env_is("PLIRON_INLINE_RECSTACK", "1");
+    let once1 = crate::env_is("PLIRON_INLINE_ONCE1", "1");
+    let scc_limit = crate::env_is("PLIRON_INLINE_SCCLIMIT", "1");
+    // `PLIRON_INLINE_SMALLSCC=1` (small mode only): no inlining at all
+    // along a call-graph cycle — a callee in the caller's own SCC (or a
+    // self-recursive caller) stays a call. On wasm the flat 512-op
+    // limit lets each member of a recursive drop-glue mesh (`Ast::drop`
+    // -> `drop_glue<Vec<Ast>>` -> `Vec::drop` -> `drop_glue<Ast>` ...)
+    // take one full level of the whole mesh: regex-syntax's `Ast::drop`
+    // 7,240 B against LLVM's 1,275. The original-site-one-level rule
+    // (`PLIRON_INLINE_SCC`) is what LLVM does for speed; size-sensitive
+    // output can't afford it.
+    let smallscc = small && crate::env_is("PLIRON_INLINE_SMALLSCC", "1");
+    let dupcost = crate::env_is("PLIRON_INLINE_DUPCOST", "1");
+    let glue_warm = crate::env_is("PLIRON_INLINE_GLUEWARM", "1");
+    // `PLIRON_INLINE_FREEMAX=<n>` (opt-in): a single-site callee over n ops
+    // gets no "free" threshold. memchr's 809-op search closure, inlined
+    // into its one site in `search_slice_with_raw`, made pulldown's
+    // `scan_nextline` too big to inline into its callers; LLVM keeps the
+    // closure out of line.
+    let freemax: Option<usize> = crate::env_get("PLIRON_INLINE_FREEMAX").and_then(|s| s.parse().ok());
+    // `PLIRON_INLINE_FREEMUL=<k>`: the free (single-site) threshold as a
+    // multiple of the base limit (default 10). pulldown's `parse_line`
+    // closure (4,594 raw ops, one site) missed it at 4,200, and its scan
+    // loop paid a call, seven spills and a result through memory per
+    // special byte; LLVM inlines it (last-call bonus on the simplified body).
+    let free_mul: usize = crate::env_get("PLIRON_INLINE_FREEMUL").and_then(|s| s.parse().ok()).unwrap_or(10);
+    // `PLIRON_INLINE_SPEC=1`: size each callsite's callee as specialized to
+    // that site (`inline_cost`), scaled by `PLIRON_INLINE_SPEC_SCALE`
+    // percent (default 147: code-free ops are ~32% of the raw count the
+    // thresholds were tuned on). Replaces the fold/mem bonuses.
+    let spec = model && crate::env_is("PLIRON_INLINE_SPEC", "1");
+    let spec_scale: usize =
+        crate::env_get("PLIRON_INLINE_SPEC_SCALE").and_then(|s| s.parse().ok()).unwrap_or(147);
+    let mut spec_cache: FxHashMap<(String, Vec<Option<u128>>), crate::inline_cost::SpecCost> = FxHashMap::default();
+    let cold_sites = crate::env_is("PLIRON_INLINE_COLD", "1");
+    let cold_once = crate::env_is("PLIRON_INLINE_COLDONCE", "1");
+    // `PLIRON_INLINE_DROPLIM=<n>` (opt-in): a drop-glue callee's threshold
+    // never exceeds n. Glue bodies lower ~1 op:1 insn (stores and calls, no
+    // slack), so even mid-size glue is far past LLVM's threshold — LLVM
+    // keeps `drop_glue<Box<ClassSet>>` a call at ~30 insns where our 320-op
+    // limit + alloca-arg save accepts the 104-op body, cloning its dealloc
+    // and landing-pad paths into every site (regex-syntax `pop_class_op`,
+    // +518 insns over LLVM). `free` sites stay exempt: the out-of-line copy
+    // dies there, so inlining can't grow the crate.
+    let droplim: usize = crate::env_get("PLIRON_INLINE_DROPLIM")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let always_all = crate::pass_enabled("PLIRON_INLINE_ALWAYS");
+    // `PLIRON_INLINE_WASM_COLDKEEP=1` (small mode; default off): non-keep
+    // callees use `WASM_COLDKEEP_THRESH` as the flat cold cap; keep-list
+    // (hash/num/str/ast-parse) keeps `limit`.
+    let coldkeep = small && crate::env_is("PLIRON_INLINE_WASM_COLDKEEP", "1");
+    let keep_thresh: usize = WASM_COLDKEEP_THRESH;
+    let mut free_used: FxHashSet<String> = FxHashSet::default();
+    // Self-recursive functions (`scc` keeps only multi-function cycles).
+    let self_rec: FxHashSet<String> = if recstack || smallscc {
+        st.funcs
+            .iter()
+            .filter(|(n, f)| has_body(ctx, f.op) && callees(ctx, st, n).iter().any(|c| c == *n))
+            .map(|(n, _)| n.clone())
+            .collect()
+    } else {
+        FxHashSet::default()
+    };
+    let scc_rule = crate::pass_enabled("PLIRON_INLINE_SCC");
+    let scc: FxHashMap<String, u32> = if scc_rule || recstack || scc_limit || smallscc {
+        scc_ids(ctx, st)
+    } else {
+        FxHashMap::default()
+    };
+    let verbose = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::inline", tracing::Level::DEBUG);
+    // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
+    // model only). `cap` still bounds the caller's absolute size.
+    let growth: usize = crate::env_get("PLIRON_INLINE_GROWTH")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| limit.saturating_mul(GROWTH_MULT));
+    // Callee infos are computed lazily at first use — a filtered round
+    // profiles only the callees its callers actually reference.
+    let mut infos: FxHashMap<String, Option<CInfo>> = FxHashMap::default();
+    macro_rules! add_info {
+        ($sym:expr) => {
+            infos.insert(
+                $sym.to_string(),
+                callee_info(ctx, st, $sym, model, limit, bonus, fold),
+            );
+        };
+    }
+    let order: Vec<String> = if bottom_up {
+        post_order(ctx, st, callers)
+    } else {
+        st.funcs
+            .iter()
+            .filter(|(_, f)| has_body(ctx, f.op))
+            .filter(|(s, _)| callers.is_none_or(|c| c.contains(*s)))
+            .filter(|(s, _)| !st.dead_unopt.contains(s.as_str()))
+            .map(|(s, _)| s.clone())
+            .collect()
+    };
+    let mut delta = Delta::default();
+    let mut rw = IRRewriter::<DummyListener>::default();
+    let _setup_end = tracing::info_span!(target: "pliron::iropt", "inline-prep").entered();
+    drop(_setup_end);
+    let _scan = tracing::info_span!(target: "pliron::iropt", "inline-scan").entered();
+    let (mut t_scan, mut t_call, mut t_info) = (0f64, 0f64, 0f64);
+    let mut t0 = std::time::Instant::now();
+    // Lazily-built per-callee side-table annotation lists; a callee's
+    // entry is dropped when that function's own body is rewritten below
+    // (it may be inlined again afterwards with the new body).
+    let mut tagcache: FxHashMap<Ptr<Operation>, CalleeTags> = FxHashMap::default();
+    // `PLIRON_DEADFREE`: ops freed since the last side-table purge, and in all.
+    let (mut freed_ops, mut freed_total) = (0usize, 0usize);
+    for sym in order {
+        let caller = st.funcs[&sym].op;
+        if st.opt_skip.contains(&caller) {
+            continue;
+        }
+        let mut size: usize = blocks_iter(ctx, caller)
+            .map(|b| b.deref(ctx).iter(ctx).count())
+            .sum();
+        let mut grown = 0usize;
+        // `PLIRON_INLINE_DUPCOST`: copies of each callee inlined into this
+        // caller so far.
+        let mut copies: FxHashMap<String, usize> = FxHashMap::default();
+        // `only` (the devirt-inline pass) restricts which pre-existing
+        // callsites may inline; ops this run itself splices in are fair game —
+        // e.g. devirt'd `{closure}` exposes `hash_one` inside `reserve_rehash`.
+        let pre: FxHashSet<Ptr<Operation>> = only
+            .map(|_| {
+                blocks_iter(ctx, caller)
+                    .flat_map(|b| b.deref(ctx).iter(ctx))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Inlining exposes nested callsites the scan hadn't seen: e.g.
+        // `HashMap::get` brings `hash_one` inside the caller's loop, where
+        // the in-loop bonus may now accept it. Rescan until a round finds
+        // nothing worth inlining (`size`/`grown`/`cap` bound the fixpoint).
+        // `inline_call` only ever *adds* blocks (the split continuation and
+        // the cloned callee body) — existing blocks never gain a new CallOp
+        // (branches/erase don't produce one), so each block is scanned once
+        // and later rounds walk only freshly spliced blocks.
+        let mut done_blocks: crate::helpers::SparseSet<Ptr<BasicBlock>> = Default::default();
+        // Persistent mirror of the caller's block order: inlining splices
+        // the split continuation right after the callsite block and appends
+        // callee clones at the region end, so a rescan can't just extend —
+        // `pending` holds continuations keyed by the block they follow and
+        // the scan splices them in at the same point the real list would.
+        let mut blklist = blocks(ctx, caller);
+        let mut pending: crate::helpers::SparseMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> =
+            Default::default();
+        for _round in 0..32 {
+            let mut sites = Vec::new();
+            let mut loops: Option<FxHashSet<Ptr<BasicBlock>>> = None;
+            let mut doomed: Option<FxHashSet<Ptr<BasicBlock>>> = None;
+            let mut bi = 0;
+            while let Some(&b) = blklist.get(bi) {
+                bi += 1;
+                if let Some(tail) = pending.remove(b) {
+                    blklist.splice(bi..bi, tail);
+                }
+                if !done_blocks.insert(b) {
+                    continue;
+                }
+                for op in b.deref(ctx).iter(ctx) {
+                    if !bottom_up && st.invokes.contains(op) {
+                        continue;
+                    }
+                    if pre.contains(&op) && only.is_some_and(|o| !o.contains(&op)) {
+                        continue;
+                    }
+                    let Some(cs) = direct_callee(ctx, st, op) else {
+                        continue;
+                    };
+                    // `always_only` profiles `#[inline(always)]` callees
+                    // only — the old upfront profiling skipped the rest.
+                    if always_only && !st.funcs[cs].always_inline {
+                        continue;
+                    }
+                    if !infos.contains_key(cs) {
+                        let ti = std::time::Instant::now();
+                        infos.insert(
+                            cs.clone(),
+                            callee_info(ctx, st, cs, model, limit, bonus, fold),
+                        );
+                        t_info += ti.elapsed().as_secs_f64() * 1e3;
+                    }
+                    let ci = &infos[cs];
+                    let Some(ci) = ci.as_ref() else {
+                        if verbose {
+                            if pliron_cfg::tracing_on() {
+                                tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: reject (ineligible)", st.cgu)
+                            };
+                        }
+                        continue;
+                    };
+                    let f = &st.funcs[cs];
+                    // PGO: a callsite the profile says never ran isn't
+                    // worth growing the caller for (`always_inline` is a
+                    // semantic requirement and still fires).
+                    let site_count = crate::pgo::block_count(st, b);
+                    if !f.always_inline && site_count == Some(0) {
+                        if verbose {
+                            if pliron_cfg::tracing_on() {
+                                tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: reject (cold callsite)",
+                                    st.cgu
+                                )
+                            };
+                        }
+                        continue;
+                    }
+                    // Free inlines: the out-of-line copy disappears
+                    // (single-callsite locals) or rustc demanded it.
+                    // `PLIRON_INLINE_RECSTACK=1`: no single-site bonus into
+                    // a caller on a recursion cycle the callee isn't on.
+                    // The out-of-line copy still dies, but every level of
+                    // the recursion now carries the callee's frame — stage
+                    // 2 `walk_expr::<TailCallCkVisitor>` got `check_tail_call`
+                    // through its 27 `visit_expr` copies (1,936-byte frame;
+                    // LLVM, which keeps it out of line, 80).
+                    let rec_caller = recstack
+                        && (scc.get(&sym).is_some_and(|c| scc.get(cs) != Some(c))
+                            || self_rec.contains(sym.as_str()) && !scc.contains_key(&sym));
+                    // `PLIRON_INLINE_ONCE1=1`: the bonus at most once per
+                    // callee per run. `single` (one calling function) is
+                    // computed at run start; a single-caller callee's call
+                    // can be cloned into other bodies after that (27 copies
+                    // of `check_tail_call`'s through `visit_expr`), and only
+                    // one of those inlines is free.
+                    // `PLIRON_INLINE_COLDONCE=1`: a `#[cold]` callee never
+                    // inlines for free. Its one copy would land in a hot
+                    // caller: `RawVec::reserve` took its cold
+                    // `do_reserve_and_handle` (grow + realloc), outgrew its
+                    // own callers' limit and paid a full prologue on the
+                    // no-grow path (pulldown's `Vec<u8>::reserve`). LLVM
+                    // keeps it out of line (rustc shares the instance from
+                    // `alloc`, so no last-call bonus applies).
+                    let free = f.always_inline
+                        || (once
+                            && single.contains(cs)
+                            && !rec_caller
+                            && !(cold_once && f.cold && !f.inline_hint)
+                            && !(once1 && free_used.contains(cs.as_str()))
+                            && freemax.is_none_or(|m| ci.n <= m));
+                    // `PLIRON_INLINE_WASM_COLD=<n>` (small mode only; unset =
+                    // `limit`): flat non-loop threshold. Loop-site `hot`x still
+                    // uses `limit` so `hash_one` (~926) keeps inlining at
+                    // `WASM_LIMIT=512` while cold helpers stop growing
+                    // regex-wasm. Measured: flat INLINE=384 kills tokenize
+                    // (+43%); a cold/hot split is the candidate (2026-10-28-solo50.md).
+                    // `COLDKEEP=1`: same as COLD=keep_thresh for non-allowlisted
+                    // callees, full `limit` for hash/num/str/parse. Applied here
+                    // (not a post-hoc reject) so loop sites with ncalls>2 that
+                    // miss the hot× bonus still see the cold cap — a separate
+                    // reject that exempted all loop blocks left Parser::bump
+                    // through at t=512 and grew CODE +19 KiB.
+                    let cold = if small {
+                        let explicit = crate::env_get("PLIRON_INLINE_WASM_COLD")
+                            .and_then(|s| s.parse().ok());
+                        if coldkeep {
+                            if wasm_cold_keep(cs) {
+                                explicit.unwrap_or(limit)
+                            } else {
+                                explicit.unwrap_or(keep_thresh)
+                            }
+                        } else {
+                            explicit.unwrap_or(limit)
+                        }
+                    } else {
+                        limit
+                    };
+                    let mut t = if free {
+                        limit.saturating_mul(free_mul)
+                    } else {
+                        cold
+                    };
+                    // `args` only feeds the bonus/fold/model scoring below —
+                    // collect the operand Vec lazily so plain candidates skip
+                    // the allocation entirely.
+                    let need_args = (bonus > 1 && !ci.dvirt.is_empty())
+                        || (fold > 1 && !ci.conds.is_empty())
+                        || model;
+                    let args = if need_args {
+                        Operation::get_op::<CallOp>(op, ctx)
+                            .map(|c| c.args(ctx))
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    // A constant address feeding an indirect-call param lets
+                    // `devirt` make the call direct; a scalar constant feeding a
+                    // branch condition folds it. (The old `dv` map's bonuses.)
+                    if bonus > 1
+                        && ci.dvirt.iter().any(|&i| {
+                            args.get(i).is_some_and(|a| {
+                                matches!(st.consts.get(*a), Some(ConstVal::Sym { .. }))
+                            })
+                        })
+                    {
+                        t = t.max(limit.saturating_mul(bonus));
+                    }
+                    if fold > 1
+                        && !spec
+                        && ci
+                            .conds
+                            .iter()
+                            .any(|&i| args.get(i).is_some_and(|a| const_arg(st, a)))
+                    {
+                        t = t.max(limit.saturating_mul(fold));
+                    }
+                    if hint > 1 && f.inline_hint {
+                        t = t.max(limit.saturating_mul(hint));
+                    }
+                    // PGO: a callsite the profile proves runs is worth
+                    // more code growth than a static guess.
+                    if site_count.is_some_and(|c| c >= 4) {
+                        t = t.saturating_add(limit.saturating_mul(2));
+                    }
+                    // The callee's size at this site: specialized (`spec`) or raw.
+                    let (sn, scalls) = if spec {
+                        let key: Vec<Option<u128>> = args
+                            .iter()
+                            .map(|a| match st.consts.get(*a) {
+                                Some(ConstVal::Bits(b)) => Some(*b),
+                                Some(ConstVal::Zero) => Some(0),
+                                _ => None,
+                            })
+                            .collect();
+                        let sc = *spec_cache
+                            .entry((cs.clone(), key))
+                            .or_insert_with(|| crate::inline_cost::spec_cost(ctx, st, ci.op, &args));
+                        (sc.n.saturating_mul(spec_scale) / 100, sc.ncalls)
+                    } else {
+                        (ci.n, ci.ncalls)
+                    };
+                    let mut cost = sn;
+                    if model {
+                        cost = sn.saturating_add(scalls.saturating_mul(call_w));
+                        if warm_cost && !spec {
+                            cost = ci.nwarm_ops.saturating_add(ci.nwarm.saturating_mul(call_w));
+                        }
+                        // `PLIRON_INLINE_GLUEWARM`: drop glue is priced by its
+                        // warm body — the EH scaffold (`_Unwind_Resume`,
+                        // `panic_in_cleanup`, exn stores) never executes on a
+                        // normal drop, and charging it prices leaf glue out of
+                        // exactly the doomed cleanup sites where inlining kills
+                        // the temp slot feeding it (regex-syntax's
+                        // `visit_class_set_item_post`: `drop_glue<Vec<_>>` at
+                        // 74 sites, warm cost 59 vs the cold-site t=64; LLVM
+                        // inlines them and calls `__rust_dealloc` directly).
+                        if glue_warm && !spec && is_drop_glue(cs) {
+                            cost = ci.nwarm_ops.saturating_add(ci.nwarm.saturating_mul(call_w));
+                        }
+                        let mut save = 0usize;
+                        for (i, a) in args.iter().enumerate().filter(|_| !spec) {
+                            if const_arg(st, a) {
+                                save = save.saturating_add(
+                                    FOLD_USE * ci.fold.get(i).copied().unwrap_or(0) as usize,
+                                );
+                            }
+                            if const_arg(st, a) || st.allocas.contains(*a) {
+                                save = save.saturating_add(
+                                    MEM_USE * ci.mem.get(i).copied().unwrap_or(0) as usize,
+                                );
+                            }
+                        }
+                        t = t.saturating_add(save);
+                        if f.cold {
+                            cost = cost.saturating_mul(COLD_W);
+                        }
+                        // `PLIRON_INLINE_WARMCALLS=1`: gate on the warm calls
+                        // only; `=3` (default): a call-carrier over
+                        // `loop_calls` total calls still qualifies when its
+                        // warm calls fit, its warm body alone scores under
+                        // the base limit (the bonus then pays for cold panic
+                        // scaffolding, not a real worker — regex's `peek` is
+                        // 387 warm ops), and total growth stays under the
+                        // `fanin` bound.
+                        let leafish =
+                            (if warm_gate { ci.nwarm } else { ci.ncalls }) <= loop_calls;
+                        let warm_leaf = warm_fanin
+                            && !leafish
+                            && ci.nwarm <= loop_calls
+                            && ci.nwarm_ops <= limit
+                            && fanin > 0
+                            && adj
+                                .as_ref()
+                                .and_then(|a| a.callers_of.get(cs.as_str()))
+                                .is_some_and(|v| {
+                                    sn.saturating_mul(v.len()) <= t.saturating_mul(fanin)
+                                });
+                        if (leafish || warm_leaf)
+                            && loops
+                                .get_or_insert_with(|| loop_blocks(ctx, st, caller))
+                                .contains(&b)
+                        {
+                            // `PLIRON_INLINE_LOOP` = bonus in limit/4 units.
+                            // A callsite in a loop pays the call+prologue cost
+                            // every iteration, so a fatter callee is worth it
+                            // (hashbrown's `hash_one`: SipHash inlined into the
+                            // probe loop wins ~30% on `HashMap::get`).
+                            let lb: usize = crate::env_get("PLIRON_INLINE_LOOP")
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(8);
+                            t = t.saturating_add(limit * lb / 4);
+                        }
+                        if pair > 0
+                            && !f.always_inline
+                            && !f.cold
+                            && adj.as_ref().is_some_and(|a| {
+                                !a.taken.contains(cs.as_str())
+                                    && a
+                                        .callers_of
+                                        .get(cs.as_str())
+                                        .is_some_and(|v| v.len() <= pair)
+                            })
+                        {
+                            t = t.saturating_mul(pair_mul);
+                        }
+                        t = t.min(limit.saturating_mul(MAX_T));
+                        if free {
+                            // Net global growth is ~0 — the callee's out-of-line
+                            // copy dies — so nested calls and coldness aren't
+                            // charged; `cap` still bounds the caller's size.
+                            cost = sn;
+                        }
+                    } else if hot > 1
+                        && ci.ncalls <= 2
+                        && loops
+                            .get_or_insert_with(|| loop_blocks(ctx, st, caller))
+                            .contains(&b)
+                    {
+                        // Small mode keeps the flat rule everywhere except a
+                        // callsite in a loop: it runs the callee once per
+                        // iteration, so up to `hot`x the limit is worth it
+                        // (std `hash_one` into hashbrown's probe loop).
+                        // Leaf-ish bodies only — a callee that still carries
+                        // many calls of its own (`try_fold` folds, ~5 calls)
+                        // just moves that call traffic into the loop and
+                        // regressed `tokenize` ~30% at `hot=2`.
+                        t = t.max(limit.saturating_mul(hot));
+                    }
+                    // A callee with landing pads may go into an invoke whose pad is a
+                    // cleanup: its `_Unwind_Resume` becomes an invoke of that pad. Not
+                    // into a catch pad: unwinder phase 1 would never see that catch.
+                    let eh_block = ci.eh
+                        && st
+                            .invokes.get(op)
+                            .is_some_and(|&(_, catch)| catch || !eh_invoke);
+                    let loopy = (small || loopy_native)
+                        && loopy_min > 0
+                        && !free
+                        && !f.inline_hint
+                        && ci.n > loopy_min
+                        && !loops
+                            .get_or_insert_with(|| loop_blocks(ctx, st, caller))
+                            .contains(&b)
+                        && *has_loop
+                            .entry(cs.clone())
+                            .or_insert_with(|| !loop_blocks(ctx, st, ci.op).is_empty());
+                    // `PLIRON_INLINE_SCCLIMIT=1`: a callee on the caller's own
+                    // recursion cycle gets the base limit and no bonuses.
+                    // Every level of the recursion pays the inlined body's
+                    // frame: `walk_expr` took `visit_expr` (with
+                    // `check_tail_call` already inside) at 27 sites.
+                    if scc_limit && !f.always_inline && scc.get(&sym).is_some_and(|c| scc.get(cs) == Some(c)) {
+                        t = t.min(limit);
+                        cost = cost.max(ci.n);
+                    }
+                    // `PLIRON_INLINE_DUPCOST=1`: the k-th copy of one callee in
+                    // one caller costs k times its size, so a fat callee
+                    // isn't pasted at every site of a big `match`. Callees
+                    // no bigger than a call are exempt.
+                    if dupcost && !f.always_inline && ci.n > limit / 8 {
+                        cost = cost.saturating_mul(copies.get(cs).copied().unwrap_or(0) + 1);
+                    }
+                    // `PLIRON_INLINE_COLD=1`: a site in a block that can't
+                    // reach a `return` (panics, diverging calls, unwinding)
+                    // gets LLVM's cold-callsite ratio (45 of 225) of the
+                    // limit: it runs at most once per frame, and its body
+                    // would grow the frame on every path.
+                    if cold_sites
+                        && !f.always_inline
+                        && doomed.get_or_insert_with(|| doomed_blocks(ctx, st, caller)).contains(&b)
+                    {
+                        t = t.min(limit / 5);
+                    }
+                    if droplim > 0
+                        && !free
+                        && !f.always_inline
+                        && is_drop_glue(cs)
+                    {
+                        t = t.min(droplim);
+                    }
+                    // `#[inline(always)]` skips the score like LLVM's
+                    // AlwaysInliner (`PLIRON_INLINE_ALWAYS=0` restores it; the
+                    // caller `cap` and the recursion/EH rules still apply).
+                    // blake3's 9k-op `compress_pre` scored past even the free
+                    // x10 threshold, so `compress_in_place` called it and
+                    // spilled the whole state through memory every block.
+                    let why = if cost > t && !(always_all && f.always_inline) {
+                        "reject (score)"
+                    } else if loopy {
+                        "reject (loopy)"
+                    } else if eh_block {
+                        "reject (eh)"
+                    } else if ci.op == caller || st.calls[op].fn_ty != f.ty {
+                        "reject (self/fnty)"
+                    } else if hist && on_chain(st, op, ci.op) {
+                        "reject (recursive)"
+                    } else if scc_rule
+                        && st.inline_hist.contains(op)
+                        && scc.get(cs).is_some_and(|c| scc.get(&sym) == Some(c))
+                    {
+                        "reject (scc)"
+                    } else if smallscc
+                        && !f.always_inline
+                        && (scc.get(cs).is_some_and(|c| scc.get(&sym) == Some(c))
+                            || self_rec.contains(cs))
+                    {
+                        "reject (small-scc)"
+                    } else if size + ci.n > cap {
+                        "reject (cap)"
+                    } else if fanin > 0
+                        && !free
+                        && !f.always_inline
+                        && adj
+                            .as_ref()
+                            .and_then(|a| a.callers_of.get(cs.as_str()))
+                            .is_some_and(|v| sn.saturating_mul(v.len()) > t.saturating_mul(fanin))
+                        && !loops
+                            .get_or_insert_with(|| loop_blocks(ctx, st, caller))
+                            .contains(&b)
+                    {
+                        "reject (fanin)"
+                    } else if model && !free && grown + sn > growth {
+                        "reject (growth)"
+                    } else if maxdup > 0
+                        && !f.always_inline
+                        && dup.get(cs).copied().unwrap_or(0) >= maxdup
+                    {
+                        "reject (dup)"
+                    } else {
+                        if model && !free {
+                            grown += sn;
+                        }
+                        if maxdup > 0 {
+                            *dup.entry(cs.clone()).or_default() += 1;
+                        }
+                        if once1 && free && !f.always_inline {
+                            free_used.insert(cs.clone());
+                        }
+                        if dupcost {
+                            *copies.entry(cs.clone()).or_default() += 1;
+                        }
+                        size += ci.n;
+                        sites.push((op, ci.op, cs.clone()));
+                        "accept"
+                    };
+                    if verbose {
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: n={} calls={} warm={}/{} cost={cost} t={t}: {why} [single={} local={} taken={} callers={} rec={} used={}]",
+                                st.cgu, ci.n, ci.ncalls, ci.nwarm, ci.nwarm_ops, single.contains(cs), f.linkage == Linkage::Local,
+                                adj.as_ref().is_some_and(|a| a.taken.contains(cs.as_str())),
+                                adj.as_ref().and_then(|a| a.callers_of.get(cs.as_str())).map_or(0, |v| v.len()),
+                                rec_caller, free_used.contains(cs.as_str())
+                            )
+                        };
+                    }
+                }
+            }
+            t_scan += t0.elapsed().as_secs_f64() * 1e3;
+            t0 = std::time::Instant::now();
+            if sites.is_empty() {
+                break;
+            }
+            for (call, callee, cs) in sites {
+                let tags = tagcache
+                    .entry(callee)
+                    .or_insert_with(|| callee_tags(&*ctx, st, callee));
+                let (b, mut news) =
+                    inline_call(ctx, st, &mut rw, call, callee, &cs, &sym, tags);
+                // `news[0]` is the split continuation (follows `b` in region
+                // order); the rest are callee clones appended at region end.
+                pending.or_default(b).push(news.remove(0));
+                blklist.extend(news);
+                if let Some(a) = adj.as_mut() {
+                    a.inlined(ctx, st, &sym, &cs);
+                }
+                // `PLIRON_DEADFREE=1`: a local callee whose last call was
+                // just inlined is freed now, as LLVM's inliner deletes it,
+                // so the clones still to come reuse its arena slots instead
+                // of growing the arena (syn's CGUs were 4x their lowered
+                // size at publish, 43% of it bodies nothing called).
+                // Its own calls stop counting, which can free its callees.
+                if st.deadfree
+                    && let Some(a) = adj.as_mut()
+                {
+                    let mut work = vec![cs.clone()];
+                    while let Some(c) = work.pop() {
+                        if c == sym
+                            || a.taken.contains(c.as_str())
+                            || a.callers_of.get(c.as_str()).is_some_and(|v| !v.is_empty())
+                            || st.dead_fns.contains(c.as_str())
+                        {
+                            continue;
+                        }
+                        let Some(f) = st.funcs.get(c.as_str()) else { continue };
+                        if f.linkage != Linkage::Local || !has_body(ctx, f.op) {
+                            continue;
+                        }
+                        let fop = f.op;
+                        for m in callees(ctx, st, &c) {
+                            if let Some(v) = a.callers_of.get_mut(m.as_str())
+                                && let Some(p) = v.iter().position(|x| *x == c)
+                            {
+                                v.swap_remove(p);
+                            }
+                            work.push(m);
+                        }
+                        tagcache.remove(&fop);
+                        freed_ops += erase_body(ctx, fop);
+                        st.dead_fns.insert(c);
+                    }
+                    if freed_ops >= FREE_PURGE {
+                        st.purge_dead(ctx);
+                        freed_total += freed_ops;
+                        freed_ops = 0;
+                    }
+                }
+                delta.callers.insert(sym.clone());
+                delta.callees.insert(cs);
+            }
+            t_call += t0.elapsed().as_secs_f64() * 1e3;
+            t0 = std::time::Instant::now();
+        }
+        // `PLIRON_INLINE_SIMP=1`: simplify a caller that received code
+        // before scoring it as a callee (`cleanup::simplify_fn`); `=2`
+        // simplifies after scoring (same verdicts, isolates the rewrite).
+        if simp_late && bottom_up {
+            add_info!(&sym);
+        }
+        if let Some((p, images)) = &mut simp
+            && delta.callers.contains(&sym)
+            && !st.opt_skip.contains(&caller)
+            && !(simp_noloop && crate::cleanup::has_loop(ctx, caller))
+        {
+            let dump = crate::env_get("PLIRON_DUMPFN").is_some_and(|w| sym.contains(w)) && pliron_cfg::tracing_on();
+            if dump {
+                tracing::info!(target: "pliron::dump", "==== pre-simp {sym} ====\n{}", pliron::printable::Printable::disp(&*caller.deref(ctx), ctx));
+            }
+            crate::cleanup::simplify_fn(ctx, st, p, images, caller);
+            if dump {
+                tracing::info!(target: "pliron::dump", "==== post-simp {sym} ====\n{}", pliron::printable::Printable::disp(&*caller.deref(ctx), ctx));
+            }
+            simp_n += 1;
+        }
+        if bottom_up && !simp_late {
+            add_info!(&sym);
+        }
+        // Clean a caller that received code, before its own callers clone
+        // it. After `add_info!`: the score keeps counting the uncleaned
+        // body, so the cleanup changes no inlining verdict.
+        if let Some(p) = &pure
+            && delta.callers.contains(&sym)
+        {
+            let c = crate::cleanup::clean_fn(ctx, st, p, caller);
+            cleaned.ops += c.ops;
+            cleaned.blocks += c.blocks;
+        }
+        tagcache.remove(&caller);
+    }
+    if freed_ops > 0 {
+        st.purge_dead(ctx);
+        freed_total += freed_ops;
+    }
+    if simp_n > 0 && pliron_cfg::tracing_on() {
+        tracing::info!(target: "pliron::stats", "inline-simp {}: simplified {simp_n} callers", st.cgu);
+    }
+    if freed_total > 0 && pliron_cfg::tracing_on() {
+        tracing::info!(target: "pliron::stats", "deadfree {}: inliner freed {freed_total} ops", st.cgu);
+    }
+    if (cleaned.ops > 0 || cleaned.blocks > 0) && pliron_cfg::tracing_on() {
+        tracing::info!(target: "pliron::stats", "clean {}: inliner erased {} ops, merged {} blocks", st.cgu, cleaned.ops, cleaned.blocks);
+    }
+    pliron_cfg::trace("in.scan", t_scan, &st.cgu);
+    pliron_cfg::trace("in.call", t_call, &st.cgu);
+    pliron_cfg::trace("in.info", t_info, &st.cgu);
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        left_stats(ctx, st, &mut infos, model, limit, bonus, fold);
+    }
+    delta
+}
+
+/// Call-graph SCC id of every bodied function in a nontrivial SCC (two
+/// or more members; self-recursion is handled by `callee_info`).
+/// Iterative Tarjan over `callees`.
+/// Blocks of `f` that can't reach a `return` or a loop: every path from
+/// them ends in `unreachable`, a diverging call or a resume
+/// (`PLIRON_INLINE_COLD`).
+fn doomed_blocks(ctx: &Context, st: &State, f: Ptr<Operation>) -> FxHashSet<Ptr<BasicBlock>> {
+    let bs = blocks(ctx, f);
+    let mut preds: FxHashMap<Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>> = FxHashMap::default();
+    let mut work = Vec::new();
+    for &b in &bs {
+        for w in bsuccs(ctx, st, b) {
+            preds.entry(w).or_default().push(b);
+        }
+        if b.deref(ctx).iter(ctx).last().is_some_and(|t| Operation::is_op::<ReturnOp>(t, ctx)) {
+            work.push(b);
+        }
+    }
+    // Blocks that can reach a loop count as live too: a function that
+    // never returns (a `loop {}` server) has no `return` to reach, and
+    // its hot loop must not look cold.
+    work.extend(loop_blocks(ctx, st, f));
+    let mut live: FxHashSet<Ptr<BasicBlock>> = work.iter().copied().collect();
+    while let Some(b) = work.pop() {
+        for &p in preds.get(&b).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if live.insert(p) {
+                work.push(p);
+            }
+        }
+    }
+    bs.into_iter().filter(|b| !live.contains(b)).collect()
+}
+
+fn scc_ids(ctx: &Context, st: &State) -> FxHashMap<String, u32> {
+    let names: Vec<&String> = st
+        .funcs
+        .iter()
+        .filter(|(n, f)| has_body(ctx, f.op) && !st.dead_unopt.contains(n.as_str()))
+        .map(|(n, _)| n)
+        .collect();
+    let ix: FxHashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    let succ: Vec<Vec<usize>> = names
+        .iter()
+        .map(|n| {
+            callees(ctx, st, n)
+                .iter()
+                .filter_map(|c| ix.get(c.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    const UNSEEN: u32 = u32::MAX;
+    let n = names.len();
+    let (mut index, mut low) = (vec![UNSEEN; n], vec![0u32; n]);
+    let mut on = vec![false; n];
+    let (mut stack, mut next, mut out) = (Vec::new(), 0u32, FxHashMap::default());
+    let mut nscc = 0u32;
+    for root in 0..n {
+        if index[root] != UNSEEN {
+            continue;
+        }
+        let mut dfs = vec![(root, 0usize)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on[root] = true;
+        while let Some(&mut (v, ref mut k)) = dfs.last_mut() {
+            if let Some(&w) = succ[v].get(*k) {
+                *k += 1;
+                if index[w] == UNSEEN {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on[w] = true;
+                    dfs.push((w, 0));
+                } else if on[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            dfs.pop();
+            if let Some(&(p, _)) = dfs.last() {
+                low[p] = low[p].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut members = Vec::new();
+                loop {
+                    let w = stack.pop().unwrap();
+                    on[w] = false;
+                    members.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                if members.len() > 1 {
+                    for w in members {
+                        out.insert(names[w].clone(), nscc);
+                    }
+                    nscc += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether `callee` was already inlined somewhere on `site`'s clone chain.
+// r[impl iropt.inline.recursion]
+fn on_chain(st: &State, site: Ptr<Operation>, callee: Ptr<Operation>) -> bool {
+    let mut i = st.inline_hist.get(site).copied().unwrap_or(u32::MAX);
+    while let Some(&(f, p)) = st.inline_hist_nodes.get(i as usize) {
+        if f == callee {
+            return true;
+        }
+        i = p;
+    }
+    false
+}
+
+/// Indirect calls whose callee is a constant function address (a vtable slot
+/// folded by `constload`, e.g. hashbrown's `&mut dyn FnMut` probe callback)
+/// become direct calls. Returns the rewritten calls plus the callers owning
+/// them, so the next inline round can restrict itself to those callers.
+// r[impl iropt.devirt]
+pub fn devirt(ctx: &mut Context, st: &mut State) -> (FxHashSet<Ptr<Operation>>, FxHashSet<String>) {
+    let mut out = FxHashSet::default();
+    let mut owners = FxHashSet::default();
+    let fns: Vec<(String, _)> = st
+        .funcs
+        .iter()
+        .filter(|(_, f)| crate::opt_body(ctx, st, f.op))
+        .map(|(n, f)| (n.clone(), f.op))
+        .collect();
+    for (fname, f) in fns {
+        for b in blocks(ctx, f) {
+            for c in ops(ctx, b) {
+                let Some(call) = Operation::get_op::<CallOp>(c, ctx) else {
+                    continue;
+                };
+                // `callee()` clones the attr for direct calls only to
+                // discard it here — test the attr's presence instead.
+                if call.get_attr_llvm_call_callee(ctx).is_some() {
+                    continue;
+                }
+                let p = call.get_operation().deref(ctx).get_operand(ctx, 0);
+                let Some(ConstVal::Sym { sym, off: 0 }) = st.consts.get(p) else {
+                    continue;
+                };
+                let (Some(fi), Some(info), Some(id)) = (
+                    st.funcs.get(sym),
+                    st.calls.get(c),
+                    st.sym_to_ident.get(sym),
+                ) else {
+                    continue;
+                };
+                if info.fn_ty != fi.ty {
+                    continue;
+                }
+                let (id, fty) = (id.clone(), info.fn_ty);
+                let fty = TypedHandle::<FuncType>::from_handle(fty, ctx).unwrap();
+                let args = call.args(ctx);
+                let nc = CallOp::new(ctx, CallOpCallable::Direct(id), fty, args).get_operation();
+                nc.insert_before(ctx, c);
+                if c.deref(ctx).get_num_results() > 0 {
+                    let (old, new) = (c.deref(ctx).get_result(ctx, 0), nc.deref(ctx).get_result(ctx, 0));
+                    old.replace_all_uses_with(ctx, &new);
+                }
+                let info = st.calls.remove(c).unwrap();
+                st.calls.insert(nc, info);
+                if let Some(h) = st.inline_hist.remove(c) {
+                    st.inline_hist.insert(nc, h);
+                }
+                if let Some(u) = st.invokes.remove(c) {
+                    st.invokes.insert(nc, u);
+                }
+                if let Some(e) = st.expect.remove(c) {
+                    st.expect.insert(nc, e);
+                }
+                if st.last_call == Some(c) {
+                    st.last_call = Some(nc);
+                }
+                Operation::erase(c, ctx);
+                out.insert(nc);
+                owners.insert(fname.clone());
+                if pliron_cfg::tracing_on()
+                    && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+                {
+                    if pliron_cfg::tracing_on() {
+                        tracing::info!(target: "pliron::stats", "devirt {fname:?} -> {sym}")
+                    };
+                }
+            }
+        }
+    }
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "devirt {}: {} calls", st.cgu, out.len())
+        };
+    }
+    (out, owners)
+}
+
+/// Why direct calls to defined functions were left in place (`PLIRON_STATS`).
+/// Fills unqueried callee infos on demand so filtered rounds report right.
+#[allow(clippy::too_many_arguments)]
+fn left_stats(
+    ctx: &Context,
+    st: &State,
+    infos: &mut FxHashMap<String, Option<CInfo>>,
+    model: bool,
+    limit: usize,
+    bonus: usize,
+    fold: usize,
+) {
+    let mut why: FxHashMap<&str, usize> = FxHashMap::default();
+    for (sym, f) in &st.funcs {
+        if !has_body(ctx, f.op) {
+            continue;
+        }
+        for b in blocks_iter(ctx, f.op) {
+            for op in b.deref(ctx).iter(ctx) {
+                let Some(cs) = direct_callee(ctx, st, op) else {
+                    continue;
+                };
+                let g = &st.funcs[cs];
+                let r = if !has_body(ctx, g.op) {
+                    "external"
+                } else if g.no_inline {
+                    "no_inline"
+                } else if g.linkage == Linkage::Preemptible {
+                    "preemptible"
+                } else if cs == sym {
+                    "self"
+                } else if let Some(ci) = infos
+                    .entry(cs.clone())
+                    .or_insert_with(|| callee_info(ctx, st, cs, model, limit, bonus, fold))
+                    .as_ref()
+                {
+                    if ci.eh && st.invokes.contains(op) {
+                        "eh callee at invoke (catch pad / EH_INVOKE=0)"
+                    } else if st.calls[op].fn_ty != g.ty {
+                        "fn type mismatch"
+                    } else {
+                        "eligible but left"
+                    }
+                } else {
+                    "too big / recursive / va"
+                };
+                *why.entry(r).or_default() += 1;
+            }
+        }
+    }
+    if pliron_cfg::tracing_on() {
+        tracing::info!(target: "pliron::stats", "inline left {}: {why:?}", st.cgu)
+    };
+}
+
+/// The callee's `noalias readonly` params point at memory the caller can't
+/// write for the call's duration (rustc's `&T` contract — `partition`'s
+/// pivot scan is the payoff: the pivot stays in a register instead of
+/// reloading per element). Record the cloned entry args they bind as
+/// `region_frozen`: lowering seeds them into `noalias`/`deref`, so licm can
+/// hoist their loads to a cloned loop's preheader — still inside the
+/// region. `readonly can_move` flags would be wrong: the freeze holds only
+/// for the clone's duration, and once a later pass forwards the entry arg
+/// to a caller value the flag would leak out of the region.
+///
+/// Lazily-filled predecessor map for the `frozen_args` resolution walks:
+/// a block's uses *are* its incoming edges, so materializing every
+/// block's `(term, succ_idx)` list once per inline site paid O(caller)
+/// per site. Lookups fill per queried block and cache for the walk.
+struct Preds<'a> {
+    ctx: &'a Context,
+    cache: std::cell::RefCell<
+        FxHashMap<Ptr<BasicBlock>, Option<std::rc::Rc<Vec<(Ptr<Operation>, usize)>>>>,
+    >,
+}
+
+impl<'a> Preds<'a> {
+    fn new(ctx: &'a Context) -> Self {
+        Self {
+            ctx,
+            cache: std::cell::RefCell::default(),
+        }
+    }
+    /// `(terminator, successor-index)` edges into `b`; `None` when `b`
+    /// has no recorded preds — the resolution endpoint, same as the
+    /// absent entries of the eagerly-built map this replaced.
+    fn get(
+        &self,
+        b: Ptr<BasicBlock>,
+    ) -> Option<std::rc::Rc<Vec<(Ptr<Operation>, usize)>>> {
+        if let Some(v) = self.cache.borrow().get(&b) {
+            return v.clone();
+        }
+        let v: Vec<_> = b
+            .uses_iter(self.ctx)
+            .map(|u| (u.user_op(), u.find_index(self.ctx)))
+            .collect();
+        let v = (!v.is_empty()).then(|| std::rc::Rc::new(v));
+        self.cache.borrow_mut().insert(b, v.clone());
+        v
+    }
+}
+
+/// `v`'s uniform source through `b`'s predecessors: `Some` only when every
+/// pred passes the same value (self-passes on back edges ignored). `None`
+/// on any disagreement — a merged value can't be proven to carry one
+/// pointer.
+fn arg_src(
+    ctx: &Context,
+    preds: &Preds,
+    b: Ptr<BasicBlock>,
+    v: Value,
+) -> Option<Value> {
+    let pr = preds.get(b)?;
+    let i = v.try_find_index(ctx).ok()?;
+    let na = b.deref(ctx).get_num_arguments();
+    let mut uniq = None;
+    let ok = pr.iter().all(|&(t, si)| {
+        let o = Operation::get_op_dyn(t, ctx);
+        let Some(ops) =
+            op_cast::<dyn BranchOpInterface>(&*o).map(|br| br.successor_operands(ctx, si))
+        else {
+            return false;
+        };
+        if ops.len() != na {
+            return false;
+        };
+        let w = ops[i];
+        w == v || *uniq.get_or_insert(w) == w
+    });
+    uniq.filter(|_| ok)
+}
+
+/// The `sub`-th leaf of an aggregate value: `insertvalue` chains decompose
+/// into the inserted element; block args resolve leaf-wise through `preds`
+/// (each pred's operand must yield the same leaf); opaque producers (loads)
+/// yield `v` itself only when `sub == 0`.
+fn extract_leaf(
+    ctx: &Context,
+    preds: &Preds,
+    mut v: Value,
+    mut sub: usize,
+    depth: usize,
+) -> Option<Value> {
+    let mut seen = FxHashSet::default();
+    let scan = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG);
+    if depth > 24 {
+        return None;
+    }
+    loop {
+        if !seen.insert(v) {
+            return None;
+        }
+        if let Some(b) = v.defining_block() {
+            // An aggregate forwarded through a block arg: extract the leaf
+            // from each pred's operand and require uniformity — preds may
+            // pass different aggregates with the same leaf (the pivot tuple
+            // is rebuilt per path).
+            // Entry/edge-incomplete blocks have no recorded preds — the arg
+            // itself is the resolution endpoint (it may carry a frozen
+            // record).
+            let Some(pr) = preds.get(b) else {
+                return (sub == 0).then_some(v);
+            };
+            let Ok(i) = v.try_find_index(ctx) else {
+                if scan {
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::frozen", "extract_leaf: no idx for {v:?} in {b:?}")
+                    };
+                }
+                return None;
+            };
+            let mut uniq = None;
+            for &(t, si) in pr.iter() {
+                let o = Operation::get_op_dyn(t, ctx);
+                let Some(ops) =
+                    op_cast::<dyn BranchOpInterface>(&*o).map(|br| br.successor_operands(ctx, si))
+                else {
+                    if scan {
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::frozen", "extract_leaf: non-branch pred {t:?} of {b:?}")
+                        };
+                    }
+                    return None;
+                };
+                let Some(&w) = ops.get(i) else {
+                    if scan {
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::frozen", "extract_leaf: arg {i} missing in {t:?} ops for {b:?}")
+                        };
+                    }
+                    return None;
+                };
+                if w == v {
+                    continue;
+                }
+                let l = extract_leaf(ctx, preds, w, sub, depth + 1)?;
+                if uniq.is_some_and(|u| u != l) {
+                    if scan {
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::frozen", "extract_leaf: arg {v:?} of {b:?} merges {uniq:?} with {l:?}")
+                        };
+                    }
+                    return None;
+                }
+                uniq = Some(l);
+            }
+            match uniq {
+                Some(l) => {
+                    v = l;
+                    continue;
+                }
+                None => return (sub == 0).then_some(v),
+            }
+        }
+        let Some(op) = v.defining_op() else {
+            return (sub == 0).then_some(v);
+        };
+        if Operation::is_op::<InsertValueOp>(op, ctx) {
+            let idx = Operation::get_op::<InsertValueOp>(op, ctx)
+                .unwrap()
+                .indices(ctx);
+            let (s, n, _) = leaf_range(ctx, op.deref(ctx).get_operand(ctx, 0).get_type(ctx), &idx);
+            if sub >= s && sub < s + n {
+                sub -= s;
+                v = op.deref(ctx).get_operand(ctx, 1);
+            } else {
+                v = op.deref(ctx).get_operand(ctx, 0);
+            }
+            continue;
+        }
+        if Operation::is_op::<UndefOp>(op, ctx) || Operation::is_op::<PoisonOp>(op, ctx) {
+            return None;
+        }
+        return (sub == 0).then_some(v);
+    }
+}
+
+/// `true` when `v` is produced by `llvm.alloca` — a distinct local object.
+fn is_alloca(ctx: &Context, v: Value) -> bool {
+    v.defining_op()
+        .is_some_and(|o| Operation::is_op::<AllocaOp>(o, ctx))
+}
+
+/// The stored value reaching `load` through memory in its block: the last
+/// store to the same resolved address, when every intervening write
+/// provably misses it. This is how the comparator's `(a, b)` tuple reaches
+/// `lt`: rustc spills it to a fresh alloca — `store b,slot+8; b' = load
+/// slot+8` — and forwarding it keeps `b`'s frozen provenance.
+/// Intervening same-object stores must be disjoint or exactly cover the
+/// load; a store through a different resolved root can only be skipped
+/// when the two are distinct `alloca` objects; calls, atomics, mem
+/// intrinsics, and volatile ops all end the scan in a miss.
+fn store_src(
+    ctx: &Context,
+    st: &State,
+    preds: &Preds,
+    load: Ptr<Operation>,
+    mem: &mut FxHashSet<Ptr<Operation>>,
+) -> Option<Value> {
+    let scan = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG);
+    let fail = |why: &str| -> Option<Value> {
+        if scan {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::frozen", "store_src: {why} for {load:?}")
+            };
+        }
+        None
+    };
+    if st.volatile.contains(load) {
+        return fail("volatile");
+    }
+    let addr = load.deref(ctx).get_operand(ctx, 0);
+    let Some((lb, ll, loff)) = ptr_base(ctx, st, preds, addr, mem) else {
+        return fail("ptr_base");
+    };
+    let Some(loff) = loff else {
+        return fail("dynoff");
+    };
+    let lsz = size_align(ctx, load.deref(ctx).get_result(ctx, 0).get_type(ctx)).0 as i64;
+    let Some(b) = load.deref(ctx).get_parent_block() else {
+        return fail("noblock");
+    };
+    let pos = b.deref(ctx).iter(ctx).position(|o| o == load);
+    let mut fuel = 32;
+    store_src_in(
+        ctx, st, preds, lb, ll, loff, lsz, b, pos, &mut fuel, scan, load, mem,
+    )
+}
+
+/// Find the value stored to slot `(lb,ll,loff..+lsz)` that dominates
+/// position `pos` in `b` (None = block end). Single-predecessor chains are
+/// walked; at a merge every predecessor's chain must yield the same value
+/// (as `extract_leaf` does for block args). `fuel` bounds total work.
+#[allow(clippy::too_many_arguments)]
+fn store_src_in(
+    ctx: &Context,
+    st: &State,
+    preds: &Preds,
+    lb: Value,
+    ll: Option<usize>,
+    loff: i64,
+    lsz: i64,
+    mut b: Ptr<BasicBlock>,
+    mut pos: Option<usize>,
+    fuel: &mut usize,
+    scan: bool,
+    load: Ptr<Operation>,
+    mem: &mut FxHashSet<Ptr<Operation>>,
+) -> Option<Value> {
+    loop {
+        *fuel = fuel.checked_sub(1)?;
+        let block_ops = ops(ctx, b);
+        let start = pos.unwrap_or(block_ops.len());
+        // The backward scan must see every op that could clobber the slot:
+        // a truncated window would fall through to the pred walk as if the
+        // block were transparent and silently skip an older same-slot store.
+        if start > 400 {
+            return None;
+        }
+        for (oi, &o) in block_ops[..start].iter().enumerate().rev().take(400) {
+            // `llvm.memcpy/memmove(dst, src, n)`: a load fully inside the
+            // copied range reads the same bytes the *source* held just
+            // before the copy — resolve the store to that source slot.
+            if let Some(name) = st.intrinsics.get(o) {
+                if name != "llvm.memcpy" && name != "llvm.memmove" {
+                    if name.starts_with("llvm.mem") {
+                        return None;
+                    }
+                    continue;
+                }
+                let od = o.deref(ctx);
+                let Some(n) = crate::sroa::const_int(ctx, st, od.get_operand(ctx, 2)) else {
+                    return None;
+                };
+                let Some((db, dl, doff)) = ptr_base(ctx, st, preds, od.get_operand(ctx, 0), mem) else {
+                    return None;
+                };
+                let Some(doff) = doff else { return None };
+                if db == lb && dl == ll {
+                    let (lo, hi) = (doff, doff + n as i64);
+                    if loff >= lo && loff + lsz <= hi {
+                        let Some((sb2, sl2, soff2)) =
+                            ptr_base(ctx, st, preds, od.get_operand(ctx, 1), mem)
+                        else {
+                            return None;
+                        };
+                        let Some(soff2) = soff2 else { return None };
+                        return store_src_in(
+                            ctx,
+                            st,
+                            preds,
+                            sb2,
+                            sl2,
+                            soff2 + (loff - doff),
+                            lsz,
+                            b,
+                            Some(oi),
+                            fuel,
+                            scan,
+                            load,
+                            mem,
+                        );
+                    }
+                    if hi <= loff || lo >= loff + lsz {
+                        continue;
+                    }
+                    return None;
+                }
+                if !(is_alloca(ctx, db) && is_alloca(ctx, lb)) {
+                    return None;
+                }
+                continue;
+            }
+            if Operation::is_op::<StoreOp>(o, ctx) && !st.volatile.contains(o) {
+                let od = o.deref(ctx);
+                let (sb, sl, soff) = ptr_base(ctx, st, preds, od.get_operand(ctx, 1), mem)?;
+                let soff = soff?;
+                let ssz = size_align(ctx, od.get_operand(ctx, 0).get_type(ctx)).0 as i64;
+                if sb == lb && sl == ll {
+                    if soff == loff && ssz == lsz {
+                        return Some(od.get_operand(ctx, 0));
+                    }
+                    if soff < loff + lsz && loff < soff + ssz {
+                        return None;
+                    }
+                    continue;
+                }
+                // Different resolved roots may still alias — only two
+                // distinct `alloca` objects provably don't.
+                if !(is_alloca(ctx, sb) && is_alloca(ctx, lb)) {
+                    return None;
+                }
+                continue;
+            }
+            if Operation::is_op::<CallOp>(o, ctx)
+                || Operation::is_op::<AtomicStoreOp>(o, ctx)
+                || Operation::is_op::<AtomicRmwOp>(o, ctx)
+                || Operation::is_op::<AtomicCmpxchgOp>(o, ctx)
+                || Operation::is_op::<StoreOp>(o, ctx)
+            {
+                if scan {
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::frozen", "store_src: writer {} for {load:?}", OpDbg { op: o, ctx })
+                    };
+                }
+                return None;
+            }
+        }
+        // No decisive store here — follow the predecessors.
+        let mut pr: Vec<Ptr<BasicBlock>> = Vec::new();
+        let Some(pr_ops) = preds.get(b) else {
+            if scan {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::frozen", "store_src: no preds {b:?} for {load:?}")
+                };
+            }
+            return None;
+        };
+        for (t, _) in pr_ops.iter() {
+            let Some(p) = t.deref(ctx).get_parent_block() else {
+                continue;
+            };
+            if !pr.contains(&p) {
+                pr.push(p);
+            }
+        }
+        if pr.len() == 1 {
+            b = pr[0];
+            pos = None;
+            continue;
+        }
+        // Merge: every predecessor path must store the same value —
+        // compared after arg/cast normalization: paths can store the same
+        // pointer under different SSA names (`pivot` reborrowed into two
+        // arg chains is still one pointer).
+        let mut it = pr.iter();
+        let v = store_src_in(
+            ctx,
+            st,
+            preds,
+            lb,
+            ll,
+            loff,
+            lsz,
+            *it.next()?,
+            None,
+            fuel,
+            scan,
+            load,
+            mem,
+        )?;
+        for &p in it {
+            let pv = store_src_in(
+                ctx, st, preds, lb, ll, loff, lsz, p, None, fuel, scan, load, mem,
+            );
+            if pv != Some(v)
+                && !pv.is_some_and(|w| {
+                    let eq = same_ptr(ctx, st, preds, w, v, mem);
+                    if scan && !eq {
+                        fn d(ctx: &Context, v: Value) -> String {
+                            v.defining_op()
+                                .map(|o| OpDbg { op: o, ctx }.to_string())
+                                .unwrap_or_else(|| format!("{v:?}"))
+                        }
+                        if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::frozen", "store_src: merge diff {} vs {}", d(ctx, w), d(ctx, v)) };
+                    }
+                    eq
+                })
+            {
+                if scan {
+                    if pliron_cfg::tracing_on() { tracing::debug!(target: "pliron::frozen", "store_src: merge {b:?} pred {p:?} -> {pv:?} vs {v:?} for {load:?}") };
+                }
+                return None;
+            }
+        }
+        return Some(v);
+    }
+}
+
+/// Same pointer after arg/cast normalization: two SSA names prove equal
+/// when they resolve — through `arg_src`, GEPs, bitcasts, freezes, and
+/// `extractvalue`, and store-forwarded loads — to the same base at the
+/// same constant offset. `mem` bounds the load forwarding the same way it
+/// bounds `ptr_base`.
+fn same_ptr(
+    ctx: &Context,
+    st: &State,
+    preds: &Preds,
+    v1: Value,
+    v2: Value,
+    mem: &mut FxHashSet<Ptr<Operation>>,
+) -> bool {
+    fn norm(
+        ctx: &Context,
+        st: &State,
+        preds: &Preds,
+        mut v: Value,
+        mem: &mut FxHashSet<Ptr<Operation>>,
+    ) -> (Value, Option<i64>) {
+        let mut off = Some(0i64);
+        let mut seen = FxHashSet::default();
+        loop {
+            if !seen.insert(v) {
+                return (v, off);
+            }
+            if let Some(b) = v.defining_block()
+                && let Some(w) = arg_src(ctx, preds, b, v)
+            {
+                v = w;
+                continue;
+            }
+            let Some(op) = v.defining_op() else {
+                return (v, off);
+            };
+            if Operation::is_op::<GetElementPtrOp>(op, ctx) {
+                off = off.and_then(|o| {
+                    crate::sroa::gep_offset(ctx, st, op).and_then(|d| o.checked_add(d))
+                });
+                v = op.deref(ctx).get_operand(ctx, 0);
+            } else if Operation::is_op::<BitcastOp>(op, ctx)
+                || Operation::is_op::<FreezeOp>(op, ctx)
+                || Operation::is_op::<AddrSpaceCastOp>(op, ctx)
+            {
+                v = op.deref(ctx).get_operand(ctx, 0);
+            } else if Operation::is_op::<ExtractValueOp>(op, ctx) {
+                let idx = Operation::get_op::<ExtractValueOp>(op, ctx)
+                    .unwrap()
+                    .indices(ctx);
+                let agg = op.deref(ctx).get_operand(ctx, 0);
+                let (s, n, _) = leaf_range(ctx, agg.get_type(ctx), &idx);
+                if n != 1 {
+                    return (v, off);
+                }
+                match extract_leaf(ctx, preds, agg, s, 0) {
+                    Some(l) => v = l,
+                    None => return (v, off),
+                }
+            } else if Operation::is_op::<LoadOp>(op, ctx) && mem.insert(op) {
+                // Same-slot loads forwarded through their stores — the
+                // `(a, b)` tuple is rebuilt and re-spilled per diamond
+                // arm, so the arms' `b` values are distinct loads of
+                // what is nonetheless the same source pointer.
+                match store_src(ctx, st, preds, op, mem) {
+                    Some(sv) => v = sv,
+                    None => return (v, off),
+                }
+            } else {
+                return (v, off);
+            }
+        }
+    }
+    // Each normalization gets its own `mem` clone — seeded with the
+    // shared set for cycle-breaking, but independent so that a load `v1`
+    // already forwarded isn't skipped when `v2`'s chain needs it.
+    let (n1, n2) = (
+        norm(ctx, st, preds, v1, &mut mem.clone()),
+        norm(ctx, st, preds, v2, &mut mem.clone()),
+    );
+    if n1 != n2
+        && pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG)
+    {
+        let d = |v: Value| {
+            v.defining_op()
+                .map(|o| OpDbg { op: o, ctx }.to_string())
+                .unwrap_or_else(|| format!("{v:?}"))
+        };
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::frozen", "same_ptr: {n1:?} ({}) vs {n2:?} ({})", d(n1.0), d(n2.0))
+        };
+    }
+    n1 == n2
+}
+
+/// Follow GEPs/bitcasts back to a block arg or instruction result,
+/// accumulating the constant byte offset. `None` when an index is dynamic —
+/// an unknown offset can't be bounded against the frozen pointee.
+/// `preds` maps clone blocks to their (terminator, successor-index) preds:
+/// a clone-interior block arg that every predecessor feeds the same value
+/// (self-passes on back edges ignored) resolves to that value —
+/// `partition`'s pivot reaches the scan loop phi-forwarded this way.
+/// An `extractvalue` of an opaque aggregate yields `(agg, Some(leaf))` — the
+/// leaf position — so callers can match a recorded frozen leaf.
+/// `llvm.load` pointers forward through same-block stores — see
+/// `store_src`.
+fn ptr_base(
+    ctx: &Context,
+    st: &State,
+    preds: &Preds,
+    mut v: Value,
+    mem: &mut FxHashSet<Ptr<Operation>>,
+) -> Option<(Value, Option<usize>, Option<i64>)> {
+    let mut off = Some(0i64);
+    let mut seen = FxHashSet::default();
+    loop {
+        if !seen.insert(v) {
+            return None;
+        }
+        if let Some(b) = v.defining_block()
+            // A recorded arg is already the best base — `frozen_args`
+            // captured any outer-clone region when the record was made.
+            // Forwarding past it into the caller's operand chain can only
+            // strand the record on an unreachable side path.
+            && !st.region_frozen.contains(v)
+            && let Some(w) = arg_src(ctx, preds, b, v)
+        {
+            v = w;
+            continue;
+        }
+        let Some(op) = v.defining_op() else {
+            return Some((v, None, off));
+        };
+        if Operation::is_op::<GetElementPtrOp>(op, ctx) {
+            // A dynamic index poisons the offset but not the base — region
+            // inheritance only needs which frozen arg it lands in.
+            off = off
+                .and_then(|o| crate::sroa::gep_offset(ctx, st, op).and_then(|d| o.checked_add(d)));
+            v = op.deref(ctx).get_operand(ctx, 0);
+        } else if Operation::is_op::<BitcastOp>(op, ctx)
+            || Operation::is_op::<FreezeOp>(op, ctx)
+            || Operation::is_op::<AddrSpaceCastOp>(op, ctx)
+        {
+            v = op.deref(ctx).get_operand(ctx, 0);
+        } else if Operation::is_op::<ExtractValueOp>(op, ctx) {
+            // `extractvalue agg, idx` of a pointer leaf: decomposing `agg`
+            // (`insertvalue` chains) keeps provenance; an opaque aggregate
+            // returns the leaf position so callers can match a recorded
+            // frozen leaf of the aggregate.
+            let idx = Operation::get_op::<ExtractValueOp>(op, ctx)
+                .unwrap()
+                .indices(ctx);
+            let agg = op.deref(ctx).get_operand(ctx, 0);
+            let (s, n, _) = leaf_range(ctx, agg.get_type(ctx), &idx);
+            if n != 1 {
+                return Some((v, None, off));
+            }
+            // Same rule as the arg case: don't decompose a recorded
+            // aggregate arg past its own leaf record.
+            if st
+                .region_frozen.get(agg)
+                .is_some_and(|rs| rs.iter().any(|&(ss, _, _)| ss as usize == s))
+            {
+                return Some((agg, Some(s), off));
+            }
+            match extract_leaf(ctx, preds, agg, s, 0) {
+                Some(l) => v = l,
+                None => return Some((agg, Some(s), off)),
+            }
+        } else if Operation::is_op::<LoadOp>(op, ctx) {
+            // A pointer fetched through memory — the comparator's args
+            // tuple is spilled to an alloca. Forward through the store
+            // that produced it when the clobber scan proves it out.
+            // `mem` is shared across the whole `ptr_base`/`store_src`
+            // recursion: store pointers can themselves be load results,
+            // and without it a value cycle overflows the stack (stage1
+            // `core` did — SIGBUS).
+            if mem.len() >= 64 || !mem.insert(op) {
+                return Some((v, None, off));
+            }
+            match store_src(ctx, st, preds, op, mem) {
+                Some(sv) => v = sv,
+                None => return Some((v, None, off)),
+            }
+        } else {
+            return Some((v, None, off));
+        }
+    }
+}
+
+/// `(bytes, region)` for a base resolved at leaf `bl`: an enclosing
+/// clone-arg record first; else a frozen param of the containing function
+/// itself — the outermost region, anchored at its entry.
+/// `anc` is `b` or a proper ancestor of it in the clone-region tree.
+fn anc_or_self(st: &State, anc: Ptr<BasicBlock>, mut b: Ptr<BasicBlock>) -> bool {
+    for _ in 0..64 {
+        if b == anc {
+            return true;
+        }
+        match st.region_parent.get(b) {
+            Some(&p) if p != b => b = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// `(bytes, region)` for `*base` frozen within a region containing `entry`
+/// (the clone being processed): an enclosing clone-arg record, a caller
+/// operand record, or a frozen param of the containing function itself —
+/// the outermost region, anchored at its entry. Among several claims the
+/// shallowest anchor wins: it promises the widest frozen span, which is
+/// what lets a nested load reach an enclosing loop's preheader.
+fn frozen_of(
+    ctx: &Context,
+    st: &State,
+    caller_frz: &[(usize, u64)],
+    fentry: Option<Ptr<BasicBlock>>,
+    entry: Ptr<BasicBlock>,
+    base: Value,
+    bl: Option<usize>,
+) -> Option<(u64, Ptr<BasicBlock>)> {
+    let mut best: Option<(u64, Ptr<BasicBlock>)> = None;
+    let mut pick = |st: &State, bytes: u64, r: Ptr<BasicBlock>| {
+        if anc_or_self(st, r, entry) && best.is_none_or(|rb| anc_or_self(st, r, rb.1)) {
+            best = Some((bytes, r));
+        }
+    };
+    if let Some(rs) = st.region_frozen.get(base) {
+        for &(s, bytes, r) in rs {
+            if bl.unwrap_or(0) == s as usize {
+                pick(st, bytes, r);
+            }
+        }
+    }
+    if bl.is_none_or(|b| b == 0)
+        && let Some(rs) = st.region_frozen_op.get(base)
+    {
+        for &(bytes, r) in rs {
+            pick(st, bytes, r);
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+    let fe = fentry?;
+    caller_frz.iter().find_map(|&(leaf, bytes)| {
+        let (a, s) = leaf_arg(ctx, fe, leaf)?;
+        (a == base && bl.unwrap_or(0) == s).then_some((bytes, fe))
+    })
+}
+
+/// The callee's `noalias readonly` params point at memory the caller can't
+/// write for the call's duration (rustc's `&T` contract — `partition`'s
+/// pivot scan is the payoff: the pivot stays in a register instead of
+/// reloading per element). Record:
+/// - `region_frozen[arg] = (leaf, bytes, region)` for each frozen binding;
+///   when the caller-side value is itself region-frozen, the region is the
+///   *enclosing* clone's — the freeze outlives this call.
+/// - `frozen_loads[op] = region` for clone loads proven to read inside the
+///   frozen pointee (constant offset, bounded by `dereferenceable`).
+/// - `region_blocks[b] = entry` for every cloned block, so lowering can map
+///   the region to Cranelift blocks.
+/// `readonly can_move` load flags would be wrong here: the freeze holds
+/// only inside the clone, and a function-wide flag would escape the region.
+/// The callee's `nonnull` params (`FuncInfo::nonnull`) hold for the
+/// caller's operands bound to them, but only inside the clone (the call
+/// dominates it; elsewhere the same value may be null). Recorded per
+/// operand with the clone entry as its region (`State::region_nn_op`),
+/// like `frozen_args`' `region_frozen_op`, so it survives the clone's
+/// entry params being merged away. LLVM gets this by simplifying callees
+/// with their own param attributes before inlining them (num-bigint-dig's
+/// `add_mul_vvw` zip). `PLIRON_INLINENN=0` disables.
+fn nonnull_args(
+    ctx: &Context,
+    st: &mut State,
+    callee: &str,
+    src: &[Ptr<BasicBlock>],
+    map: &IrMapping,
+    call_args: &[Value],
+) {
+    if !pliron_cfg::pass_enabled("PLIRON_INLINENN") {
+        return;
+    }
+    let Some(entry) = src.first().and_then(|b| map.lookup_block(*b)) else {
+        return;
+    };
+    let Some(f) = st.funcs.get(callee) else {
+        return;
+    };
+    let eargs: Vec<Value> = entry.deref(ctx).arguments(ctx).collect();
+    // The leaf indices describe the declared ABI; a rewritten signature
+    // (`deadarg`, `sret2reg`) would shift them.
+    let nleaves: usize = eargs.iter().map(|a| crate::types::leaves(ctx, a.get_type(ctx)).len()).sum();
+    if f.nonnull.is_empty() || nleaves != f.nparams || eargs.len() != call_args.len() {
+        return;
+    }
+    let mut marks: Vec<(Value, u64)> = Vec::new();
+    for &i in &f.nonnull {
+        let Some((a, off)) = crate::state::leaf_arg(ctx, entry, i) else { continue };
+        let Some(k) = eargs.iter().position(|&e| e == a) else { continue };
+        // `nonnull` only describes pointers: a non-pointer leaf here means
+        // the ABI leaf index and the IR param layout disagree.
+        if !crate::types::leaf_is_ptr(ctx, a.get_type(ctx)).get(off).copied().unwrap_or(false) {
+            continue;
+        }
+        if off < 64 {
+            marks.push((call_args[k], 1 << off));
+        }
+    }
+    for (v, m) in marks {
+        st.region_nn_op.or_default(v).push((m, entry));
+    }
+}
+
+fn frozen_args(
+    ctx: &Context,
+    st: &mut State,
+    callee: &str,
+    caller: &str,
+    src: &[Ptr<BasicBlock>],
+    map: &IrMapping,
+    call_args: &[Value],
+    call_block: Ptr<BasicBlock>,
+) {
+    if !crate::pass_enabled("PLIRON_FROZEN_INLINE") {
+        return;
+    }
+    let dbg = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG);
+    let Some(entry) = src.first().and_then(|b| map.lookup_block(*b)) else {
+        return;
+    };
+    // The containing function's entry block anchors the outermost region:
+    // the function's own frozen params hold for the whole body.
+    let fop = call_block.deref(ctx).get_parent_op(ctx);
+    let fentry = fop
+        .and_then(|o| Operation::get_op::<FuncOp>(o, ctx))
+        .and_then(|o| o.get_entry_block(ctx));
+    // The clone nests inside whatever region the callsite sits in (the
+    // function body when the call is in original code) — the containment
+    // chain licm walks to decide whether a preheader is in a tagged
+    // load's region. This bookkeeping must run even when the callee has
+    // no FuncInfo: a missing link breaks the ancestor walk for every
+    // clone nested inside it.
+    let parent = st
+        .region_blocks.get(call_block)
+        .copied()
+        .or(fentry)
+        .unwrap_or(entry);
+    st.region_parent.insert(entry, parent);
+    for &b in src {
+        if let Some(nb) = map.lookup_block(b) {
+            // Nested clones inside `src` keep their own (remapped) region;
+            // only unclaimed blocks belong to this clone's region.
+            st.region_blocks.or_insert_with(nb, || entry);
+        }
+    }
+    let Some(f) = st.funcs.get(callee) else {
+        if dbg {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::frozen", "frozen_args: callee {callee:?} not in funcs")
+            };
+        }
+        return;
+    };
+    let callee_frozen = !f.frozen.is_empty();
+    if dbg {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::frozen", "frozen_args: na={:?} frz={:?} callee={callee:?} entry={entry:?}",
+                f.noalias.len(),
+                f.frozen.len()
+            )
+        };
+    }
+    // CFG edges of the whole containing function, for `ptr_base`'s
+    // block-arg resolution: a load's pointer (or a caller operand bound to
+    // a frozen arg) is often phi-forwarded through args of *enclosing*
+    // clone blocks — `partition`'s pivot reaches `lt` callsites that way.
+    // Lazy: `Preds` reads a block's use list on demand instead of
+    // scanning every region terminator here.
+    let preds = Preds::new(ctx);
+    // `(bytes, region)` for a base resolved at leaf `bl`: an enclosing
+    // clone-arg record first; else a frozen param of the containing
+    // function itself — the outermost region, anchored at its entry.
+    let caller_frz: Vec<(usize, u64)> = st
+        .funcs
+        .get(caller)
+        .map(|x| x.frozen.clone())
+        .unwrap_or_default();
+    // Caller-side operands bound to each entry arg, for region inheritance.
+    // `inline_call` branches to `entry` with `args` positionally, so the
+    // entry arg at index k is bound to `call_args[k]`.
+    let eargs: Vec<Value> = entry.deref(ctx).arguments(ctx).collect();
+    for &(leaf, bytes) in &f.frozen {
+        let Some((a, sub)) = leaf_arg(ctx, entry, leaf) else {
+            if dbg {
+                if pliron_cfg::tracing_on() {
+                    tracing::debug!(target: "pliron::frozen", "frozen_args: leaf {leaf} unresolved")
+                };
+            }
+            continue;
+        };
+        let cv = eargs
+            .iter()
+            .position(|&x| x == a)
+            .and_then(|k| call_args.get(k).copied());
+        // `a` may cover several leaves (comparator tuples pack both refs
+        // into one operand) — resolve the `sub`-th leaf of the operand.
+        let lv = cv.and_then(|v| extract_leaf(ctx, &preds, v, sub, 0));
+        let rb = lv.and_then(|v| ptr_base(ctx, st, &preds, v, &mut FxHashSet::default()));
+        // Inherit the enclosing region only when the operand's pointee
+        // provably sits inside the outer frozen range — `a = pivot + 8`
+        // resolves to pivot's base but points *past* its 8 frozen bytes.
+        // The clone-entry region is always valid: `a`'s own `readonly`
+        // contract holds for this call regardless.
+        let inh = rb.and_then(|(b, l, off)| {
+            frozen_of(ctx, st, &caller_frz, fentry, entry, b, l)
+                .filter(|&(rb_, _)| off.is_some_and(|o| o >= 0 && o + bytes as i64 <= rb_ as i64))
+                .map(|(_, r)| r)
+        });
+        let region = inh.unwrap_or(entry);
+        if dbg
+            && pliron_cfg::tracing_on()
+            && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG)
+        {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::frozen", "frozen_args: leaf {leaf} sub {sub} entry {entry:?} inh={inh:?} rb={rb:?} cv={cv:?}"
+                )
+            };
+        }
+        if dbg {
+            let rbs = rb
+                .and_then(|(v, ..)| v.defining_op())
+                .map(|o| OpDbg { op: o, ctx }.to_string())
+                .unwrap_or_default();
+            let cvs = cv
+                .and_then(|v| v.defining_op())
+                .map(|o| OpDbg { op: o, ctx }.to_string())
+                .unwrap_or_default();
+            let cas = call_args
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| {
+                    v.defining_op()
+                        .map(|o| format!("{k}: {}", OpDbg { op: o, ctx }))
+                        .unwrap_or_else(|| format!("{k}: {v:?}"))
+                })
+                .collect::<Vec<_>>()
+                .join(" ; ");
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::frozen", "frozen_args: record leaf {leaf} sub {sub} bytes {bytes} region={region:?} callee={callee:?} cv={cv:?} rb={rb:?} {rbs} | {cvs} || {cas}"
+                )
+            };
+        }
+        st.region_frozen.or_default(a)
+            .push((sub as u32, bytes, region));
+        // `*operand` is frozen for the call's duration — exactly this
+        // clone's span. Record the caller-side leaf too, in
+        // `region_frozen_op` (not `region_frozen`: seeding `noalias` on a
+        // caller value would claim function-wide disjointness it doesn't
+        // have). Clone loads that forward it through entry args — the
+        // partition pivot reaches `lt` callsites as the outer loop's own
+        // block param — tag this clone's region, which reaches an
+        // enclosing loop's preheader where the load's own entry can't.
+        if let Some(lv) = lv {
+            st.region_frozen_op.or_default(lv)
+                .push((bytes, entry));
+        }
+    }
+    // Loads inside the clone that provably read inside a frozen pointee:
+    // they may hoist within the region without a clobber scan. Nothing can
+    // match while no frozen record exists anywhere — the usual case for
+    // leaf callees — so skip the cloned-op walk outright.
+    let any_frozen = callee_frozen
+        || !caller_frz.is_empty()
+        || !st.region_frozen.is_empty()
+        || !st.region_frozen_op.is_empty();
+    if any_frozen {
+        for &b in src {
+            let Some(nb) = map.lookup_block(b) else {
+                continue;
+            };
+            for op in nb.deref(ctx).iter(ctx) {
+                if !Operation::is_op::<LoadOp>(op, ctx) {
+                    continue;
+                }
+                let ptr = op.deref(ctx).get_operand(ctx, 0);
+                let Some((base, bl, Some(off))) =
+                    ptr_base(ctx, st, &preds, ptr, &mut FxHashSet::default())
+                else {
+                    continue;
+                };
+                let Some((bytes, region)) =
+                    frozen_of(ctx, st, &caller_frz, fentry, entry, base, bl)
+                else {
+                    if dbg
+                        && pliron_cfg::tracing_on()
+                        && tracing::enabled!(target: "pliron::frozen", tracing::Level::DEBUG)
+                    {
+                        let bs = base
+                            .defining_op()
+                            .map(|o| OpDbg { op: o, ctx }.to_string())
+                            .unwrap_or_default();
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::frozen", "frozen_args: miss {op:?} base {base:?} leaf {bl:?} off {off} {bs}")
+                        };
+                    }
+                    continue;
+                };
+                let sz =
+                    size_align(ctx, op.deref(ctx).get_result(ctx, 0).get_type(ctx)).0 as i64;
+                if off < 0 || off + sz > bytes as i64 {
+                    continue;
+                }
+                st.frozen_loads.insert(op, region);
+                if dbg {
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::frozen", "frozen_args: load {op:?} base {base:?} off {off} region {region:?}")
+                    };
+                }
+            }
+        }
+    }
+    for &(leaf, _, _) in &f.noalias {
+        let Some((a, sub)) = leaf_arg(ctx, entry, leaf) else {
+            continue;
+        };
+        if dbg {
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(target: "pliron::frozen", "frozen_args: na record leaf {leaf} a={a:?} entry={entry:?}")
+            };
+        }
+        st.region_noalias.or_default(a).push(sub as u32);
+    }
+}
+
+/// Keep the invariant that an invoke ends its block (`call; br`): ops after
+/// an invoke run only when it returns, but block-level dominance (domcheck,
+/// sroa-fwd, licm, ...) treats the landing-pad edge as leaving at the
+/// block's end and would credit them to the pad. Lowering splits there
+/// anyway. Splits `inv`'s block after it when more than a terminator
+/// follows and returns the new (normal-path) block, tagged like the old one.
+pub fn end_block_at_invoke(
+    ctx: &mut Context,
+    st: &mut State,
+    inv: Ptr<Operation>,
+) -> Option<Ptr<BasicBlock>> {
+    let b = inv.deref(ctx).get_parent_block()?;
+    let next = inv.get_next(ctx)?;
+    if Some(next) == b.deref(ctx).iter(ctx).last() {
+        return None;
+    }
+    let mut rw = IRRewriter::<DummyListener>::default();
+    let nb = rw.split_block(ctx, b, OpInsertionPoint::AfterOperation(inv), None);
+    BrOp::new(ctx, nb, vec![]).get_operation().insert_after(ctx, inv);
+    if let Some(&r) = st.region_blocks.get(b) {
+        st.region_blocks.insert(nb, r);
+    }
+    if let Some(&c) = st.prof_bcount.get(b) {
+        st.prof_bcount.insert(nb, c);
+    }
+    Some(nb)
+}
+
+/// Under `PLIRON_SM_MARKFLOW`: the inlined callee's `_Unwind_Resume`,
+/// now an invoke of the callsite's pad, still leaves the callee's frame —
+/// every one of its locals dies there. Slotmerge can no longer treat that
+/// resume as the end of every slot (the unwind lands in this frame's pad,
+/// which reads the caller's), so say which ones: an `llvm.lifetime.end`
+/// before it for each local that has one elsewhere (cloned from it, so
+/// size and intrinsic type match). `PLIRON_INLINE_RESUME_ENDS=0` skips it.
+///
+/// A local of the clone's entry (`clones[0]`) dominates every resume.
+/// One defined elsewhere — SROA's escape copies sit next to their calls,
+/// an earlier inline's locals in its clone — gets an end only at the
+/// resumes its block dominates within the clone, under
+/// `PLIRON_INLINE_RESUME_DOM=1`; a use it doesn't dominate is invalid SSA
+/// (`erase_unreachable`/`guardelim` panicked). `PLIRON_INLINE_RESUME_INFO=
+/// <caller substr>` counts what each inline covered.
+#[allow(clippy::too_many_arguments)]
+fn resume_ends(
+    ctx: &mut Context,
+    st: &mut State,
+    invokes: &[Ptr<Operation>],
+    locals: &[Value],
+    clones: &[Ptr<BasicBlock>],
+    caller: &str,
+    cs: &str,
+) {
+    if !crate::env_is("PLIRON_SM_MARKFLOW", "1") || !crate::pass_enabled("PLIRON_INLINE_RESUME_ENDS") {
+        return;
+    }
+    let resumes: Vec<Ptr<Operation>> = invokes
+        .iter()
+        .copied()
+        .filter(|&op| direct_callee(ctx, st, op).is_some_and(|c| c == "_Unwind_Resume"))
+        .collect();
+    if resumes.is_empty() {
+        return;
+    }
+    let entry = clones[0];
+    let def_block = |ctx: &Context, v: Value| v.defining_op().and_then(|o| o.deref(ctx).get_parent_block());
+    let dom = crate::env_is("PLIRON_INLINE_RESUME_DOM", "1");
+    // Resumes each non-entry local's block dominates, by the clone's dominator
+    // tree (Cooper-Harvey-Kennedy over its RPO; the entry is the root, edges
+    // leaving the clone are exits).
+    let mut dominated: FxHashMap<Value, Vec<Ptr<Operation>>> = FxHashMap::default();
+    // Resumes the clone entry reaches (the rest sit in dead code an
+    // earlier inline left: no end needed there).
+    let mut live_resumes: Vec<Ptr<Operation>> = resumes.clone();
+    let in_clone: FxHashSet<Ptr<BasicBlock>> = clones.iter().copied().collect();
+    if dom && locals.iter().any(|&a| def_block(ctx, a).is_some_and(|x| x != entry)) {
+        let idx: FxHashMap<Ptr<BasicBlock>, usize> = clones.iter().enumerate().map(|(k, &b)| (b, k)).collect();
+        let succ: Vec<Vec<usize>> =
+            clones.iter().map(|&b| bsuccs(ctx, st, b).into_iter().filter_map(|w| idx.get(&w).copied()).collect()).collect();
+        let n = clones.len();
+        let (mut rpo, mut seen, mut work) = (Vec::with_capacity(n), vec![false; n], vec![(0usize, 0usize)]);
+        seen[0] = true;
+        while let Some((v, k)) = work.last_mut() {
+            if let Some(&w) = succ[*v].get(*k) {
+                *k += 1;
+                if !seen[w] {
+                    seen[w] = true;
+                    work.push((w, 0));
+                }
+            } else {
+                rpo.push(*v);
+                work.pop();
+            }
+        }
+        rpo.reverse();
+        let mut num = vec![usize::MAX; n];
+        for (k, &v) in rpo.iter().enumerate() {
+            num[v] = k;
+        }
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &v in &rpo {
+            for &w in &succ[v] {
+                preds[w].push(v);
+            }
+        }
+        let mut idom = vec![usize::MAX; n];
+        idom[0] = 0;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &v in &rpo[1..] {
+                let mut new = usize::MAX;
+                for &p in preds[v].iter().filter(|&&p| idom[p] != usize::MAX) {
+                    new = if new == usize::MAX {
+                        p
+                    } else {
+                        let (mut x, mut y) = (p, new);
+                        while x != y {
+                            while num[x] > num[y] {
+                                x = idom[x];
+                            }
+                            while num[y] > num[x] {
+                                y = idom[y];
+                            }
+                        }
+                        x
+                    };
+                }
+                if new != idom[v] {
+                    idom[v] = new;
+                    changed = true;
+                }
+            }
+        }
+        live_resumes.retain(|r| idx.get(&r.deref(ctx).get_parent_block().unwrap()).is_some_and(|&ri| num[ri] != usize::MAX));
+        let dominates = |x: usize, mut r: usize| {
+            if num[r] == usize::MAX {
+                return false;
+            }
+            while r != x && r != 0 {
+                r = idom[r];
+            }
+            r == x
+        };
+        for &a in locals {
+            let Some(x) = def_block(ctx, a).filter(|&x| x != entry) else { continue };
+            let Some(&xi) = idx.get(&x) else { continue };
+            let ord = |o: Ptr<Operation>| x.deref(ctx).iter(ctx).position(|p| p == o);
+            let d: Vec<Ptr<Operation>> = resumes
+                .iter()
+                .copied()
+                .filter(|&r| {
+                    let rb = r.deref(ctx).get_parent_block().unwrap();
+                    if rb == x {
+                        a.defining_op().and_then(ord) < ord(r)
+                    } else {
+                        idx.get(&rb).is_some_and(|&ri| dominates(xi, ri))
+                    }
+                })
+                .collect();
+            dominated.insert(a, d);
+        }
+    }
+    // `PLIRON_INLINE_RESUME_HOIST=1` (with DOM): a local whose block
+    // misses a live resume moves to the clone entry first — every alloca
+    // lowers to a static slot wherever it sits, so only SSA cares — and
+    // then ends at every live resume. Its size must be a constant (moved
+    // along when the clone defines it) or a value from outside the clone.
+    let hoist = dom && crate::env_is("PLIRON_INLINE_RESUME_HOIST", "1");
+    // A value defined where it dominates the clone entry.
+    let above = |ctx: &Context, v: Value| def_block(ctx, v).is_none_or(|b| b == entry || !in_clone.contains(&b));
+    // (entry, entry without an end, other, other without an end, other ended, hoisted)
+    let mut n = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+    for &a in locals {
+        let at_entry = def_block(ctx, a) == Some(entry);
+        let Some(m) = a.uses_iter(ctx).map(|u| u.user_op()).find(|&m| {
+            st.intrinsics.get(m).is_some_and(|n| n == "llvm.lifetime.end")
+                && m.deref(ctx).operands(ctx).any(|v| v == a)
+        }) else {
+            if at_entry { n.1 += 1 } else { n.3 += 1 }
+            continue;
+        };
+        let at: Vec<Ptr<Operation>> = if at_entry {
+            n.0 += 1;
+            resumes.clone()
+        } else {
+            n.2 += 1;
+            let mut at = dominated.remove(&a).unwrap_or_default();
+            if hoist
+                && at.len() < live_resumes.len()
+                && let Some(al) = a.defining_op()
+                && in_clone.contains(&al.deref(ctx).get_parent_block().unwrap())
+            {
+                let sz = al.deref(ctx).get_operand(ctx, 0);
+                let szop = sz.defining_op().filter(|_| !above(ctx, sz));
+                if szop.is_none_or(|c| Operation::is_op::<ConstantOp>(c, ctx)) {
+                    al.unlink(ctx);
+                    al.insert_at_front(entry, ctx);
+                    if let Some(c) = szop {
+                        c.unlink(ctx);
+                        c.insert_at_front(entry, ctx);
+                    }
+                    at = live_resumes.clone();
+                    n.5 += 1;
+                }
+            }
+            n.4 += !at.is_empty() as usize;
+            at
+        };
+        let ci = Operation::get_op::<CallIntrinsicOp>(m, ctx).unwrap();
+        let iname = ci.get_attr_llvm_intrinsic_name(ctx).unwrap().clone();
+        let fty = TypedHandle::<FuncType>::from_handle(ci.get_attr_llvm_intrinsic_type(ctx).unwrap().clone().into(), ctx)
+            .unwrap();
+        let args: Vec<Value> = m.deref(ctx).operands(ctx).collect();
+        // A size operand next to the original end needn't dominate a resume.
+        if args.iter().any(|&v| v != a && !above(ctx, v)) {
+            continue;
+        }
+        for r in at {
+            let new = CallIntrinsicOp::new(ctx, iname.clone(), fty, args.clone()).get_operation();
+            new.insert_before(ctx, r);
+            st.intrinsics.insert(new, "llvm.lifetime.end".to_string());
+        }
+    }
+    if let Some(f) = crate::env_get("PLIRON_INLINE_RESUME_INFO")
+        && caller.contains(f)
+    {
+        eprintln!(
+            "inline-resume: {caller} <- {cs}: resumes={} live={} entry={} entry-noend={} other={} other-noend={} other-ended={} hoisted={}",
+            resumes.len(),
+            live_resumes.len(),
+            n.0,
+            n.1,
+            n.2,
+            n.3,
+            n.4,
+            n.5
+        );
+    }
+}
+
+/// Returns the callsite block plus the freshly created blocks in region
+/// order (`cont` follows `block`; callee clones sit at the region end), so
+/// the rescan worklist can track the list without re-walking it.
+// r[impl iropt.inline.eh]
+fn inline_call(
+    ctx: &mut Context,
+    st: &mut State,
+    rw: &mut IRRewriter<DummyListener>,
+    call: Ptr<Operation>,
+    callee: Ptr<Operation>,
+    cs: &str,
+    caller: &str,
+    tags: &CalleeTags,
+) -> (Ptr<BasicBlock>, Vec<Ptr<BasicBlock>>) {
+    let block = call.deref(ctx).get_parent_block().unwrap();
+    let region = block.deref(ctx).get_parent_region().unwrap();
+    let args = Operation::get_op::<CallOp>(call, ctx).unwrap().args(ctx);
+    let res = (call.deref(ctx).get_num_results() > 0).then(|| call.deref(ctx).get_result(ctx, 0));
+    let unwind = st.invokes.remove(call);
+    let cont = rw.split_block(ctx, block, OpInsertionPoint::AfterOperation(call), None);
+    // PGO: scale the callee's counts by callsite/entry so cloned blocks
+    // carry an honest count into the caller (LLVM's scaling rule).
+    let callsite_c = st.prof_bcount.get(block).copied();
+    if let Some(c) = callsite_c {
+        st.prof_bcount.insert(cont, c);
+    }
+    let callee_entry = st.prof.get(callee).and_then(|p| p.blocks.first().copied());
+    let scale = |x: u64| match (callsite_c, callee_entry) {
+        (Some(c), Some(e)) => ((x as u128 * c as u128) / e.max(1) as u128) as u64,
+        _ => x,
+    };
+
+    let src = &tags.src;
+    let mut map = IrMapping::bounded(tags.vb, tags.ob, tags.bb);
+    clone_blocks_into(src, region, ctx, rw, &mut map);
+    // Debug info: the clones now run inlined at the call, so their
+    // inlined-at chains continue at its location.
+    let site = call.deref(ctx).dbg_loc();
+    let mut dbg_memo = FxHashMap::default();
+    if site != 0
+        && let Some(d) = st.dbg.as_deref_mut()
+    {
+        let memo = &mut dbg_memo;
+        for &b in src {
+            let nb = map.lookup_block(b).unwrap();
+            let ops: Vec<Ptr<Operation>> = nb.deref(ctx).iter(ctx).collect();
+            for op in ops {
+                let l = op.deref(ctx).dbg_loc();
+                if l != 0 {
+                    let n = d.inline_at(l, site, memo);
+                    op.deref_mut(ctx).set_loc(pliron::location::Location::Dbg(n));
+                }
+            }
+        }
+    }
+    // Region ids are `Ptr<BasicBlock>`s in the source's block space: every
+    // record copied below must remap through `map` so a tag anchored at
+    // the callee's own entry (or a nested clone's) resolves inside the
+    // clone — verbatim copies point at blocks the caller's `region_blocks`
+    // never maps, and licm's ancestry walk dead-ends on them.
+    let remap = |r: Ptr<BasicBlock>| map.lookup_block(r).unwrap_or(r);
+    for &(b, m) in &tags.blocks {
+        let nb = map.lookup_block(b).unwrap();
+        if m & B_REGION != 0 {
+            st.region_blocks.insert(nb, remap(st.region_blocks[b]));
+        }
+        if m & B_PARENT != 0 {
+            st.region_parent.insert(nb, remap(st.region_parent[b]));
+        }
+        if m & B_BCOUNT != 0 {
+            st.prof_bcount.insert(nb, scale(st.prof_bcount[b]));
+        }
+    }
+    // The clone's own locals (for `resume_ends`).
+    let mut locals: Vec<Value> = Vec::new();
+    for &(v, m) in &tags.vals {
+        let Some(nv) = map.lookup_value(v) else {
+            continue;
+        };
+        if m & V_ALLOCAS != 0 {
+            st.allocas.insert(nv, st.allocas[v]);
+            locals.push(nv);
+            // The clone's variables are the inlined instance's.
+            if site != 0
+                && let Some(d) = st.dbg.as_deref_mut()
+                && let Some(&g) = d.alloca_decls.get(&v)
+            {
+                for di in d.groups[g as usize].clone() {
+                    let mut dc = d.decls[di as usize].clone();
+                    dc.loc = d.inline_at(dc.loc, site, &mut dbg_memo);
+                    d.declare(nv, dc);
+                }
+            }
+        }
+        if m & V_DBGNOTE != 0
+            && let Some(d) = st.dbg.as_deref_mut()
+        {
+            // The clone holds the inlined instance's pieces.
+            let mut notes = ctx.dbg_notes.borrow_mut();
+            if let Some(ids) = notes.get(&v).cloned() {
+                let mut nids = NoteIds::new();
+                for id in ids {
+                    let mut pc = d.pieces.get_mut().unwrap().list[id as usize];
+                    if site != 0 {
+                        pc.loc = d.inline_at(pc.loc, site, &mut dbg_memo);
+                    }
+                    nids.push(d.pieces.get_mut().unwrap().id(pc));
+                }
+                notes.entry(nv).or_default().extend(nids);
+            }
+        }
+        if m & V_PROMOTED != 0 {
+            st.promoted.insert(nv, st.promoted[v]);
+        }
+        if m & V_LTSLICES != 0 {
+            let sl: Vec<Value> = st.lt_slices[v].iter().filter_map(|&x| map.lookup_value(x)).collect();
+            st.lt_slices.insert(nv, sl);
+        }
+        if m & V_CONSTS != 0 {
+            st.consts.insert(nv, st.consts[v].clone());
+        }
+        if m & V_RFROZEN != 0 {
+            let f = st.region_frozen[v]
+                .iter()
+                .map(|&(s, b, r)| (s, b, remap(r)))
+                .collect();
+            st.region_frozen.insert(nv, f);
+        }
+        if m & V_RNOALIAS != 0 {
+            st.region_noalias.insert(nv, st.region_noalias[v].clone());
+        }
+        if m & V_RFROZEN_OP != 0 {
+            let f = st.region_frozen_op[v]
+                .iter()
+                .map(|&(b, r)| (b, remap(r)))
+                .collect();
+            st.region_frozen_op.insert(nv, f);
+        }
+    }
+    // History node for calls cloned out of this body, pushed on first use.
+    let parent = st.inline_hist.get(call).copied().unwrap_or(u32::MAX);
+    let mut hist_node = None;
+    // Plain calls of the body that become invokes to this callsite's pad.
+    let mut fresh_invokes: Vec<Ptr<Operation>> = Vec::new();
+    for &(op, m) in &tags.ops {
+        let Some(new) = map.lookup_op(op) else {
+            continue;
+        };
+        if m & OP_CALLS != 0 {
+            let node = *hist_node.get_or_insert_with(|| {
+                st.inline_hist_nodes.push((callee, parent));
+                st.inline_hist_nodes.len() as u32 - 1
+            });
+            st.inline_hist.insert(new, node);
+            st.calls.insert(new, st.calls[op].clone());
+            if let Some(&(lp, catch)) = st.invokes.get(op) {
+                st.invokes
+                    .insert(new, (map.lookup_block(lp).unwrap(), catch));
+            } else if let Some(u) = unwind {
+                st.invokes.insert(new, u);
+                fresh_invokes.push(new);
+            }
+        }
+        if m & OP_INTRINSICS != 0 {
+            st.intrinsics.insert(new, st.intrinsics[op].clone());
+        }
+        if m & OP_RMW != 0 {
+            st.rmw.insert(new, st.rmw[op].clone());
+        }
+        if m & OP_EXPECT != 0 {
+            st.expect.insert(new, st.expect[op]);
+        }
+        if m & OP_PROF_EDGES != 0 {
+            st.prof_edges
+                .insert(new, st.prof_edges[op].iter().map(|&c| scale(c)).collect());
+        }
+        if m & OP_VOLATILE != 0 {
+            st.volatile.insert(new);
+        }
+        if m & OP_NONNULL != 0 {
+            st.nonnull.insert(new);
+        }
+        if m & OP_INBOUNDS != 0 {
+            st.inbounds.insert(new);
+        }
+        if m & OP_BOOL01 != 0 {
+            st.bool01.insert(new);
+        }
+        if m & OP_FROZEN_LOADS != 0 {
+            st.frozen_loads.insert(new, remap(st.frozen_loads[op]));
+        }
+        if m & OP_RETURN != 0 {
+            let r = Operation::get_op::<ReturnOp>(new, ctx).unwrap();
+            let rv: Vec<_> = r.retval(ctx).into_iter().collect();
+            let br = BrOp::new(ctx, cont, rv).get_operation();
+            br.insert_before(ctx, new);
+            Operation::erase(new, ctx);
+        }
+    }
+    if unwind.is_some() {
+        let clones: Vec<Ptr<BasicBlock>> = src.iter().map(|b| map.lookup_block(*b).unwrap()).collect();
+        resume_ends(ctx, st, &fresh_invokes, &locals, &clones, caller, cs);
+    }
+    if let Some(res) = res {
+        let ty = res.get_type(ctx);
+        BasicBlock::push_argument(cont, ctx, ty);
+        let arg = cont.deref(ctx).get_argument(ctx, 0);
+        res.replace_all_uses_with(ctx, &arg);
+        // Every `ret` of the clone feeds `arg`: rustc's `nonnull` return
+        // attribute holds for it (LLVM's inliner keeps return attributes
+        // the same way). Opt-in: `PLIRON_RETNN=1`.
+        if let Some(m) = st.funcs.get(cs).map(|f| f.ret_nonnull).filter(|&m| m != 0)
+            && pliron_cfg::env_is("PLIRON_RETNN", "1")
+        {
+            // Only pointer leaves (a mismatch means the ABI and IR disagree).
+            let ptrs = crate::types::leaf_is_ptr(ctx, ty);
+            let m = (0..ptrs.len().min(64)).filter(|&k| ptrs[k] && m & (1 << k) != 0).fold(0u64, |a, k| a | 1 << k);
+            if m != 0 {
+                st.nnargs.insert(arg, m);
+            }
+        }
+    }
+    // Create the branch to the clone before `frozen_args` so its
+    // predecessor map sees the callsite edge — the clone entry's sole pred
+    // is what lets `store_src` walk back to the args-tuple stores.
+    let entry = map.lookup_block(src[0]).unwrap();
+    let br = BrOp::new(ctx, entry, args.clone()).get_operation();
+    br.insert_before(ctx, call);
+    frozen_args(ctx, st, cs, caller, src, &map, &args, block);
+    nonnull_args(ctx, st, cs, src, &map, &args);
+    st.calls.remove(call);
+    Operation::erase(call, ctx);
+    // An invoke ends its block (`call; br`): ops after it run only on the
+    // normal-return path, but block-level dominance (domcheck, sroa-fwd,
+    // ...) would credit them to the landing pad too. A body call that
+    // became an invoke here sits mid-block — split after it, as lowering
+    // does anyway (nu_command `copy_on_thread`: sroa-fwd forwarded a store
+    // into cleanup code, 2026-10-22).
+    let split_blocks: Vec<_> = fresh_invokes
+        .into_iter()
+        .filter_map(|n| end_block_at_invoke(ctx, st, n))
+        .collect();
+    let clones = src.iter().map(|b| map.lookup_block(*b).unwrap());
+    (block, std::iter::once(cont).chain(clones).chain(split_blocks).collect())
+}
+
+#[cfg(test)]
+mod coldkeep_tests {
+    use super::{is_drop_glue, wasm_cold_keep};
+
+    #[test]
+    fn keep_matches_hash_num_str_parse() {
+        assert!(wasm_cold_keep(
+            "_RNvXs3_NtNtCsew6TSQKploy_4core4hash3sipINtB5_6HasherNtB5_11Sip13RoundsE"
+        ));
+        assert!(wasm_cold_keep(
+            "_RNvMsB_NtCsew6TSQKploy_4core3numm27from_ascii_bytes_radix_impl"
+        ));
+        assert!(wasm_cold_keep(
+            "_RNvMs2_NtNtNtCsew6TSQKploy_4core3num3imp6bignumNtB5_8Big32x4010mul_digits"
+        ));
+        assert!(wasm_cold_keep(
+            "_RNvNtNtCsew6TSQKploy_4core3str11validations19run_utf8_validation"
+        ));
+        assert!(wasm_cold_keep(
+            "_RNvXNtNtCsew6TSQKploy_4core4char6decodeINtB2_11DecodeUtf16"
+        ));
+        assert!(wasm_cold_keep(
+            "_RNvMs2_NtNtCslyoFghIStgp_3lib3ast5parseINtB5_7ParserIQNtB5_6ParserE4bumpB9_"
+        ));
+        assert!(wasm_cold_keep(
+            "_RNvNtCslyoFghIStgp_3lib5debug11utf8_decode"
+        ));
+    }
+
+    #[test]
+    fn keep_rejects_fmt_num_alloc_math() {
+        // `fmt::num` must NOT match via a bare `3num` substring.
+        assert!(!wasm_cold_keep(
+            "_RNvXsX_NtNtCsew6TSQKploy_4core3fmt3numyNtB7_5Debug3fmt"
+        ));
+        assert!(!wasm_cold_keep(
+            "_RNvMsa_NtCsew6TSQKploy_4core3fmtNtB5_9Formatter9write_fmt"
+        ));
+        assert!(!wasm_cold_keep(
+            "_RNvMs8_NtCseNTGQnV141q_5alloc7raw_vecNtB5_11RawVecInner11finish_grow"
+        ));
+        assert!(!wasm_cold_keep(
+            "_RNvNtNtNtCsf5r1dCIKy5h_17compiler_builtins4math9libm_math6scalbn6scalbn"
+        ));
+    }
+
+    #[test]
+    fn drop_glue_matches() {
+        assert!(is_drop_glue(
+            "_RINvNtCscyJ6arFbMDT_4core3ptr9drop_glueINtNtCscu5Z4uCmBC0_5alloc5boxed3BoxNtNtCs31JiNmLaWF1_12regex_syntax3ast8ClassSetEEB1e_"
+        ));
+        assert!(is_drop_glue("_RINvNtCscyJ6arFbMDT_4core3ptr13drop_in_placeNtNtCs31JiNmLaWF1_12regex_syntax3ast3AstEBH_"));
+        assert!(!is_drop_glue(
+            "_RNvMs7_NtCscu5Z4uCmBC0_5alloc5boxedINtB5_3BoxNtNtCs31JiNmLaWF1_12regex_syntax3ast8ClassSetE3newBL_"
+        ));
+    }
+}

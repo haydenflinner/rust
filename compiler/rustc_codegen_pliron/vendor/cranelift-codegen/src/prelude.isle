@@ -269,9 +269,25 @@
 (extern const $I32X4 Type)
 (extern const $I64X2 Type)
 
+;; pliron: wide vectors
+(extern const $I8X32 Type)
+(extern const $I8X64 Type)
+(extern const $I16X16 Type)
+(extern const $I16X32 Type)
+(extern const $I32X8 Type)
+(extern const $I32X16 Type)
+(extern const $I64X4 Type)
+(extern const $I64X8 Type)
+
 (extern const $F16X8 Type)
+(extern const $F16X16 Type)
+(extern const $F16X32 Type)
 (extern const $F32X4 Type)
+(extern const $F32X8 Type)
+(extern const $F32X16 Type)
 (extern const $F64X2 Type)
+(extern const $F64X4 Type)
+(extern const $F64X8 Type)
 
 (extern const $I32X4XN Type)
 
@@ -431,6 +447,12 @@
 (decl fits_in_64 (Type) Type)
 (extern extractor fits_in_64 fits_in_64)
 
+;; Like fits_in_64 but also accepts fixed vectors (i8x8, i32x2) — the
+;; aarch64 SIMD&FP => GPR bitcast rule needs vector acceptance that the
+;; scalar-only fits_in_64 deliberately excludes.
+(decl fits_in_64_allow_vec (Type) Type)
+(extern extractor fits_in_64_allow_vec fits_in_64_allow_vec)
+
 ;; An extractor that only matches types that fit in exactly 16 bits.
 (decl ty_16 (Type) Type)
 (extern extractor ty_16 ty_16)
@@ -546,6 +568,13 @@
 (attr ty_vec128 (tag vector))
 (decl ty_vec128 (Type) Type)
 (extern extractor ty_vec128 ty_vec128)
+
+;; PLIRON: extractors that only match 256/512-bit vector types — the
+;; wide-vector lowering rules use them to stay lane-generic.
+(decl ty_vec256 (Type) Type)
+(extern extractor ty_vec256 ty_vec256)
+(decl ty_vec512 (Type) Type)
+(extern extractor ty_vec512 ty_vec512)
 
 ;; An extractor that matches types that support iconst_s/iconst_u construction.
 (decl ty_int_vec128 (Type) Type)

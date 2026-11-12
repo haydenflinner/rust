@@ -150,6 +150,30 @@
         (mem AMode)
         (flags MemFlagsData))
 
+       ;; A scalar load with post-index writeback: `rd = [rn]`, then
+       ;; `rwb = rn + simm9`. `rwb` is allocated to the same register as
+       ;; `rn` (a reuse-def operand), so the writeback lands in the base
+       ;; register. Only created by post-index fusion during lowering, or
+       ;; post-allocation by the emit-time writeback sweep.
+       (LoadPost
+        (op LoadPostOp)
+        (rd WritableReg)
+        (rwb WritableReg)
+        (rn Reg)
+        (simm9 SImm9)
+        (flags MemFlagsData))
+
+       ;; A scalar store with post-index writeback: `[rn] = rt`, then
+       ;; `rwb = rn + simm9`. `rwb` is allocated to the same register as
+       ;; `rn` (a reuse-def operand). Same provenance as `LoadPost`.
+       (StorePost
+        (op StorePostOp)
+        (rt Reg)
+        (rwb WritableReg)
+        (rn Reg)
+        (simm9 SImm9)
+        (flags MemFlagsData))
+
        ;; A store of a pair of registers.
        (StoreP64
         (rt Reg)
@@ -209,6 +233,26 @@
         (from_bits u8)
         (to_bits u8))
 
+       ;; PLIRON: unsigned bitfield move — `ubfm rd, rn, #immr, #imms`,
+       ;; covering the `ubfiz`/`ubfx`/`lsl`/`lsr` aliases for
+       ;; `(x & mask) << k` and `(x >> k) & mask` forms.
+       (UBfm
+        (rd WritableReg)
+        (rn Reg)
+        (immr u8)
+        (imms u8)
+        (size OperandSize))
+
+       ;; PLIRON: bitfield merge — `bfm rd, rn, #immr, #imms` (`bfi`).
+       ;; Modifies `rd` like `MovK`: separate input `rd_in` tied to `rd`.
+       (Bfm
+        (rd WritableReg)
+        (rn Reg)
+        (rd_in Reg)
+        (immr u8)
+        (imms u8)
+        (size OperandSize))
+
        ;; A conditional-select operation.
        (CSel
         (rd WritableReg)
@@ -218,6 +262,14 @@
 
        ;; A conditional-select negation operation.
        (CSNeg
+        (rd WritableReg)
+        (cond Cond)
+        (rn Reg)
+        (rm Reg))
+
+       ;; PLIRON: a conditional-select increment operation
+       ;; (`cond ? rn : rm + 1`).
+       (CSInc
         (rd WritableReg)
         (cond Cond)
         (rn Reg)
@@ -921,7 +973,10 @@
         (targets BoxVecMachLabel)
         (ridx Reg)
         (rtmp1 WritableReg)
-        (rtmp2 WritableReg))
+        (rtmp2 WritableReg)
+        ;; PLIRON: false when the default is unreachable: no bounds branch
+        ;; or Spectre clamp, the index is used as is.
+        (checked bool))
 
        ;; Load an inline symbol reference.
        (LoadExtNameGot
@@ -1490,7 +1545,16 @@
         ;; adjustment meta-instructions). See the diagram in the documentation
         ;; for [crate::isa::aarch64::abi](the ABI module) for more details.
         (SlotOffset
-         (off i64))))
+         (off i64))
+
+        ;; "post-indexed" mode as per AArch64 docs on a general register:
+        ;; postincrement `rn` after the access. Only created post-allocation
+        ;; (by the emit-time writeback sweep), so the writeback carries no
+        ;; regalloc metadata; the def is implied to be the same reg as the
+        ;; use. Lowering-time fusion uses `LoadPost`/`StorePost` instead.
+        (PostIndex
+         (rn Reg)
+         (simm9 SImm9))))
 
 (attr AMode.Const (tag amode_const))
 
@@ -1504,10 +1568,29 @@
 
 (instantiate AMode.RegOffset              ((args (bv 64) (named i64)) (ret (named AMode))))
 
+;; Which scalar load a `LoadPost` performs: the unsigned/signed integer
+;; forms and the FP/vector forms.
+(type LoadPostOp (enum
+  (ULoad8) (SLoad8) (ULoad16) (SLoad16) (ULoad32) (SLoad32) (ULoad64)
+  (FpuLoad16) (FpuLoad32) (FpuLoad64) (FpuLoad128)))
+
+;; Which scalar store a `StorePost` performs.
+(type StorePostOp (enum
+  (Store8) (Store16) (Store32) (Store64)
+  (FpuStore16) (FpuStore32) (FpuStore64) (FpuStore128)))
+
 ;; A memory argument to a load/store-pair.
 (type PairAMode (enum
   ;; Signed, scaled 7-bit offset from a register.
   (SignedOffset
+    (reg Reg)
+    (simm7 SImm7Scaled))
+
+  ;; Post-increment a general register after address computation.
+  ;; Only created post-allocation (by emit-time rewriting), so the
+  ;; writeback carries no regalloc metadata; the def is implied to be
+  ;; the same reg as the use.
+  (PostIndex
     (reg Reg)
     (simm7 SImm7Scaled))
 
@@ -1678,6 +1761,9 @@
     (Sqrt)
     (Cvt32To64)
     (Cvt64To32)
+    ;; PLIRON: half <-> single converts (fcvt s,h / fcvt h,s).
+    (Cvt16To32)
+    (Cvt32To16)
 ))
 
 ;; A floating-point unit (FPU) operation with two args.
@@ -1851,8 +1937,14 @@
     (Fmla)
     ;; Floating-point fused multiply-subtract vectors
     (Fmls)
+    ;; Integer multiply-accumulate vectors
+    (Mla)
+    ;; Integer multiply-subtract vectors
+    (Mls)
     ;; Signed integer dot product (FEAT_DotProd)
     (Sdot)
+    ;; Unsigned integer dot product (FEAT_DotProd)
+    (Udot)
     ;; Unsigned-by-signed integer dot product (FEAT_I8MM)
     (Usdot)
 ))
@@ -1958,6 +2050,22 @@
     (Umull8)
     (Umull16)
     (Umull32)
+    ;; Signed add long (widen the narrow operand, add to the wide one).
+    (Saddw8)
+    (Saddw16)
+    (Saddw32)
+    ;; Unsigned add long.
+    (Uaddw8)
+    (Uaddw16)
+    (Uaddw32)
+    ;; Signed add long of two narrow operands.
+    (Saddl8)
+    (Saddl16)
+    (Saddl32)
+    ;; Unsigned add long of two narrow operands.
+    (Uaddl8)
+    (Uaddl16)
+    (Uaddl32)
 ))
 
 (type VecRRRLongModOp
@@ -1966,6 +2074,10 @@
     (Umlal8)
     (Umlal16)
     (Umlal32)
+    ;; Signed multiply add long
+    (Smlal8)
+    (Smlal16)
+    (Smlal32)
 ))
 
 ;; A vector operation on a pair of elements with one register.
@@ -2005,6 +2117,9 @@
     (Ushr)
     ;; Signed shift right
     (Sshr)
+    ;; PLIRON: shift right narrow (`shrn`, low half): `size` is the
+    ;; destination arrangement, the source lanes are twice as wide.
+    (Shrn)
 ))
 
 ;; Destructive shift-by-immediate operation on each lane of a vector.
@@ -2307,6 +2422,16 @@
 
 (decl pure partial ashr_from_u64 (Type u64) ShiftOpAndAmt)
 (extern constructor ashr_from_u64 ashr_from_u64)
+
+;; PLIRON: ROR operand for the logical (shifted register) fold.
+(decl pure partial rotr_from_u64 (Type u64) ShiftOpAndAmt)
+(extern constructor rotr_from_u64 rotr_from_u64)
+
+;; PLIRON: `imul` by `2^n ± 1` strength reduction — returns the shift amount.
+(decl pure partial imul_pow2p1_shamt (Type u64) u8)
+(extern constructor imul_pow2p1_shamt imul_pow2p1_shamt)
+(decl pure partial imul_pow2m1_shamt (Type u64) u8)
+(extern constructor imul_pow2m1_shamt imul_pow2m1_shamt)
 
 (spec (integral_ty ty)
       (provide (= result ty))
@@ -2737,6 +2862,16 @@
        (MInst.AluRRImm12 (ALUOp.SubS) size (writable_zero_reg)
         src1 src2)))
 
+;; PLIRON: `cmn` — compare against a negated immediate (`cmp x, -c` is
+;; `adds` flags of `x + c`). Pairs with `sextload`'s `x <s -64` byte
+;; tests; `PLIRON_CMN=0` disables the rule that uses it.
+(attr cmn_imm (veri chain))
+(decl cmn_imm (OperandSize Reg Imm12) ProducesFlags)
+(rule (cmn_imm size src1 src2)
+      (ProducesFlags.ProducesFlagsSideEffect
+       (MInst.AluRRImm12 (ALUOp.AddS) size (writable_zero_reg)
+        src1 src2)))
+
 (attr cmp64_imm (veri chain))
 (decl cmp64_imm (Reg Imm12) ProducesFlags)
 (rule (cmp64_imm src1 src2)
@@ -3049,6 +3184,16 @@
          (MInst.CSNeg dst cond if_true if_false)
          dst)))
 
+;; PLIRON: helper for a `CSInc` — `cond ? if_true : if_false + 1` —
+;; one inst where `csel` needs a second materialized register.
+(attr csinc (veri chain))
+(decl csinc (Cond Reg Reg) ConsumesFlags)
+(rule (csinc cond if_true if_false)
+      (let ((dst WritableReg (temp_writable_reg $I64)))
+        (ConsumesFlags.ConsumesFlagsReturnsReg
+         (MInst.CSInc dst cond if_true if_false)
+         dst)))
+
 ;; Helper for generating `MInst.CCmp` instructions.
 ;; Creates a new `ProducesFlags` from the supplied `ProducesFlags` followed
 ;; immediately by the `MInst.CCmp` instruction.
@@ -3198,6 +3343,10 @@
 (decl fcvtn (Reg ScalarSize) Reg)
 (rule (fcvtn x size) (vec_rr_narrow_low (VecRRNarrowOp.Fcvtn) x size))
 
+;; PLIRON: helper for generating `fcvtn2` instructions.
+(decl fcvtn2 (Reg Reg ScalarSize) Reg)
+(rule (fcvtn2 x y size) (vec_rr_narrow_high (VecRRNarrowOp.Fcvtn) x y size))
+
 ;; Helper for generating `sqxtn` instructions.
 (decl sqxtn (Reg ScalarSize) Reg)
 (rule (sqxtn x size) (vec_rr_narrow_low (VecRRNarrowOp.Sqxtn) x size))
@@ -3285,6 +3434,19 @@
 (decl umlal32 (Reg Reg Reg bool) Reg)
 (rule (umlal32 x y z high_half) (vec_rrrr_long (VecRRRLongModOp.Umlal32) x y z high_half))
 
+;; Helpers for the remaining `smlal`/`umlal` widening multiply-accumulate
+;; forms (`x` is the accumulator as well as the destination).
+(decl smlal8 (Reg Reg Reg bool) Reg)
+(rule (smlal8 x y z high_half) (vec_rrrr_long (VecRRRLongModOp.Smlal8) x y z high_half))
+(decl smlal16 (Reg Reg Reg bool) Reg)
+(rule (smlal16 x y z high_half) (vec_rrrr_long (VecRRRLongModOp.Smlal16) x y z high_half))
+(decl smlal32 (Reg Reg Reg bool) Reg)
+(rule (smlal32 x y z high_half) (vec_rrrr_long (VecRRRLongModOp.Smlal32) x y z high_half))
+(decl umlal8 (Reg Reg Reg bool) Reg)
+(rule (umlal8 x y z high_half) (vec_rrrr_long (VecRRRLongModOp.Umlal8) x y z high_half))
+(decl umlal16 (Reg Reg Reg bool) Reg)
+(rule (umlal16 x y z high_half) (vec_rrrr_long (VecRRRLongModOp.Umlal16) x y z high_half))
+
 ;; Helper for generating `smull8` instructions.
 (decl smull8 (Reg Reg bool) Reg)
 (rule (smull8 x y high_half) (vec_rrr_long (VecRRRLongOp.Smull8) x y high_half))
@@ -3308,6 +3470,36 @@
 ;; Helper for generating `umull32` instructions.
 (decl umull32 (Reg Reg bool) Reg)
 (rule (umull32 x y high_half) (vec_rrr_long (VecRRRLongOp.Umull32) x y high_half))
+
+;; Helpers for `saddw`/`uaddw` widening adds: `rd = rn + widen(rm half)`,
+;; where `rn`/`rd` are the wide arrangement and `rm` the narrow one.
+(decl saddw8 (Reg Reg bool) Reg)
+(rule (saddw8 x y high_half) (vec_rrr_long (VecRRRLongOp.Saddw8) x y high_half))
+(decl saddw16 (Reg Reg bool) Reg)
+(rule (saddw16 x y high_half) (vec_rrr_long (VecRRRLongOp.Saddw16) x y high_half))
+(decl saddw32 (Reg Reg bool) Reg)
+(rule (saddw32 x y high_half) (vec_rrr_long (VecRRRLongOp.Saddw32) x y high_half))
+(decl uaddw8 (Reg Reg bool) Reg)
+(rule (uaddw8 x y high_half) (vec_rrr_long (VecRRRLongOp.Uaddw8) x y high_half))
+(decl uaddw16 (Reg Reg bool) Reg)
+(rule (uaddw16 x y high_half) (vec_rrr_long (VecRRRLongOp.Uaddw16) x y high_half))
+(decl uaddw32 (Reg Reg bool) Reg)
+(rule (uaddw32 x y high_half) (vec_rrr_long (VecRRRLongOp.Uaddw32) x y high_half))
+
+;; Helpers for `saddl`/`uaddl`: `rd = widen(rn half) + widen(rm half)` —
+;; both operands narrow.
+(decl saddl8 (Reg Reg bool) Reg)
+(rule (saddl8 x y high_half) (vec_rrr_long (VecRRRLongOp.Saddl8) x y high_half))
+(decl saddl16 (Reg Reg bool) Reg)
+(rule (saddl16 x y high_half) (vec_rrr_long (VecRRRLongOp.Saddl16) x y high_half))
+(decl saddl32 (Reg Reg bool) Reg)
+(rule (saddl32 x y high_half) (vec_rrr_long (VecRRRLongOp.Saddl32) x y high_half))
+(decl uaddl8 (Reg Reg bool) Reg)
+(rule (uaddl8 x y high_half) (vec_rrr_long (VecRRRLongOp.Uaddl8) x y high_half))
+(decl uaddl16 (Reg Reg bool) Reg)
+(rule (uaddl16 x y high_half) (vec_rrr_long (VecRRRLongOp.Uaddl16) x y high_half))
+(decl uaddl32 (Reg Reg bool) Reg)
+(rule (uaddl32 x y high_half) (vec_rrr_long (VecRRRLongOp.Uaddl32) x y high_half))
 
 ;; Helper for generating `asr` instructions.
 (attr asr (veri chain))
@@ -3505,9 +3697,27 @@
 
 ;; SDOT Vd.4S, Vn.16B, Vm.16B -- accumulates the 4-way i8 dot product into
 ;; `acc` (which is both source and destination). `a`/`b` are i8x16.
-(decl sdot (Reg Reg Reg) Reg)
-(rule (sdot acc a b)
+(decl a64_sdot (Reg Reg Reg) Reg)
+(rule (a64_sdot acc a b)
       (vec_rrr_mod (VecALUModOp.Sdot) acc a b (VectorSize.Size32x4)))
+
+;; MLA Vd.<T>, Vn.<T>, Vm.<T> -- integer multiply-accumulate vectors;
+;; `acc` is both source and destination. Not available at .2d.
+(decl mla (Type Reg Reg Reg) Reg)
+(rule (mla ty acc a b)
+      (vec_rrr_mod (VecALUModOp.Mla) acc a b (vector_size ty)))
+
+;; MLS Vd.<T>, Vn.<T>, Vm.<T> -- integer multiply-subtract vectors;
+;; `acc` is both source and destination. Not available at .2d.
+(decl mls (Type Reg Reg Reg) Reg)
+(rule (mls ty acc a b)
+      (vec_rrr_mod (VecALUModOp.Mls) acc a b (vector_size ty)))
+
+;; UDOT Vd.4S, Vn.16B, Vm.16B -- like `sdot`, but both sources are read as
+;; unsigned bytes. `acc` is both source and destination; `a`/`b` are i8x16.
+(decl a64_udot (Reg Reg Reg) Reg)
+(rule (a64_udot acc a b)
+      (vec_rrr_mod (VecALUModOp.Udot) acc a b (VectorSize.Size32x4)))
 
 ;; USDOT Vd.4S, Vn.16B, Vm.16B -- like `sdot`, but the first source is read as
 ;; unsigned bytes and the second as signed. `acc` is both source and
@@ -3744,6 +3954,99 @@
       (load_constant_full $I64 extend (operand_size $I64) n))
 
 ;; Sign extension helpers ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; PLIRON: is `val`'s register already extended per `ae` to at least 32 bits?
+;; Lets narrow compares put a dirty operand in `cmp`'s fused extend slot and
+;; skip standalone `uxtb`/`uxth`/`sxtb`s. (Ported from the riscv64 backend's
+;; oracle.)
+(decl pure partial rec val_already_extended (ArgumentExtension Value) bool)
+
+;; Producers not listed below leave their high bits dirty.
+(rule -1 (val_already_extended _ _) false)
+
+;; 32/64-bit values need no extension to reach 32 bits.
+(rule 0 (val_already_extended _ v @ (value_type (ty_32_or_64 _))) true)
+
+;; uextend/sextend produce full-width results by construction.
+(rule 1 (val_already_extended (ArgumentExtension.Uext) (uextend _ _)) true)
+(rule 1 (val_already_extended (ArgumentExtension.Sext) (sextend _ _)) true)
+
+;; icmp/fcmp materialize as full-width 0/1 via cset/fcset.
+(rule 1 (val_already_extended _ (icmp _ _ _ _)) true)
+(rule 1 (val_already_extended _ (fcmp _ _ _ _)) true)
+
+;; Narrow loads carry their own extension.
+(rule 1 (val_already_extended (ArgumentExtension.Uext) (uload8 _ _ _ _)) true)
+(rule 1 (val_already_extended (ArgumentExtension.Uext) (uload16 _ _ _ _)) true)
+(rule 1 (val_already_extended (ArgumentExtension.Sext) (sload8 _ _ _ _)) true)
+(rule 1 (val_already_extended (ArgumentExtension.Sext) (sload16 _ _ _ _)) true)
+
+;; PLIRON: a narrow-typed `load` zero extends too (`ldrb`/`ldrh`) — only
+;; ever `Uext`-clean.
+(rule 1 (val_already_extended (ArgumentExtension.Uext)
+        (load (fits_in_16 _) _ _ _)) true)
+
+;; PLIRON: narrow `ireduce` lowers to `uxtb`/`uxth` — zero-extended to 32.
+(rule 1 (val_already_extended (ArgumentExtension.Uext) (ireduce (fits_in_16 _) _)) true)
+
+;; `black_box` of a narrow value emits `uxtb`/`uxth` itself (see `lower`), so
+;; its result is clean for `Uext`. A wide `black_box` aliases its input's
+;; vreg — cleanliness passes through.
+(rule 1 (val_already_extended op (black_box _ x)) (val_already_extended op x))
+(rule 2 (val_already_extended (ArgumentExtension.Uext) (black_box _ x @ (value_type (fits_in_16 _)))) true)
+
+;; PLIRON (`PLIRON_NARROWEXT=1`): canonical narrow `iconst`s and
+;; `band`/`bor`/`bxor` trees over clean operands (see `narrow_uext_clean`).
+(rule 3 (val_already_extended (ArgumentExtension.Uext) v @ (value_type (fits_in_16 _)))
+      (if-let true (narrowext_clean v))
+      true)
+
+(decl pure narrowext_on (u64) bool)
+(extern constructor narrowext_on narrowext_on)
+(decl pure narrowext_clean (Value) bool)
+(extern constructor narrowext_clean narrowext_clean)
+;; `wide_clean bits v`: `v`'s register is already zero above `bits`, so a
+;; narrow `ireduce` of it needs no `uxtb`/`uxth` of its own.
+(decl pure wide_clean (u64 Value) bool)
+(extern constructor wide_clean wide_clean)
+
+;; PLIRON (`PLIRON_BFUSE`, default on): bitfield fusion — `(x>>k)&m`,
+;; `(x&m)<<k`, and `bor` field assembly → `ubfx`/`ubfiz`/`bfi`.
+(decl pure bfuse_on () bool)
+(extern constructor bfuse_on bfuse_on)
+(decl pure partial bf_imm_u8 (u64) u8)
+(extern constructor bf_imm_u8 bf_imm_u8)
+(decl pure partial bf_ubfx_imms (Type u64 u64) u8)
+(extern constructor bf_ubfx_imms bf_ubfx_imms)
+(decl pure partial bf_field_imms (Type u64 u64) u8)
+(extern constructor bf_field_imms bf_field_imms)
+(decl pure partial bf_ubfiz_immr (Type u64) u8)
+(extern constructor bf_ubfiz_immr bf_ubfiz_immr)
+(decl pure partial bf_ubfiz_imms (Type u64 u64) u8)
+(extern constructor bf_ubfiz_imms bf_ubfiz_imms)
+(decl pure partial bf_field_ubfiz_imms (Type u64 u64) u8)
+(extern constructor bf_field_ubfiz_imms bf_field_ubfiz_imms)
+(decl pure bf_disjoint_lowfield (Value u64 u64) bool)
+(extern constructor bf_disjoint_lowfield bf_disjoint_lowfield)
+(decl pure bf_disjoint_mask (Value u64) bool)
+(extern constructor bf_disjoint_mask bf_disjoint_mask)
+
+;; `ubfm` — unsigned bitfield move (`ubfiz`/`ubfx`/`lsl`/`lsr` aliases).
+(attr ubfm (veri chain))
+(decl ubfm (OperandSize Reg u8 u8) Reg)
+(rule (ubfm size src immr imms)
+      (let ((dst WritableReg (temp_writable_reg $I64))
+            (_ Unit (emit (MInst.UBfm dst src immr imms size))))
+        dst))
+
+;; `bfm` — insert a bitfield into an existing register (`bfi` alias).
+;; `rd_in` is a tied operand (modifies in place).
+(attr bfm (veri chain))
+(decl bfm (OperandSize Reg Reg u8 u8) Reg)
+(rule (bfm size src rd_in immr imms)
+      (let ((dst WritableReg (temp_writable_reg $I64))
+            (_ Unit (emit (MInst.Bfm dst src rd_in immr imms size))))
+        dst))
 
 ;; Place a `Value` into a register, sign extending it to 32-bits
 (attr put_in_reg_sext32 (veri chain))
@@ -3992,10 +4295,21 @@
         (amode_no_more_iconst ty val offset))
 (rule 1 (amode ty (iadd _ x (i32_from_iconst y)) offset)
         (if-let new_offset (i32_checked_add y offset))
+        (if-let true (amode_fold_ok ty new_offset))
         (amode_no_more_iconst ty x new_offset))
 (rule 2 (amode ty (iadd _ (i32_from_iconst x) y) offset)
         (if-let new_offset (i32_checked_add x offset))
+        (if-let true (amode_fold_ok ty new_offset))
         (amode_no_more_iconst ty y new_offset))
+
+;; PLIRON: an `iadd base, K` is only folded into
+;; the access offset when the sum still encodes (`simm9` / scaled
+;; `uimm12`); otherwise the sum stays a register (pliron's lcse made it
+;; `base + hi`, hoistable) and the access keeps its small offset, instead
+;; of `mov`+`movk` of the whole offset at every access. Always true
+;; with `PLIRON_BIGOFF=0`.
+(decl pure amode_fold_ok (Type i32) bool)
+(extern constructor amode_fold_ok amode_fold_ok)
 
 (rule 3
       (amode ty (stack_addr _ slot offset1) offset2)
@@ -4049,6 +4363,24 @@
 (rule 7 (amode_no_more_iconst ty (iadd _ (ishl shift_ty y (iconst _ (u64_from_imm64 n))) x) offset)
         (if-let true (u64_eq (ty_bytes ty) (u64_wrapping_shl 1 (shift_masked_imm shift_ty n))))
         (amode_reg_scaled (amode_add x offset) y))
+;; PLIRON: `iadd y, y` is `y * 2` — the egraph's `ishl y, 1` strength
+;; reduction produces this shape (miniz_oxide's halfword-table
+;; indexing), and it otherwise survives to a standalone `add` plus a
+;; reg+reg amode instead of the single scaled form.
+(rule 6 (amode_no_more_iconst ty (iadd _ x (iadd _ y y)) offset)
+        (if-let true (u64_eq (ty_bytes ty) 2))
+        (amode_reg_scaled (amode_add x offset) y))
+(rule 7 (amode_no_more_iconst ty (iadd _ (iadd _ y y) x) offset)
+        (if-let true (u64_eq (ty_bytes ty) 2))
+        (amode_reg_scaled (amode_add x offset) y))
+;; PLIRON: likewise `imul y, ty_bytes` — `index * sizeof` is the same
+;; scaled index, whichever op produced it.
+(rule 6 (amode_no_more_iconst ty (iadd _ x (imul _ y (iconst _ (u64_from_imm64 n)))) offset)
+        (if-let true (u64_eq (ty_bytes ty) n))
+        (amode_reg_scaled (amode_add x offset) y))
+(rule 7 (amode_no_more_iconst ty (iadd _ (imul _ y (iconst _ (u64_from_imm64 n))) x) offset)
+        (if-let true (u64_eq (ty_bytes ty) n))
+        (amode_reg_scaled (amode_add x offset) y))
 
 ;; Highest priority: a non-zero uimm12 offset folds into the load's immediate,
 ;; keeping `val` (e.g. a shared `base + index`) CSE-able across offsets instead
@@ -4056,6 +4388,24 @@
 (rule 8 (amode_no_more_iconst ty val offset)
         (if-let uimm12 (uimm12_scaled_nonzero_from_i64 offset ty))
         (AMode.UnsignedOffset val uimm12))
+
+;; PLIRON: a multi-use `iadd` result is materialized for its other uses
+;; anyway, so decomposing it into a reg+reg amode (rules 3-7 above) only
+;; keeps the operands' registers live as well. Keep the result whole so a
+;; shared `base + index` computes once and each load adds its own
+;; immediate. Priorities above 8 so this wins over the decompositions.
+;; Opt-in: `PLIRON_AMODESHARE=1` enables.
+(decl pure amode_share_ok (Value) bool)
+(extern constructor amode_share_ok amode_share_ok)
+
+(rule 9 (amode_no_more_iconst ty v @ (iadd _ _ _) offset)
+        (if-let true (amode_share_ok v))
+        (if-let uimm12 (uimm12_scaled_from_i64 offset ty))
+        (AMode.UnsignedOffset v uimm12))
+(rule 10 (amode_no_more_iconst ty v @ (iadd _ _ _) offset)
+         (if-let true (amode_share_ok v))
+         (if-let simm9 (simm9_from_i64 offset))
+         (AMode.Unscaled v simm9))
 
 (attr amode_reg_scaled (veri chain))
 (decl amode_reg_scaled (Reg Value) AMode)
@@ -4065,6 +4415,10 @@
         (AMode.RegScaledExtended base index (ExtendOp.UXTW)))
 (rule 1 (amode_reg_scaled base (sextend _ index @ (value_type $I32)))
         (AMode.RegScaledExtended base index (ExtendOp.SXTW)))
+;; PLIRON: narrower extend sources are NOT expressible — the
+;; ldst-register option field only permits uxtw/sxtw/sxtx/lsl; uxtb/
+;; uxth/sxtb/sxth encodings trap at runtime. An i16-typed index falls
+;; through to RegScaled on the already-extended 64-bit value.
 
 ;; Helper to add a 32-bit signed immediate to the register provided. This will
 ;; select an appropriate `add` instruction to use.
@@ -4899,6 +5253,65 @@
 (rule 1 (is_nonzero_cmp (maybe_uextend (icmp _ cc a b))) (emit_icmp cc a b))
 (rule 0 (is_nonzero_cmp val) (is_nonzero val))
 
+;; PLIRON (`PLIRON_CCMP`, default on): `band`/`bor` of two integer
+;; compares is one `cmp; ccmp` flag chain — the `a && b` / `a || b`
+;; idiom LLVM emits. `ccmp u,v,#nzcv,cc` applies the second compare
+;; only when the primary's condition held on its flags and forces the
+;; constant NZCV otherwise, so `brif`/`select`/`trapnz` consumers read
+;; the fused condition directly instead of `cset; cset; and` + test.
+;; The primary may be anything `emit_icmp` handles (narrow, i128);
+;; the secondary needs `ccmp`'s plain reg/reg form so it's gated to
+;; 32/64-bit operands. Both operand orders are tried since `band`/
+;; `bor` operands have no canonical order.
+;; The `mode` argument selects which of the four flag-chain shapes to
+;; build for a `cset condB` / `b.condB` consumer: `ccmp u,v,#nzcv,cc`
+;; applies B's compare only when `cc` held on the primary flags and
+;; forces the constant NZCV otherwise. bit0 = invert the primary cond
+;; for the guard; bit1 = the constant NZCV must satisfy (not falsify)
+;; `condB`.
+;;
+;;   mode 0 (`a && b`, `sel(A,B,0)`): guard = condA,   NZCV falsifies B
+;;   mode 1 (`!a && b`, `sel(A,0,B)`): guard = !condA,  NZCV falsifies B
+;;   mode 2 (`!a || b`, `sel(A,B,1)`): guard = condA,   NZCV satisfies B
+;;   mode 3 (`a || b`, `sel(A,1,B)`): guard = !condA,  NZCV satisfies B
+;; The fusion externs are total: when they decline (knob off, non-`Cond`
+;; primary, non-32/64-bit secondary compare) they build the same result
+;; the generic rules would — `is_nonzero` of the combination value for
+;; the `is_nonzero_cmp` consumers, or the plain `and`/`orr`/`select`
+;; for the `lower` value producers.
+(decl ccmp_band_cond (u8 Value IntCC Value Value IntCC Value Value) CondResult)
+(extern constructor ccmp_band_cond ccmp_band_cond)
+(decl ccmp_sel_cond (u8 Value Value IntCC Value Value) CondResult)
+(extern constructor ccmp_sel_cond ccmp_sel_cond)
+(decl ccmp_band_out (u8 Type Value IntCC Value Value Value IntCC Value Value) InstOutput)
+(extern constructor ccmp_band_out ccmp_band_out)
+(decl ccmp_sel_out (u8 Type Value Value Value IntCC Value Value) InstOutput)
+(extern constructor ccmp_sel_out ccmp_sel_out)
+
+(rule 2 (is_nonzero_cmp val @ (band _ (maybe_uextend (icmp _ cc0 x0 y0))
+                                     (maybe_uextend (icmp _ cc1 x1 y1))))
+        (ccmp_band_cond 0 val cc0 x0 y0 cc1 x1 y1))
+(rule 2 (is_nonzero_cmp val @ (bor _ (maybe_uextend (icmp _ cc0 x0 y0))
+                                    (maybe_uextend (icmp _ cc1 x1 y1))))
+        (ccmp_band_cond 3 val cc0 x0 y0 cc1 x1 y1))
+;; `select` of a compare against a constant arm is the same bool op.
+(rule 2 (is_nonzero_cmp val @ (select _ cond
+                                (maybe_uextend (icmp _ ccB u v))
+                                (u64_from_iconst 0)))
+        (ccmp_sel_cond 0 val cond ccB u v))
+(rule 3 (is_nonzero_cmp val @ (select _ cond
+                                (u64_from_iconst 0)
+                                (maybe_uextend (icmp _ ccB u v))))
+        (ccmp_sel_cond 1 val cond ccB u v))
+(rule 4 (is_nonzero_cmp val @ (select _ cond
+                                (maybe_uextend (icmp _ ccB u v))
+                                (u64_from_iconst 1)))
+        (ccmp_sel_cond 2 val cond ccB u v))
+(rule 5 (is_nonzero_cmp val @ (select _ cond
+                                (u64_from_iconst 1)
+                                (maybe_uextend (icmp _ ccB u v))))
+        (ccmp_sel_cond 3 val cond ccB u v))
+
 ;; Converts a `Value` to a `CondResult` with the condition being tested if
 ;; `Value` is nonzero.
 ;;
@@ -4920,6 +5333,42 @@
           (CondResult.NotZero (orr $I64 lo hi) (OperandSize.Size64))))
 (rule 3 (is_nonzero val @ (value_type $I8))
   (CondResult.Cond (tst_imm $I32 val (u64_into_imm_logic $I32 255)) (Cond.Ne)))
+;; PLIRON (`PLIRON_NARROWEXT=1`): a narrow value whose register is already
+;; zero-extended tests as-is — `cbnz w` instead of `tst #0xff` / `uxth`.
+(rule 4 (is_nonzero val @ (value_type (fits_in_16 _)))
+  (if-let true (narrowext_on 8))
+  (if-let true (val_already_extended (ArgumentExtension.Uext) val))
+  (CondResult.NotZero val (OperandSize.Size32)))
+;; PLIRON (`PLIRON_NARROWEXT` bit 8): `is_nonzero` of a narrow `ireduce`
+;; or `band`-of-`ireduce` tests the unmasked source register with `tst`
+;; — `(y mod W) != 0` is `y & (W-1) != 0`, `(y & k) != 0` likewise —
+;; instead of materialising the value's `uxtb`/`uxth`/`and` first
+;; (LLVM's `tst w, #0xff` shape). Single-use only: a shared value still
+;; materialises for its other uses and the extra `tst` would be a loss.
+(decl pure partial narrowext_tst_mask (Value u64) u64)
+(extern constructor narrowext_tst_mask narrowext_tst_mask)
+(rule 5 (is_nonzero val @ (maybe_uextend inner @ (ireduce _ y)))
+  (if-let false (value_has_multiple_uses val))
+  (if-let false (value_has_multiple_uses inner))
+  (if-let m (narrowext_tst_mask inner 0xFFFFFFFFFFFFFFFF))
+  (if-let mi (imm_logic_from_u64 $I32 m))
+  (CondResult.Cond (tst_imm $I32 (lo_reg y) mi) (Cond.Ne)))
+(rule 5 (is_nonzero val @ (maybe_uextend inner @ (band _ inner2 @ (ireduce _ y)
+                                                        (u64_from_iconst k))))
+  (if-let false (value_has_multiple_uses val))
+  (if-let false (value_has_multiple_uses inner))
+  (if-let false (value_has_multiple_uses inner2))
+  (if-let m (narrowext_tst_mask inner k))
+  (if-let mi (imm_logic_from_u64 $I32 m))
+  (CondResult.Cond (tst_imm $I32 (lo_reg y) mi) (Cond.Ne)))
+(rule 6 (is_nonzero val @ (maybe_uextend inner @ (band _ (u64_from_iconst k)
+                                                        inner2 @ (ireduce _ y))))
+  (if-let false (value_has_multiple_uses val))
+  (if-let false (value_has_multiple_uses inner))
+  (if-let false (value_has_multiple_uses inner2))
+  (if-let m (narrowext_tst_mask inner k))
+  (if-let mi (imm_logic_from_u64 $I32 m))
+  (CondResult.Cond (tst_imm $I32 (lo_reg y) mi) (Cond.Ne)))
 
 (attr emit_icmp (veri chain))
 (decl emit_icmp (IntCC Value Value) CondResult)
@@ -4927,22 +5376,94 @@
 ;; 8/16-bit base signed/unsigned cases
 (rule 0 (emit_icmp cc rn rm @ (value_type (fits_in_16 ty)))
   (if (signed_cond_code cc))
-  (CondResult.Cond
-    (cmp_extend
-      (OperandSize.Size32)
-      (put_in_reg_sext32 rn)
-      rm
-      (lower_extend_op ty (ArgumentExtension.Sext)))
-    (cond_code cc)))
+  (emit_icmp_narrow cc rn rm ty (ArgumentExtension.Sext)))
 (rule 1 (emit_icmp cc rn rm @ (value_type (fits_in_16 ty)))
   (if (unsigned_cond_code cc))
+  (emit_icmp_narrow cc rn rm ty (ArgumentExtension.Uext)))
+
+;; PLIRON: `cmp`'s fused extend slot only covers rm. When rm is already clean
+;; for this extension mode and rn is not, swap operands (with swapped cond) so
+;; the dirty operand gets the free extension and no standalone `uxtb`/`sxtb`
+;; is emitted.
+(decl emit_icmp_narrow (IntCC Value Value Type ArgumentExtension) CondResult)
+(rule 0 (emit_icmp_narrow cc rn rm ty ae)
   (CondResult.Cond
     (cmp_extend
       (OperandSize.Size32)
-      (put_in_reg_zext32 rn)
+      (put_in_reg_ext32_maybe rn ae)
       rm
-      (lower_extend_op ty (ArgumentExtension.Uext)))
+      (lower_extend_op ty ae))
     (cond_code cc)))
+(rule 1 (emit_icmp_narrow cc rn rm ty ae)
+  (if-let true (val_already_extended ae rm))
+  (if-let false (val_already_extended ae rn))
+  (CondResult.Cond
+    (cmp_extend
+      (OperandSize.Size32)
+      rm
+      rn
+      (lower_extend_op ty ae))
+    (cond_code (intcc_swap_args cc))))
+
+;; PLIRON: `put_in_reg_ext32` that elides the `extend` entirely when the
+;; producer already left a clean register.
+(decl put_in_reg_ext32_maybe (Value ArgumentExtension) Reg)
+(rule 0 (put_in_reg_ext32_maybe val ae) (put_in_reg_ext32 val ae))
+(rule 1 (put_in_reg_ext32_maybe val @ (value_type (fits_in_16 _)) ae)
+  (if-let true (val_already_extended ae val))
+  (put_in_reg val))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 1024): a narrow `icmp` of
+;; `isub c, j` / `iadd c, j` against iconst `k` can often drop the
+;; operand's `uxtb`/`uxth` — `(c∓j) mod W == k` is `c == (k±j) mod W`
+;; (one cmp on `c`), and an unsigned relation can compare the unmasked
+;; 32-bit sub/add result when the bound in `narrow_addsub_cmp` holds
+;; (`add+uxtb+cmp`/`sub+uxtb+cmp` → `sub+cmp`/`cmp`).
+(type NarrowAddsubCmp (enum
+  ;; compare `c` against the rolled constant `k2` (eq/ne)
+  (C (k2 u64))
+  ;; emit `sub c, j` on the clean register; compare against `k2`
+  (Sub (j u64) (k2 u64))
+  ;; emit `sub c, s` on the clean register (`iadd`-as-isub rewrite);
+  ;; compare against `k2`
+  (Rewrite (s u64) (k2 u64))))
+(decl pure partial narrow_addsub_cmp (u64 IntCC Type Value u64 u64) NarrowAddsubCmp)
+(extern constructor narrow_addsub_cmp narrow_addsub_cmp)
+;; The narrow source reg when clean, the `uxtb`/`uxth` when not.
+(decl put_in_reg_uext_narrow_maybe (Value) Reg)
+(rule 0 (put_in_reg_uext_narrow_maybe v)
+  (put_in_reg_ext32_maybe v (ArgumentExtension.Uext)))
+(rule 1 (put_in_reg_uext_narrow_maybe v)
+  (if-let true (narrowext_clean v))
+  (put_in_reg v))
+(decl emit_icmp_addsub_k (IntCC Value NarrowAddsubCmp) CondResult)
+(rule 0 (emit_icmp_addsub_k cc c (NarrowAddsubCmp.C k2))
+  (if-let (imm12_from_u64 k2i) k2)
+  (CondResult.Cond
+    (cmp_imm (OperandSize.Size32) (put_in_reg_uext_narrow_maybe c) k2i)
+    (cond_code cc)))
+(rule 1 (emit_icmp_addsub_k cc c (NarrowAddsubCmp.Sub j k2))
+  (if-let (imm12_from_u64 ji) j)
+  (if-let (imm12_from_u64 k2i) k2)
+  (CondResult.Cond
+    (cmp_imm (OperandSize.Size32)
+             (sub_imm $I32 (put_in_reg_uext_narrow_maybe c) ji)
+             k2i)
+    (cond_code cc)))
+(rule 2 (emit_icmp_addsub_k cc c (NarrowAddsubCmp.Rewrite s k2))
+  (if-let (imm12_from_u64 si) s)
+  (if-let (imm12_from_u64 k2i) k2)
+  (CondResult.Cond
+    (cmp_imm (OperandSize.Size32)
+             (sub_imm $I32 (put_in_reg_uext_narrow_maybe c) si)
+             k2i)
+    (cond_code cc)))
+(rule 10 (emit_icmp cc rn @ (isub ty @ (fits_in_16 _) c (u64_from_iconst j)) (u64_from_iconst k))
+  (if-let x (narrow_addsub_cmp 0 cc ty c j k))
+  (emit_icmp_addsub_k cc c x))
+(rule 11 (emit_icmp cc rn @ (iadd ty @ (fits_in_16 _) c (u64_from_iconst j)) (u64_from_iconst k))
+  (if-let x (narrow_addsub_cmp 1 cc ty c j k))
+  (emit_icmp_addsub_k cc c x))
 
 ;; 32/64-bit base case
 (rule 2 (emit_icmp cc rn rm @ (value_type (ty_32_or_64 ty)))
@@ -4954,7 +5475,7 @@
 (rule 3 (emit_icmp cc rn @ (value_type (fits_in_16 ty)) (imm12_from_value rm))
   (if (unsigned_cond_code cc))
   (CondResult.Cond
-    (cmp_imm (OperandSize.Size32) (put_in_reg_zext32 rn) rm)
+    (cmp_imm (OperandSize.Size32) (put_in_reg_uext_narrow_maybe rn) rm)
     (cond_code cc)))
 
 ;; 128-bit base case
@@ -4984,6 +5505,19 @@
 
 (rule 6 (emit_icmp cond rn @ (value_type (ty_32_or_64 ty)) (u64_from_iconst (imm12_from_u64 c)))
   (CondResult.Cond (cmp_imm (operand_size ty) rn c) (cond_code cond)))
+
+;; PLIRON (`PLIRON_CMN`, default on): `cmp x, -c` is `cmn x, c` when the
+;; negated immediate fits imm12 — one insn where a `movn`+`cmp` pair
+;; otherwise materializes. `sextload`'s `x <s -64` continuation tests
+;; are the motivating shape.
+(rule 9 (emit_icmp cond rn @ (value_type (ty_32_or_64 ty)) y @ (iconst _ (u64_from_imm64 n)))
+      (if-let true (cmn_on))
+      (if-let true (u64_ne n 0))
+      (if-let imm (imm12_from_negated_value y))
+  (CondResult.Cond (cmn_imm (operand_size ty) (put_in_reg rn) imm) (cond_code cond)))
+
+(decl pure cmn_on () bool)
+(extern constructor cmn_on cmn_on)
 
 ;; For direct equality comparisons to zero transform the other operand into a
 ;; nonzero comparison and then invert the whole conditional to test for zero.
@@ -5181,6 +5715,45 @@
          (MInst.CSel dst_lo cond rn_lo rm_lo)
          (MInst.CSel dst_hi cond rn_hi rm_hi)
          (value_regs dst_lo dst_hi)))))
+;; PLIRON: `select c, K+1, K` (or the mirrored `K, K+1`) on adjacent
+;; constants is a single `csinc` on the shared base register — LLVM's
+;; `cinc` idiom — instead of two materializations and a `csel`.
+(rule 5 (lower_select_cond ty flags cond
+        rn @ (u64_from_iconst a) rm @ (u64_from_iconst b))
+  (if (ty_int_ref_scalar_64 ty))
+  (if-let true (u64_eq a (u64_wrapping_add b 1)))
+  (if-let true (u64_gt b 0))
+  (let ((rb Reg (put_in_reg rm)))
+    (with_flags flags (csinc (invert_cond cond) rb rb))))
+(rule 6 (lower_select_cond ty flags cond
+        rn @ (u64_from_iconst a) rm @ (u64_from_iconst b))
+  (if (ty_int_ref_scalar_64 ty))
+  (if-let true (u64_eq b (u64_wrapping_add a 1)))
+  (if-let true (u64_gt a 0))
+  (let ((ra Reg (put_in_reg rn)))
+    (with_flags flags (csinc cond ra ra))))
+;; Zero bases ride `xzr` so `select c, 1, 0` / `select c, 0, 1` stay one
+;; inst like `cset` (same encoding anyway — this just avoids a `mov 0`).
+(rule 9 (lower_select_cond ty flags cond
+        (u64_from_iconst 1) (u64_from_iconst 0))
+  (if (ty_int_ref_scalar_64 ty))
+  (with_flags flags (csinc (invert_cond cond) (zero_reg) (zero_reg))))
+(rule 9 (lower_select_cond ty flags cond
+        (u64_from_iconst 0) (u64_from_iconst 1))
+  (if (ty_int_ref_scalar_64 ty))
+  (with_flags flags (csinc cond (zero_reg) (zero_reg))))
+;; An iconst-0 arm selects off `xzr` directly — saves a `mov w_, 0`
+;; materialization per select.
+(rule 7 (lower_select_cond ty flags cond
+        rn (u64_from_iconst 0))
+  (if (ty_int_ref_scalar_64 ty))
+  (let ((rt Reg (put_in_reg rn)))
+    (with_flags flags (csel cond rt (zero_reg)))))
+(rule 8 (lower_select_cond ty flags cond
+        (u64_from_iconst 0) rm)
+  (if (ty_int_ref_scalar_64 ty))
+  (let ((re Reg (put_in_reg rm)))
+    (with_flags flags (csel cond (zero_reg) re))))
 (rule 1 (lower_select_cond ty flags cond rn rm)
   (if (ty_int_ref_scalar_64 ty))
   (with_flags flags (csel cond rn rm)))
@@ -5215,7 +5788,15 @@
       (let ((rtmp1 WritableReg (temp_writable_reg $I64))
             (rtmp2 WritableReg (temp_writable_reg $I64)))
        (ConsumesFlags.ConsumesFlagsSideEffect
-        (MInst.JTSequence default targets ridx rtmp1 rtmp2))))
+        (MInst.JTSequence default targets ridx rtmp1 rtmp2 true))))
+
+;; PLIRON: the sequence without its bounds check (`jump_table_default_dead`).
+(decl jt_sequence_unchecked (Reg MachLabel BoxVecMachLabel) SideEffectNoResult)
+(rule (jt_sequence_unchecked ridx default targets)
+      (let ((rtmp1 WritableReg (temp_writable_reg $I64))
+            (rtmp2 WritableReg (temp_writable_reg $I64)))
+       (SideEffectNoResult.Inst
+        (MInst.JTSequence default targets ridx rtmp1 rtmp2 false))))
 
 ;; Helpers for emitting `MInst.CondBr` instructions.
 ;; Chainable helper terms: handled via chaining (inlined into specified

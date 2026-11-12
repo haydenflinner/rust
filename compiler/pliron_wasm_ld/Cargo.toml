@@ -13,3 +13,4 @@ doctest = false
 wasmparser = "0.248"
 wasm-encoder = { version = "0.248", features = ["wasmparser"] }
 object = { version = "0.39", default-features = false, features = ["std", "read_core", "archive"] }
+rustc-hash = "2.1.3"

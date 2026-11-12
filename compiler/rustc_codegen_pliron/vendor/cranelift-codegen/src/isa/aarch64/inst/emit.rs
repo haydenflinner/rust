@@ -263,6 +263,9 @@ fn enc_ldst_reg(
     rd: Reg,
 ) -> u32 {
     let s_bit = if s_bit { 1 } else { 0 };
+    // PLIRON: keep the whitelist — the ldst-register option field only
+    // permits uxtw/sxtw/sxtx/lsl; uxtb/uxth/sxtb/sxth encodings trap at
+    // runtime (verified on Apple Silicon).
     let extend_bits = match extendop {
         Some(ExtendOp::UXTW) => 0b010,
         Some(ExtendOp::SXTW) => 0b110,
@@ -328,7 +331,7 @@ fn enc_vec_rrr_long(
     q: u32,
     u: u32,
     size: u32,
-    bit14: u32,
+    opc: u32,
     rm: Reg,
     rn: Reg,
     rd: Writable<Reg>,
@@ -336,13 +339,13 @@ fn enc_vec_rrr_long(
     debug_assert_eq!(q & 0b1, q);
     debug_assert_eq!(u & 0b1, u);
     debug_assert_eq!(size & 0b11, size);
-    debug_assert_eq!(bit14 & 0b1, bit14);
+    debug_assert_eq!(opc & 0b111111, opc);
 
-    0b0_0_0_01110_00_1_00000_100000_00000_00000
+    0b0_0_0_01110_00_1_00000_000000_00000_00000
         | q << 30
         | u << 29
         | size << 22
-        | bit14 << 14
+        | opc << 10
         | (machreg_to_vec(rm) << 16)
         | (machreg_to_vec(rn) << 5)
         | machreg_to_vec(rd.to_reg())
@@ -1090,6 +1093,9 @@ impl MachInstEmit for Inst {
                         let reg = stack_reg();
                         sink.put4(enc_ldst_simm9(op, simm9, 0b01, reg, rd));
                     }
+                    &AMode::PostIndex { rn, simm9 } => {
+                        sink.put4(enc_ldst_simm9(op, simm9, 0b01, rn, rd));
+                    }
                     // Eliminated by `mem_finalize()` above.
                     &AMode::SPOffset { .. }
                     | &AMode::FPOffset { .. }
@@ -1186,6 +1192,9 @@ impl MachInstEmit for Inst {
                         let reg = stack_reg();
                         sink.put4(enc_ldst_simm9(op, simm9, 0b01, reg, rd));
                     }
+                    &AMode::PostIndex { rn, simm9 } => {
+                        sink.put4(enc_ldst_simm9(op, simm9, 0b01, rn, rd));
+                    }
                     // Eliminated by `mem_finalize()` above.
                     &AMode::SPOffset { .. }
                     | &AMode::FPOffset { .. }
@@ -1196,6 +1205,61 @@ impl MachInstEmit for Inst {
                         panic!("Should not see {mem:?} here!")
                     }
                 }
+            }
+
+            &Inst::LoadPost {
+                op,
+                rd,
+                rwb: _,
+                rn,
+                simm9,
+                flags,
+            } => {
+                let op = match op {
+                    LoadPostOp::ULoad8 => 0b0011100001,
+                    LoadPostOp::SLoad8 => 0b0011100010,
+                    LoadPostOp::ULoad16 => 0b0111100001,
+                    LoadPostOp::SLoad16 => 0b0111100010,
+                    LoadPostOp::ULoad32 => 0b1011100001,
+                    LoadPostOp::SLoad32 => 0b1011100010,
+                    LoadPostOp::ULoad64 => 0b1111100001,
+                    LoadPostOp::FpuLoad16 => 0b0111110001,
+                    LoadPostOp::FpuLoad32 => 0b1011110001,
+                    LoadPostOp::FpuLoad64 => 0b1111110001,
+                    LoadPostOp::FpuLoad128 => 0b0011110011,
+                };
+
+                if let Some(trap_code) = flags.trap_code() {
+                    sink.add_trap(trap_code);
+                }
+
+                sink.put4(enc_ldst_simm9(op, simm9, 0b01, rn, rd.to_reg()));
+            }
+
+            &Inst::StorePost {
+                op,
+                rt,
+                rwb: _,
+                rn,
+                simm9,
+                flags,
+            } => {
+                let op = match op {
+                    StorePostOp::Store8 => 0b0011100000,
+                    StorePostOp::Store16 => 0b0111100000,
+                    StorePostOp::Store32 => 0b1011100000,
+                    StorePostOp::Store64 => 0b1111100000,
+                    StorePostOp::FpuStore16 => 0b0111110000,
+                    StorePostOp::FpuStore32 => 0b1011110000,
+                    StorePostOp::FpuStore64 => 0b1111110000,
+                    StorePostOp::FpuStore128 => 0b0011110010,
+                };
+
+                if let Some(trap_code) = flags.trap_code() {
+                    sink.add_trap(trap_code);
+                }
+
+                sink.put4(enc_ldst_simm9(op, simm9, 0b01, rn, rt));
             }
 
             &Inst::StoreP64 {
@@ -1222,6 +1286,10 @@ impl MachInstEmit for Inst {
                     &PairAMode::SPPostIndexed { simm7 } => {
                         assert_eq!(simm7.scale_ty, I64);
                         let reg = stack_reg();
+                        sink.put4(enc_ldst_pair(0b1010100010, simm7, reg, rt, rt2));
+                    }
+                    &PairAMode::PostIndex { reg, simm7 } => {
+                        assert_eq!(simm7.scale_ty, I64);
                         sink.put4(enc_ldst_pair(0b1010100010, simm7, reg, rt, rt2));
                     }
                 }
@@ -1253,6 +1321,10 @@ impl MachInstEmit for Inst {
                     &PairAMode::SPPostIndexed { simm7 } => {
                         assert_eq!(simm7.scale_ty, I64);
                         let reg = stack_reg();
+                        sink.put4(enc_ldst_pair(0b1010100011, simm7, reg, rt, rt2));
+                    }
+                    &PairAMode::PostIndex { reg, simm7 } => {
+                        assert_eq!(simm7.scale_ty, I64);
                         sink.put4(enc_ldst_pair(0b1010100011, simm7, reg, rt, rt2));
                     }
                 }
@@ -1299,6 +1371,10 @@ impl MachInstEmit for Inst {
                         let reg = stack_reg();
                         sink.put4(enc_ldst_vec_pair(opc, 0b01, true, simm7, reg, rt, rt2));
                     }
+                    &PairAMode::PostIndex { reg, simm7 } => {
+                        assert!(simm7.scale_ty == F64 || simm7.scale_ty == I8X16);
+                        sink.put4(enc_ldst_vec_pair(opc, 0b01, true, simm7, reg, rt, rt2));
+                    }
                 }
             }
             &Inst::FpuStoreP64 {
@@ -1341,6 +1417,10 @@ impl MachInstEmit for Inst {
                         let reg = stack_reg();
                         sink.put4(enc_ldst_vec_pair(opc, 0b01, false, simm7, reg, rt, rt2));
                     }
+                    &PairAMode::PostIndex { reg, simm7 } => {
+                        assert!(simm7.scale_ty == F64 || simm7.scale_ty == I8X16);
+                        sink.put4(enc_ldst_vec_pair(opc, 0b01, false, simm7, reg, rt, rt2));
+                    }
                 }
             }
             &Inst::Mov { size, rd, rm } => {
@@ -1353,7 +1433,12 @@ impl MachInstEmit for Inst {
                         // should never MOV to XZR.
                         assert!(rd.to_reg() != stack_reg());
 
-                        if rm == stack_reg() {
+                        if rd.to_reg() == rm {
+                            // PLIRON: a 64-bit self-move is a no-op. ISLE's
+                            // `pliron_copy64` (coldargs' rebind copy) leaves
+                            // one whenever regalloc puts both sides in the
+                            // same register.
+                        } else if rm == stack_reg() {
                             // We can't use ORR here, so use an `add rd, sp, #0` instead.
                             let imm12 = Imm12::maybe_from_u64(0).unwrap();
                             sink.put4(enc_arith_rr_imm12(
@@ -1421,6 +1506,10 @@ impl MachInstEmit for Inst {
             }
             &Inst::CSNeg { rd, rn, rm, cond } => {
                 sink.put4(enc_csel(rd, rn, rm, cond, 1, 1));
+            }
+            // PLIRON:
+            &Inst::CSInc { rd, rn, rm, cond } => {
+                sink.put4(enc_csel(rd, rn, rm, cond, 0, 1));
             }
             &Inst::CSet { rd, cond } => {
                 sink.put4(enc_csel(rd, zero_reg(), zero_reg(), cond.invert(), 0, 1));
@@ -1774,6 +1863,8 @@ impl MachInstEmit for Inst {
             }
             &Inst::FpuMoveFromVec { rd, rn, idx, size } => {
                 let (imm5, shift, mask) = match size.lane_size() {
+                    // PLIRON: `dup h<d>, v<n>.h[i]` for packed-f16 lane reads.
+                    ScalarSize::Size16 => (0b00010, 2, 0b111),
                     ScalarSize::Size32 => (0b00100, 3, 0b011),
                     ScalarSize::Size64 => (0b01000, 4, 0b001),
                     _ => unimplemented!(),
@@ -1811,6 +1902,19 @@ impl MachInstEmit for Inst {
                     FPUOp1::Cvt64To32 => {
                         debug_assert_eq!(size, ScalarSize::Size64);
                         0b000_11110_01_1_000100_10000
+                    }
+                    // PLIRON: fcvt s<d>, h<n> / fcvt h<d>, s<n>. The ftype
+                    // field (bits 23:22) names the *source* precision and is
+                    // injected below from `size`; opc (bits 16:15) names the
+                    // destination: bits 20:15 are `0001` + opc (00 = s, 11 = h), the same
+                    // layout as Cvt64To32 (000100) / Cvt32To64 (000101).
+                    FPUOp1::Cvt16To32 => {
+                        debug_assert_eq!(size, ScalarSize::Size16);
+                        0b000_11110_00_1_000100_10000
+                    }
+                    FPUOp1::Cvt32To16 => {
+                        debug_assert_eq!(size, ScalarSize::Size32);
+                        0b000_11110_00_1_000111_10000
                     }
                 };
                 let top22 = top22 | size.ftype() << 12;
@@ -2074,6 +2178,9 @@ impl MachInstEmit for Inst {
                     VecShiftImmOp::Ushr => (true, 0b_001_011110_0000_000_000001_00000_00000_u32),
                     VecShiftImmOp::Sshr => (true, 0b_000_011110_0000_000_000001_00000_00000_u32),
                     VecShiftImmOp::Shl => (false, 0b_000_011110_0000_000_010101_00000_00000_u32),
+                    // immh selects the destination lane size; the shift is
+                    // encoded like a right shift on that size.
+                    VecShiftImmOp::Shrn => (true, 0b_000_011110_0000_000_100001_00000_00000_u32),
                 };
                 if size.is_128bits() {
                     template |= 0b1 << 30;
@@ -2585,19 +2692,33 @@ impl MachInstEmit for Inst {
                 alu_op,
                 high_half,
             } => {
-                let (u, size, bit14) = match alu_op {
-                    VecRRRLongOp::Smull8 => (0b0, 0b00, 0b1),
-                    VecRRRLongOp::Smull16 => (0b0, 0b01, 0b1),
-                    VecRRRLongOp::Smull32 => (0b0, 0b10, 0b1),
-                    VecRRRLongOp::Umull8 => (0b1, 0b00, 0b1),
-                    VecRRRLongOp::Umull16 => (0b1, 0b01, 0b1),
-                    VecRRRLongOp::Umull32 => (0b1, 0b10, 0b1),
+                let (u, size, opc) = match alu_op {
+                    VecRRRLongOp::Smull8 => (0b0, 0b00, 0b110000),
+                    VecRRRLongOp::Smull16 => (0b0, 0b01, 0b110000),
+                    VecRRRLongOp::Smull32 => (0b0, 0b10, 0b110000),
+                    VecRRRLongOp::Umull8 => (0b1, 0b00, 0b110000),
+                    VecRRRLongOp::Umull16 => (0b1, 0b01, 0b110000),
+                    VecRRRLongOp::Umull32 => (0b1, 0b10, 0b110000),
+                    // PLIRON: widening add — `Vd = Vn + widen(Vm half)`.
+                    VecRRRLongOp::Saddw8 => (0b0, 0b00, 0b000100),
+                    VecRRRLongOp::Saddw16 => (0b0, 0b01, 0b000100),
+                    VecRRRLongOp::Saddw32 => (0b0, 0b10, 0b000100),
+                    VecRRRLongOp::Uaddw8 => (0b1, 0b00, 0b000100),
+                    VecRRRLongOp::Uaddw16 => (0b1, 0b01, 0b000100),
+                    VecRRRLongOp::Uaddw32 => (0b1, 0b10, 0b000100),
+                    // PLIRON: widening add of two narrow operands.
+                    VecRRRLongOp::Saddl8 => (0b0, 0b00, 0b000000),
+                    VecRRRLongOp::Saddl16 => (0b0, 0b01, 0b000000),
+                    VecRRRLongOp::Saddl32 => (0b0, 0b10, 0b000000),
+                    VecRRRLongOp::Uaddl8 => (0b1, 0b00, 0b000000),
+                    VecRRRLongOp::Uaddl16 => (0b1, 0b01, 0b000000),
+                    VecRRRLongOp::Uaddl32 => (0b1, 0b10, 0b000000),
                 };
                 sink.put4(enc_vec_rrr_long(
                     high_half as u32,
                     u,
                     size,
-                    bit14,
+                    opc,
                     rm,
                     rn,
                     rd,
@@ -2612,16 +2733,19 @@ impl MachInstEmit for Inst {
                 high_half,
             } => {
                 debug_assert_eq!(rd.to_reg(), ri);
-                let (u, size, bit14) = match alu_op {
-                    VecRRRLongModOp::Umlal8 => (0b1, 0b00, 0b0),
-                    VecRRRLongModOp::Umlal16 => (0b1, 0b01, 0b0),
-                    VecRRRLongModOp::Umlal32 => (0b1, 0b10, 0b0),
+                let (u, size) = match alu_op {
+                    VecRRRLongModOp::Umlal8 => (0b1, 0b00),
+                    VecRRRLongModOp::Umlal16 => (0b1, 0b01),
+                    VecRRRLongModOp::Umlal32 => (0b1, 0b10),
+                    VecRRRLongModOp::Smlal8 => (0b0, 0b00),
+                    VecRRRLongModOp::Smlal16 => (0b0, 0b01),
+                    VecRRRLongModOp::Smlal32 => (0b0, 0b10),
                 };
                 sink.put4(enc_vec_rrr_long(
                     high_half as u32,
                     u,
                     size,
-                    bit14,
+                    0b100000,
                     rm,
                     rn,
                     rd,
@@ -2658,7 +2782,23 @@ impl MachInstEmit for Inst {
                     _ => false,
                 };
 
-                let (top11, bit15_10) = match alu_op {
+                // PLIRON: packed-f16 ops encode in the "three same (fp16)"
+                // space — different opcodes, no sz bit — so they bypass the
+                // `enc_float_size` injection below.
+                let (top11, bit15_10) = if is_float
+                    && size.lane_size() == ScalarSize::Size16
+                {
+                    match alu_op {
+                        VecALUOp::Fadd => (0b000_01110_010, 0b000101),
+                        VecALUOp::Fsub => (0b000_01110_110, 0b000101),
+                        VecALUOp::Fmul => (0b001_01110_010, 0b000111),
+                        VecALUOp::Fdiv => (0b001_01110_010, 0b001111),
+                        VecALUOp::Fmax => (0b000_01110_010, 0b001101),
+                        VecALUOp::Fmin => (0b000_01110_110, 0b001101),
+                        _ => unreachable!("no fp16 vector encoding for {alu_op:?}"),
+                    }
+                } else {
+                    match alu_op {
                     VecALUOp::Sqadd => (0b000_01110_00_1 | enc_size << 1, 0b000011),
                     VecALUOp::Sqsub => (0b000_01110_00_1 | enc_size << 1, 0b001011),
                     VecALUOp::Uqadd => (0b001_01110_00_1 | enc_size << 1, 0b000011),
@@ -2737,8 +2877,9 @@ impl MachInstEmit for Inst {
                     VecALUOp::Uzp2 => (0b01001110_00_0 | enc_size << 1, 0b010110),
                     VecALUOp::Trn1 => (0b01001110_00_0 | enc_size << 1, 0b001010),
                     VecALUOp::Trn2 => (0b01001110_00_0 | enc_size << 1, 0b011010),
+                    }
                 };
-                let top11 = if is_float {
+                let top11 = if is_float && size.lane_size() != ScalarSize::Size16 {
                     top11 | size.enc_float_size() << 1
                 } else {
                     top11
@@ -2754,12 +2895,19 @@ impl MachInstEmit for Inst {
                 size,
             } => {
                 debug_assert_eq!(rd.to_reg(), ri);
-                let (q, _enc_size) = size.enc_size();
+                let (q, enc_size) = size.enc_size();
 
                 let (top11, bit15_10) = match alu_op {
                     VecALUModOp::Bsl => (0b001_01110_01_1, 0b000111),
+                    // PLIRON: f16 lanes use the fp16 three-same space.
+                    VecALUModOp::Fmla if size.lane_size() == ScalarSize::Size16 => {
+                        (0b000_01110_010, 0b000011)
+                    }
                     VecALUModOp::Fmla => {
                         (0b000_01110_00_1 | (size.enc_float_size() << 1), 0b110011)
+                    }
+                    VecALUModOp::Fmls if size.lane_size() == ScalarSize::Size16 => {
+                        (0b000_01110_110, 0b000011)
                     }
                     VecALUModOp::Fmls => {
                         (0b000_01110_10_1 | (size.enc_float_size() << 1), 0b110011)
@@ -2769,9 +2917,24 @@ impl MachInstEmit for Inst {
                     // so it is baked into top11; only Q (from `size`) is variable.
                     // top11 (Q=0) | q<<9 with bit15_10 yields 0x4E809400 for .4S/.16B.
                     VecALUModOp::Sdot => (0b000_01110_10_0, 0b100101),
+                    // UDOT Vd.4S, Vn.16B, Vm.16B (FEAT_DotProd). Same as SDOT
+                    // but with the unsigned bit (bit 29) set — top11 +0b100000000.
+                    VecALUModOp::Udot => (0b001_01110_10_0, 0b100101),
                     // USDOT Vd.4S, Vn.16B, Vm.16B (FEAT_I8MM). Same shape as
                     // SDOT; only the opcode field differs.
                     VecALUModOp::Usdot => (0b000_01110_10_0, 0b100111),
+                    // MLA Vd.<T>, Vn.<T>, Vm.<T> — integer multiply-accumulate,
+                    // element size in bits 23:22 like `mul` (no .2d).
+                    VecALUModOp::Mla => {
+                        debug_assert_ne!(size, VectorSize::Size64x2);
+                        (0b000_01110_00_1 | enc_size << 1, 0b100101)
+                    }
+                    // MLS Vd.<T>, Vn.<T>, Vm.<T> — same as MLA but with the
+                    // unsigned bit (bit 29) set — top11 +0b100000000.
+                    VecALUModOp::Mls => {
+                        debug_assert_ne!(size, VectorSize::Size64x2);
+                        (0b001_01110_00_1 | enc_size << 1, 0b100101)
+                    }
                 };
                 sink.put4(enc_vec_rrr(top11 | q << 9, rm, bit15_10, rn, rd));
             }
@@ -2921,6 +3084,12 @@ impl MachInstEmit for Inst {
                 };
                 sink.put4(enc_bfm(opc, size, rd, rn, 0, from_bits - 1));
             }
+            &Inst::UBfm { rd, rn, immr, imms, size } => {
+                sink.put4(enc_bfm(0b10, size, rd, rn, immr, imms));
+            }
+            &Inst::Bfm { rd, rn, rd_in: _, immr, imms, size } => {
+                sink.put4(enc_bfm(0b01, size, rd, rn, immr, imms));
+            }
             &Inst::Jump { ref dest } => {
                 let off = sink.cur_offset();
                 // Indicate that the jump uses a label, if so, so that a fixup can occur later.
@@ -2994,10 +3163,21 @@ impl MachInstEmit for Inst {
                 // If this is a try-call, jump to the continuation
                 // (normal-return) block.
                 if let Some(try_call) = info.try_call_info.as_ref() {
-                    let jmp = Inst::Jump {
-                        dest: BranchTarget::Label(try_call.continuation),
-                    };
-                    jmp.emit(sink, emit_info, state);
+                    if try_call.continuation_elide {
+                        // PLIRON: the callee cannot return (`TrapCode::NORETURN_CALL`)
+                        // and code follows: no trap, no jump.
+                    } else if let Some(trap_code) = try_call.continuation_trap {
+                        // The continuation is a lone `trap`: emit it
+                        // inline (`bl; udf`) instead of jumping to a
+                        // cold block.
+                        let trap = Inst::Udf { trap_code };
+                        trap.emit(sink, emit_info, state);
+                    } else {
+                        let jmp = Inst::Jump {
+                            dest: BranchTarget::Label(try_call.continuation),
+                        };
+                        jmp.emit(sink, emit_info, state);
+                    }
                 }
 
                 // We produce an island above if needed, so disable
@@ -3041,10 +3221,21 @@ impl MachInstEmit for Inst {
                 // If this is a try-call, jump to the continuation
                 // (normal-return) block.
                 if let Some(try_call) = info.try_call_info.as_ref() {
-                    let jmp = Inst::Jump {
-                        dest: BranchTarget::Label(try_call.continuation),
-                    };
-                    jmp.emit(sink, emit_info, state);
+                    if try_call.continuation_elide {
+                        // PLIRON: the callee cannot return (`TrapCode::NORETURN_CALL`)
+                        // and code follows: no trap, no jump.
+                    } else if let Some(trap_code) = try_call.continuation_trap {
+                        // The continuation is a lone `trap`: emit it
+                        // inline (`bl; udf`) instead of jumping to a
+                        // cold block.
+                        let trap = Inst::Udf { trap_code };
+                        trap.emit(sink, emit_info, state);
+                    } else {
+                        let jmp = Inst::Jump {
+                            dest: BranchTarget::Label(try_call.continuation),
+                        };
+                        jmp.emit(sink, emit_info, state);
+                    }
                 }
 
                 // We produce an island above if needed, so disable
@@ -3171,13 +3362,20 @@ impl MachInstEmit for Inst {
                 rtmp2,
                 default,
                 ref targets,
-                ..
+                checked,
             } => {
+                if !checked {
+                    // PLIRON: unreachable default. The index is in range,
+                    // so just copy it into rtmp2 (32-bit: `ridx` is
+                    // zero-extended).
+                    Inst::Mov { size: OperandSize::Size32, rd: rtmp2, rm: ridx }.emit(sink, emit_info, state);
+                }
                 // This sequence is *one* instruction in the vcode, and is expanded only here at
                 // emission time, because we cannot allow the regalloc to insert spills/reloads in
                 // the middle; we depend on hardcoded PC-rel addressing below.
 
                 // Branch to default when condition code from prior comparison indicates.
+                if checked {
                 let br =
                     enc_conditional_br(BranchTarget::Label(default), CondBrKind::Cond(Cond::Hs));
 
@@ -3205,53 +3403,112 @@ impl MachInstEmit for Inst {
                 {
                     Inst::Csdb.emit(sink, emit_info, state);
                 }
-
-                // Load address of jump table
-                let inst = Inst::Adr { rd: rtmp1, off: 16 };
-                inst.emit(sink, emit_info, state);
-                // Load value out of jump table
-                let inst = Inst::SLoad32 {
-                    rd: rtmp2,
-                    mem: AMode::reg_plus_reg_scaled_extended(
-                        rtmp1.to_reg(),
-                        rtmp2.to_reg(),
-                        ExtendOp::UXTW,
-                    ),
-                    flags: MemFlagsData::trusted(),
-                };
-                inst.emit(sink, emit_info, state);
-                // Add base of jump table to jump-table-sourced block offset
-                let inst = Inst::AluRRR {
-                    alu_op: ALUOp::Add,
-                    size: OperandSize::Size64,
-                    rd: rtmp1,
-                    rn: rtmp1.to_reg(),
-                    rm: rtmp2.to_reg(),
-                };
-                inst.emit(sink, emit_info, state);
-                // Branch to computed address. (`targets` here is only used for successor queries
-                // and is not needed for emission.)
-                let inst = Inst::IndirectBr {
-                    rn: rtmp1.to_reg(),
-                    targets: vec![],
-                };
-                inst.emit(sink, emit_info, state);
-                // Emit jump table (table of 32-bit offsets).
-                let jt_off = sink.cur_offset();
-                for &target in targets.iter() {
-                    let word_off = sink.cur_offset();
-                    // off_into_table is an addend here embedded in the label to be later patched
-                    // at the end of codegen. The offset is initially relative to this jump table
-                    // entry; with the extra addend, it'll be relative to the jump table's start,
-                    // after patching.
-                    let off_into_table = word_off - jt_off;
-                    sink.use_label_at_offset(word_off, target, LabelUse::PCRel32);
-                    sink.put4(off_into_table);
                 }
 
-                // Lowering produces an EmitIsland before using a JTSequence, so we can safely
-                // disable the worst-case-size check in this case.
-                start_off = sink.cur_offset();
+                // PLIRON: deferred narrow table (`PLIRON_JT_NARROW=1`). The
+                // table goes after all code; `MachBuffer::finish` picks 1-,
+                // 2- or 4-byte entries holding (target - lowest target) / 4
+                // and patches the three placeholders below:
+                //   adr  rtmp1, table
+                //   ldr{b,h,} wtmp2, [rtmp1, wtmp2, uxtw #{0,1,2}]
+                //   adr  rtmp1, lowest_target
+                //   add  rtmp1, rtmp1, rtmp2, lsl #2
+                //   br   rtmp1
+                'jt: {
+                    if sink.can_defer_jump_table(LabelUse::Adr21) {
+                        let (r1, r2) = (rtmp1.to_reg(), rtmp2.to_reg());
+                        let uxtw = Some(ExtendOp::UXTW);
+                        let enc = |op: u32, scaled: bool| -> SmallVec<[u8; 8]> {
+                            SmallVec::from_slice(
+                                &enc_ldst_reg(op, r1, r2, scaled, uxtw, r2).to_le_bytes(),
+                            )
+                        };
+                        let load_enc = [
+                            enc(0b0011100001, false),
+                            enc(0b0111100001, true),
+                            enc(0b1011100001, true),
+                        ];
+                        let table_off = sink.cur_offset();
+                        sink.put4(enc_adr(0, rtmp1));
+                        let load_off = sink.cur_offset();
+                        sink.put_data(&load_enc[2]);
+                        let base_off = sink.cur_offset();
+                        sink.put4(enc_adr(0, rtmp1));
+                        Inst::AluRRRShift {
+                            alu_op: ALUOp::Add,
+                            size: OperandSize::Size64,
+                            rd: rtmp1,
+                            rn: r1,
+                            rm: r2,
+                            shiftop: ShiftOpAndAmt::new(
+                                ShiftOp::LSL,
+                                ShiftOpShiftImm::maybe_from_shift(2).unwrap(),
+                            ),
+                        }
+                        .emit(sink, emit_info, state);
+                        Inst::IndirectBr {
+                            rn: r1,
+                            targets: vec![],
+                        }
+                        .emit(sink, emit_info, state);
+                        sink.defer_jump_table(MachDeferredJumpTable {
+                            targets: targets.iter().copied().collect(),
+                            table_use: (table_off, LabelUse::Adr21),
+                            base_use: (base_off, LabelUse::Adr21),
+                            load_off,
+                            load_enc,
+                            scale: 4,
+                        });
+                        break 'jt;
+                    }
+
+                    // Load address of jump table
+                    let inst = Inst::Adr { rd: rtmp1, off: 16 };
+                    inst.emit(sink, emit_info, state);
+                    // Load value out of jump table
+                    let inst = Inst::SLoad32 {
+                        rd: rtmp2,
+                        mem: AMode::reg_plus_reg_scaled_extended(
+                            rtmp1.to_reg(),
+                            rtmp2.to_reg(),
+                            ExtendOp::UXTW,
+                        ),
+                        flags: MemFlagsData::trusted(),
+                    };
+                    inst.emit(sink, emit_info, state);
+                    // Add base of jump table to jump-table-sourced block offset
+                    let inst = Inst::AluRRR {
+                        alu_op: ALUOp::Add,
+                        size: OperandSize::Size64,
+                        rd: rtmp1,
+                        rn: rtmp1.to_reg(),
+                        rm: rtmp2.to_reg(),
+                    };
+                    inst.emit(sink, emit_info, state);
+                    // Branch to computed address. (`targets` here is only used for successor queries
+                    // and is not needed for emission.)
+                    let inst = Inst::IndirectBr {
+                        rn: rtmp1.to_reg(),
+                        targets: vec![],
+                    };
+                    inst.emit(sink, emit_info, state);
+                    // Emit jump table (table of 32-bit offsets).
+                    let jt_off = sink.cur_offset();
+                    for &target in targets.iter() {
+                        let word_off = sink.cur_offset();
+                        // off_into_table is an addend here embedded in the label to be later patched
+                        // at the end of codegen. The offset is initially relative to this jump table
+                        // entry; with the extra addend, it'll be relative to the jump table's start,
+                        // after patching.
+                        let off_into_table = word_off - jt_off;
+                        sink.use_label_at_offset(word_off, target, LabelUse::PCRel32);
+                        sink.put4(off_into_table);
+                    }
+
+                    // Lowering produces an EmitIsland before using a JTSequence, so we can safely
+                    // disable the worst-case-size check in this case.
+                    start_off = sink.cur_offset();
+                }
             }
             &Inst::LoadExtNameGot { rd, ref name } => {
                 // See this CE Example for the variations of this with and without BTI & PAUTH
@@ -3395,9 +3652,20 @@ impl MachInstEmit for Inst {
                     // that no other instructions will be inserted here (we're emitting directly),
                     // and a live range of `tmp2` should not span this instruction, so this use
                     // should otherwise be correct.
-                    debug_assert!(rd.to_reg() != tmp2_reg());
-                    debug_assert!(reg != tmp2_reg());
-                    let tmp = writable_tmp2_reg();
+                    //
+                    // With `PLIRON_X17`, x17 is allocatable, so use `rd` (written here
+                    // anyway) unless it is also the base, in which case the base is an
+                    // allocated register and `spilltmp` is free.
+                    let tmp = if !x17_allocatable() {
+                        debug_assert!(rd.to_reg() != tmp2_reg());
+                        debug_assert!(reg != tmp2_reg());
+                        writable_tmp2_reg()
+                    } else if rd.to_reg() != reg {
+                        rd
+                    } else {
+                        debug_assert!(reg != spilltmp_reg());
+                        writable_spilltmp_reg()
+                    };
                     for insn in Inst::load_constant(tmp, abs_offset).into_iter() {
                         insn.emit(sink, emit_info, state);
                     }
@@ -3652,6 +3920,566 @@ impl MachInstEmit for Inst {
 
     fn pretty_print_inst(&self, state: &mut Self::State) -> String {
         self.print_with_state(state)
+    }
+
+    fn fuse_with_next(&self, next: &Self, state: &Self::State) -> Option<Self> {
+        // A load/store's byte displacement, if it uses a simple
+        // `[rn + imm]` form — unsigned scaled or unscaled-signed, since
+        // pair offsets are signed anyway. The virtual stack-relative
+        // modes (`SlotOffset`, `SPOffset`, `FPOffset`, `IncomingArg`)
+        // and `RegOffset` are resolved exactly as `mem_finalize` will
+        // later do during this inst's own emission: the frame layout is
+        // final by emit time, so `adj`/`basereg` match. (Out-of-range
+        // resolved offsets simply fail the simm7 check below, same as
+        // a far register offset.)
+        fn uoff(mem: &AMode, state: &EmitState) -> Option<(Reg, i64)> {
+            match *mem {
+                AMode::UnsignedOffset { rn, uimm12 } => Some((rn, i64::from(uimm12.value()))),
+                AMode::Unscaled { rn, simm9 } => Some((rn, i64::from(simm9.value()))),
+                AMode::RegOffset { rn, off } => Some((rn, off)),
+                AMode::SPOffset { off } => Some((stack_reg(), off)),
+                AMode::FPOffset { off } => Some((fp_reg(), off)),
+                AMode::IncomingArg { off } => {
+                    let frame_layout = state.frame_layout();
+                    let resolved = i64::from(
+                        frame_layout.setup_area_size
+                            + frame_layout.tail_args_size
+                            + frame_layout.clobber_size
+                            + frame_layout.fixed_frame_storage_size
+                            + frame_layout.outgoing_args_size,
+                    ) - off;
+                    Some((stack_reg(), resolved))
+                }
+                AMode::SlotOffset { off } => {
+                    let adj = i64::from(state.frame_layout().outgoing_args_size);
+                    Some((stack_reg(), off + adj))
+                }
+                _ => None,
+            }
+        }
+        // Two accesses on adjacent `scale`-byte slots of the same base
+        // make an ldp/stp pair; `swap` says the second inst addressed
+        // the lower slot, so its register goes first.
+        fn pair_amode(
+            m1: &AMode,
+            m2: &AMode,
+            scale_ty: Type,
+            state: &EmitState,
+        ) -> Option<(PairAMode, bool)> {
+            let (r1, o1) = uoff(m1, state)?;
+            let (r2, o2) = uoff(m2, state)?;
+            if r1 != r2 {
+                return None;
+            }
+            // PLIRON: also try an fp-relative base when sp-resolution is
+            // in play — deep spillslots are beyond `ldp`/`stp`'s simm7
+            // from sp but sit just below fp (the clobber area). High-index
+            // slots are within ±512 of fp there.
+            let mut cands: SmallVec<[(Reg, i64, i64); 2]> = SmallVec::new();
+            cands.push((r1, o1, o2));
+            if r1 == stack_reg() && state.frame_layout().setup_area_size > 0 {
+                let s2f = i64::from(state.frame_layout().sp_to_fp());
+                cands.push((fp_reg(), o1 - s2f, o2 - s2f));
+            }
+            for (r, a, b) in cands {
+                let size = i64::from(scale_ty.bytes());
+                let (base, swap) = if b == a + size {
+                    (a, false)
+                } else if a == b + size {
+                    (b, true)
+                } else {
+                    continue;
+                };
+                if let Some(simm7) = SImm7Scaled::maybe_from_i64(base, scale_ty) {
+                    return Some((PairAMode::SignedOffset { reg: r, simm7 }, swap));
+                }
+            }
+            None
+        }
+        match (self, next) {
+            (
+                &Inst::FpuLoad128 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::FpuLoad128 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 || r1.to_reg() == r2.to_reg() {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, I8X16, state)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::FpuLoadP128 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            (
+                &Inst::FpuLoad64 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::FpuLoad64 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 || r1.to_reg() == r2.to_reg() {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, F64, state)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::FpuLoadP64 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            (
+                &Inst::ULoad64 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::ULoad64 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 || r1.to_reg() == r2.to_reg() {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, I64, state)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::LoadP64 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            (
+                &Inst::FpuStore128 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::FpuStore128 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, I8X16, state)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::FpuStoreP128 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            (
+                &Inst::FpuStore64 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::FpuStore64 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, F64, state)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::FpuStoreP64 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            (
+                &Inst::Store64 { rd: r1, mem: ref m1, flags: f1 },
+                &Inst::Store64 { rd: r2, mem: ref m2, flags: f2 },
+            ) => {
+                if f1 != f2 {
+                    return None;
+                }
+                let (mem, swap) = pair_amode(m1, m2, I64, state)?;
+                let (rt, rt2) = if swap { (r2, r1) } else { (r1, r2) };
+                Some(Inst::StoreP64 {
+                    rt,
+                    rt2,
+                    mem,
+                    flags: f1,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn pair_fusion_crossable(&self) -> bool {
+        // Pure register dataflow: no memory access, no flag reads or
+        // writes that ordering with a store could disturb, no control
+        // flow, traps or calls. (Flag-computing ALU ops like `subs`
+        // still commute with stores — stores don't touch NZCV — and
+        // the caller's hazard check covers data registers.)
+        matches!(
+            self,
+            Inst::AluRRR { .. }
+                | Inst::AluRRRR { .. }
+                | Inst::AluRRImm12 { .. }
+                | Inst::AluRRImmLogic { .. }
+                | Inst::AluRRImmShift { .. }
+                | Inst::AluRRRShift { .. }
+                | Inst::AluRRRExtend { .. }
+                | Inst::BitRR { .. }
+                | Inst::Mov { .. }
+                | Inst::MovWide { .. }
+                | Inst::MovK { .. }
+                | Inst::Extend { .. }
+                | Inst::UBfm { .. }
+                | Inst::Bfm { .. }
+                | Inst::FpuMove32 { .. }
+                | Inst::FpuMove64 { .. }
+                | Inst::FpuMove128 { .. }
+                | Inst::FpuMoveFromVec { .. }
+                | Inst::FpuExtend { .. }
+                | Inst::FpuRR { .. }
+                | Inst::FpuRRR { .. }
+                | Inst::FpuRRI { .. }
+                | Inst::FpuRRIMod { .. }
+                | Inst::FpuRRRR { .. }
+                | Inst::FpuToInt { .. }
+                | Inst::IntToFpu { .. }
+                | Inst::FpuRound { .. }
+                | Inst::MovToFpu { .. }
+                | Inst::FpuMoveFPImm { .. }
+                | Inst::MovToVec { .. }
+                | Inst::MovFromVec { .. }
+                | Inst::MovFromVecSigned { .. }
+                | Inst::VecDup { .. }
+                | Inst::VecDupFromFpu { .. }
+                | Inst::VecDupFPImm { .. }
+                | Inst::VecDupImm { .. }
+                | Inst::VecExtend { .. }
+                | Inst::VecMovElement { .. }
+                | Inst::VecRRLong { .. }
+                | Inst::VecRRNarrowLow { .. }
+                | Inst::VecRRNarrowHigh { .. }
+                | Inst::VecRRPair { .. }
+                | Inst::VecRRRLong { .. }
+                | Inst::VecRRRLongMod { .. }
+                | Inst::VecRRPairLong { .. }
+                | Inst::VecRRR { .. }
+                | Inst::VecRRRMod { .. }
+                | Inst::VecFmlaElem { .. }
+                | Inst::VecMisc { .. }
+                | Inst::VecLanes { .. }
+                | Inst::VecShiftImm { .. }
+                | Inst::VecShiftImmMod { .. }
+                | Inst::VecExtract { .. }
+                | Inst::VecTbl { .. }
+                | Inst::VecTblExt { .. }
+        )
+    }
+
+    fn mem_signed_offset(&self) -> Option<(Reg, i64, Type)> {
+        // A load/store inst on a plain signed-offset register base:
+        // (base reg, byte offset, scale type for writeback immediates).
+        match self {
+            Inst::LoadP64 { mem, .. } | Inst::StoreP64 { mem, .. } => match mem {
+                &PairAMode::SignedOffset { reg, simm7 } => {
+                    Some((reg, i64::from(simm7.value), I64))
+                }
+                _ => None,
+            },
+            Inst::FpuLoadP64 { mem, .. } | Inst::FpuStoreP64 { mem, .. } => match mem {
+                &PairAMode::SignedOffset { reg, simm7 } => {
+                    Some((reg, i64::from(simm7.value), F64))
+                }
+                _ => None,
+            },
+            Inst::FpuLoadP128 { mem, .. } | Inst::FpuStoreP128 { mem, .. } => match mem {
+                &PairAMode::SignedOffset { reg, simm7 } => {
+                    Some((reg, i64::from(simm7.value), I8X16))
+                }
+                _ => None,
+            },
+            Inst::ULoad8 { mem, .. }
+            | Inst::SLoad8 { mem, .. }
+            | Inst::ULoad16 { mem, .. }
+            | Inst::SLoad16 { mem, .. }
+            | Inst::ULoad32 { mem, .. }
+            | Inst::SLoad32 { mem, .. }
+            | Inst::ULoad64 { mem, .. }
+            | Inst::Store8 { mem, .. }
+            | Inst::Store16 { mem, .. }
+            | Inst::Store32 { mem, .. }
+            | Inst::Store64 { mem, .. }
+            | Inst::FpuLoad16 { mem, .. }
+            | Inst::FpuLoad32 { mem, .. }
+            | Inst::FpuLoad64 { mem, .. }
+            | Inst::FpuLoad128 { mem, .. }
+            | Inst::FpuStore16 { mem, .. }
+            | Inst::FpuStore32 { mem, .. }
+            | Inst::FpuStore64 { mem, .. }
+            | Inst::FpuStore128 { mem, .. } => {
+                let ty = self.mem_type().unwrap();
+                let (rn, off) = match mem {
+                    &AMode::Unscaled { rn, simm9 } => (rn, i64::from(simm9.value)),
+                    &AMode::UnsignedOffset { rn, uimm12 } => {
+                        (rn, i64::from(uimm12.value()))
+                    }
+                    &AMode::RegOffset { rn, off } => (rn, off),
+                    _ => return None,
+                };
+                Some((rn, off, ty))
+            }
+            _ => None,
+        }
+    }
+
+    fn post_index_imm_ok(&self, wb: i64) -> bool {
+        let ty = match self {
+            Inst::LoadP64 { .. } | Inst::StoreP64 { .. } => I64,
+            Inst::FpuLoadP64 { .. } | Inst::FpuStoreP64 { .. } => F64,
+            Inst::FpuLoadP128 { .. } | Inst::FpuStoreP128 { .. } => I8X16,
+            _ => return SImm9::maybe_from_i64(wb).is_some(),
+        };
+        SImm7Scaled::maybe_from_i64(wb, ty).is_some()
+    }
+
+    fn set_post_index(&mut self, wb: i64) {
+        // Post-index writeback with `Rn ∈ {Rt, Rt2}` is constrained
+        // unpredictable — the sweep must not put such a pair in a
+        // writeback chain.
+        let defs_base = match self {
+            Inst::LoadP64 { rt, rt2, mem, .. }
+            | Inst::FpuLoadP64 { rt, rt2, mem, .. }
+            | Inst::FpuLoadP128 { rt, rt2, mem, .. } => match &*mem {
+                &PairAMode::SignedOffset { reg, .. } => {
+                    rt.to_reg() == reg || rt2.to_reg() == reg
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        match self {
+            Inst::LoadP64 { mem, .. }
+            | Inst::StoreP64 { mem, .. }
+            | Inst::FpuLoadP64 { mem, .. }
+            | Inst::FpuStoreP64 { mem, .. }
+            | Inst::FpuLoadP128 { mem, .. }
+            | Inst::FpuStoreP128 { mem, .. } => {
+                if let PairAMode::SignedOffset { reg, simm7 } = *mem {
+                    debug_assert!(!defs_base);
+                    let simm7 = SImm7Scaled::maybe_from_i64(wb, simm7.scale_ty)
+                        .expect("post-index writeback out of range");
+                    *mem = PairAMode::PostIndex { reg, simm7 };
+                }
+            }
+            _ => {
+                if self.mem_type().is_none() {
+                    return;
+                }
+                let mem = match self {
+                    Inst::ULoad8 { mem, .. }
+                    | Inst::SLoad8 { mem, .. }
+                    | Inst::ULoad16 { mem, .. }
+                    | Inst::SLoad16 { mem, .. }
+                    | Inst::ULoad32 { mem, .. }
+                    | Inst::SLoad32 { mem, .. }
+                    | Inst::ULoad64 { mem, .. }
+                    | Inst::Store8 { mem, .. }
+                    | Inst::Store16 { mem, .. }
+                    | Inst::Store32 { mem, .. }
+                    | Inst::Store64 { mem, .. }
+                    | Inst::FpuLoad16 { mem, .. }
+                    | Inst::FpuLoad32 { mem, .. }
+                    | Inst::FpuLoad64 { mem, .. }
+                    | Inst::FpuLoad128 { mem, .. }
+                    | Inst::FpuStore16 { mem, .. }
+                    | Inst::FpuStore32 { mem, .. }
+                    | Inst::FpuStore64 { mem, .. }
+                    | Inst::FpuStore128 { mem, .. } => mem,
+                    _ => return,
+                };
+                let rn = match *mem {
+                    AMode::Unscaled { rn, .. }
+                    | AMode::UnsignedOffset { rn, .. }
+                    | AMode::RegOffset { rn, .. } => rn,
+                    _ => return,
+                };
+                let simm9 =
+                    SImm9::maybe_from_i64(wb).expect("post-index writeback out of range");
+                *mem = AMode::PostIndex { rn, simm9 };
+            }
+        }
+    }
+
+    fn flag_twin_candidate(&self) -> bool {
+        match self {
+            Inst::AluRRR { alu_op: ALUOp::Add | ALUOp::Sub, rd, .. }
+            | Inst::AluRRImm12 { alu_op: ALUOp::Add | ALUOp::Sub, rd, .. } => {
+                rd.to_reg() != zero_reg()
+            }
+            _ => false,
+        }
+    }
+
+    fn flag_twin(&self, later: &Self) -> Option<Self> {
+        let flags_op = |op: ALUOp| match op {
+            ALUOp::Add => Some(ALUOp::AddS),
+            ALUOp::Sub => Some(ALUOp::SubS),
+            _ => None,
+        };
+        match (self, later) {
+            (
+                &Inst::AluRRR { alu_op, size, rd, rn, rm },
+                &Inst::AluRRR { alu_op: op2, size: size2, rd: rd2, rn: rn2, rm: rm2 },
+            ) if rd2.to_reg() == zero_reg() && size2 == size && Some(op2) == flags_op(alu_op) => {
+                // Addition commutes (the carry of `a + b` is that of
+                // `b + a`); subtraction's operands must match in order.
+                let same = (rn2, rm2) == (rn, rm) || (alu_op == ALUOp::Add && (rn2, rm2) == (rm, rn));
+                same.then_some(Inst::AluRRR { alu_op: op2, size, rd, rn, rm })
+            }
+            (
+                &Inst::AluRRImm12 { alu_op, size, rd, rn, imm12 },
+                &Inst::AluRRImm12 { alu_op: op2, size: size2, rd: rd2, rn: rn2, imm12: imm2 },
+            ) if rd2.to_reg() == zero_reg()
+                && size2 == size
+                && rn2 == rn
+                && (imm2.bits, imm2.shift12) == (imm12.bits, imm12.shift12)
+                && Some(op2) == flags_op(alu_op) =>
+            {
+                Some(Inst::AluRRImm12 { alu_op: op2, size, rd, rn, imm12 })
+            }
+            _ => None,
+        }
+    }
+
+    fn nzcv_free(&self) -> bool {
+        let quiet = |op: ALUOp| {
+            !matches!(
+                op,
+                ALUOp::AddS | ALUOp::SubS | ALUOp::AndS | ALUOp::Adc | ALUOp::AdcS | ALUOp::Sbc | ALUOp::SbcS
+            )
+        };
+        match self {
+            Inst::AluRRR { alu_op, .. }
+            | Inst::AluRRImm12 { alu_op, .. }
+            | Inst::AluRRImmLogic { alu_op, .. }
+            | Inst::AluRRImmShift { alu_op, .. }
+            | Inst::AluRRRShift { alu_op, .. }
+            | Inst::AluRRRExtend { alu_op, .. } => quiet(*alu_op),
+            Inst::AluRRRR { .. }
+            | Inst::BitRR { .. }
+            | Inst::Mov { .. }
+            | Inst::MovWide { .. }
+            | Inst::MovK { .. }
+            | Inst::Extend { .. }
+            | Inst::UBfm { .. }
+            | Inst::Bfm { .. }
+            | Inst::Nop0
+            | Inst::Nop4
+            | Inst::ULoad8 { .. }
+            | Inst::SLoad8 { .. }
+            | Inst::ULoad16 { .. }
+            | Inst::SLoad16 { .. }
+            | Inst::ULoad32 { .. }
+            | Inst::SLoad32 { .. }
+            | Inst::ULoad64 { .. }
+            | Inst::Store8 { .. }
+            | Inst::Store16 { .. }
+            | Inst::Store32 { .. }
+            | Inst::Store64 { .. }
+            | Inst::StoreP64 { .. }
+            | Inst::LoadP64 { .. }
+            | Inst::FpuLoad32 { .. }
+            | Inst::FpuLoad64 { .. }
+            | Inst::FpuLoad128 { .. }
+            | Inst::FpuStore32 { .. }
+            | Inst::FpuStore64 { .. }
+            | Inst::FpuStore128 { .. }
+            // Post-index forms (patch 90's writeback loads/stores):
+            // the address update is a plain add, no flags.
+            | Inst::StorePost { .. }
+            | Inst::LoadPost { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn mem_offset_ok(&self, off: i64) -> bool {
+        match self {
+            Inst::LoadP64 { mem, .. }
+            | Inst::StoreP64 { mem, .. }
+            | Inst::FpuLoadP64 { mem, .. }
+            | Inst::FpuStoreP64 { mem, .. }
+            | Inst::FpuLoadP128 { mem, .. }
+            | Inst::FpuStoreP128 { mem, .. } => match mem {
+                PairAMode::SignedOffset { simm7, .. } => {
+                    SImm7Scaled::maybe_from_i64(off, simm7.scale_ty).is_some()
+                }
+                _ => false,
+            },
+            _ => match (self.mem_signed_offset(), self.mem_type()) {
+                (Some(_), Some(ty)) => {
+                    SImm9::maybe_from_i64(off).is_some()
+                        || UImm12Scaled::maybe_from_i64(off, ty).is_some()
+                }
+                _ => false,
+            },
+        }
+    }
+
+    fn set_mem_offset(&mut self, off: i64) {
+        let ty = self.mem_type();
+        match self {
+            Inst::LoadP64 { mem, .. }
+            | Inst::StoreP64 { mem, .. }
+            | Inst::FpuLoadP64 { mem, .. }
+            | Inst::FpuStoreP64 { mem, .. }
+            | Inst::FpuLoadP128 { mem, .. }
+            | Inst::FpuStoreP128 { mem, .. } => {
+                if let PairAMode::SignedOffset { reg, simm7 } = *mem {
+                    let simm7 = SImm7Scaled::maybe_from_i64(off, simm7.scale_ty)
+                        .expect("pair offset out of range");
+                    *mem = PairAMode::SignedOffset { reg, simm7 };
+                }
+            }
+            Inst::ULoad8 { mem, .. }
+            | Inst::SLoad8 { mem, .. }
+            | Inst::ULoad16 { mem, .. }
+            | Inst::SLoad16 { mem, .. }
+            | Inst::ULoad32 { mem, .. }
+            | Inst::SLoad32 { mem, .. }
+            | Inst::ULoad64 { mem, .. }
+            | Inst::Store8 { mem, .. }
+            | Inst::Store16 { mem, .. }
+            | Inst::Store32 { mem, .. }
+            | Inst::Store64 { mem, .. }
+            | Inst::FpuLoad16 { mem, .. }
+            | Inst::FpuLoad32 { mem, .. }
+            | Inst::FpuLoad64 { mem, .. }
+            | Inst::FpuLoad128 { mem, .. }
+            | Inst::FpuStore16 { mem, .. }
+            | Inst::FpuStore32 { mem, .. }
+            | Inst::FpuStore64 { mem, .. }
+            | Inst::FpuStore128 { mem, .. } => {
+                let rn = match *mem {
+                    AMode::Unscaled { rn, .. }
+                    | AMode::UnsignedOffset { rn, .. }
+                    | AMode::RegOffset { rn, .. } => rn,
+                    _ => return,
+                };
+                let ty = ty.expect("scalar access has a type");
+                *mem = if let Some(simm9) = SImm9::maybe_from_i64(off) {
+                    AMode::Unscaled { rn, simm9 }
+                } else {
+                    let uimm12 = UImm12Scaled::maybe_from_i64(off, ty)
+                        .expect("mem offset out of range");
+                    AMode::UnsignedOffset { rn, uimm12 }
+                };
+            }
+            _ => {}
+        }
+    }
+
+    fn self_add_imm(&self) -> Option<(Reg, i64)> {
+        match self {
+            Inst::AluRRImm12 {
+                alu_op,
+                rd,
+                rn,
+                imm12,
+                ..
+            } if rd.to_reg() == *rn => match alu_op {
+                ALUOp::Add => Some((*rn, i64::from(imm12.value()))),
+                ALUOp::Sub => Some((*rn, -i64::from(imm12.value()))),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 }
 

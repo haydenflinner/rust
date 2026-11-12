@@ -109,7 +109,9 @@ use crate::settings::ProbestackStrategy;
 use crate::{ir, isa};
 use crate::{machinst::*, trace};
 use alloc::boxed::Box;
+use core::cell::Cell;
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use regalloc2::{MachineEnv, PReg, PRegSet};
 use smallvec::smallvec;
 
@@ -582,6 +584,18 @@ pub trait ABIMachineSpec {
     /// Get the ABI-dependent MachineEnv for managing register allocation.
     fn get_machine_env(flags: &settings::Flags, call_conv: isa::CallConv) -> &MachineEnv;
 
+    /// PLIRON: per-function variant of `get_machine_env`, letting a backend
+    /// narrow the allocatable set for this particular function. `has_wide`
+    /// is whether the function's CLIF values include a vector wider than
+    /// 256 bits. Default: ignore it.
+    fn get_machine_env_for(
+        _has_wide: bool,
+        flags: &settings::Flags,
+        call_conv: isa::CallConv,
+    ) -> &MachineEnv {
+        Self::get_machine_env(flags, call_conv)
+    }
+
     /// Get all caller-save registers, that is, registers that we expect
     /// not to be saved across a call to a callee with the given ABI.
     fn get_regs_clobbered_by_call(
@@ -652,6 +666,19 @@ pub struct CallInfo<T> {
 pub struct TryCallInfo {
     /// The target to jump to on a normal returhn.
     pub continuation: MachLabel,
+    /// If the continuation block consists of exactly one `trap`
+    /// instruction (and the edge carries no arguments), the trap code
+    /// to materialize inline after the call instead of jumping to the
+    /// block: `callq; ud2` rather than `callq; jmp shared_ud2`. Shared
+    /// trap blocks are effectively cold and sink in the block order, so
+    /// the jump never becomes a fallthrough; emitting the trap in place
+    /// is both smaller and one fewer branch.
+    pub continuation_trap: Option<crate::ir::TrapCode>,
+    /// PLIRON: emit nothing for the normal-return edge. Set at emission
+    /// (`MachInst::elide_noreturn_continuation`) only when
+    /// `continuation_trap` is `TrapCode::NORETURN_CALL` and more code
+    /// follows in the function.
+    pub continuation_elide: bool,
     /// Exception tags to catch and corresponding destination labels.
     pub exception_handlers: Box<[TryCallHandler]>,
 }
@@ -1036,6 +1063,17 @@ impl core::ops::Index<Sig> for SigSet {
     }
 }
 
+std::thread_local! {
+    static PLIRON_LAST_FRAME: core::cell::Cell<[u32; 5]> = const { core::cell::Cell::new([0; 5]) };
+}
+
+/// PLIRON: the frame of the last function this thread compiled:
+/// `[stack slots, spill slots, clobber saves, outgoing args, fixed
+/// storage (slots + spills, aligned)]` in bytes.
+pub fn pliron_last_frame() -> [u32; 5] {
+    PLIRON_LAST_FRAME.with(|c| c.get())
+}
+
 /// Structure describing the layout of a function's stack frame.
 #[derive(Clone, Debug, Default)]
 pub struct FrameLayout {
@@ -1186,6 +1224,11 @@ pub struct Callee<M: ABIMachineSpec> {
     /// registers and keep nothing live after this sequence of instructions.
     stack_limit: Option<(Reg, SmallInstVec<M::I>)>,
 
+    /// PLIRON: whether the function's CLIF values include a vector wider
+    /// than 256 bits (a 512-bit value); used by `machine_env` for
+    /// per-function register-env selection.
+    has_wide_vector: bool,
+
     _mach: PhantomData<M>,
 }
 
@@ -1209,6 +1252,19 @@ fn checked_round_up(val: u32, mask: u32) -> Option<u32> {
     Some(val.checked_add(mask)? & !mask)
 }
 
+// PLIRON: per-function frame-pointer bisect. `PLIRON_FN_DUMP=1` prints each
+// function's ordinal and name as its Callee is created; `PLIRON_FP_RANGE=a:b`
+// keeps a frame pointer for ordinals in [a,b); `PLIRON_FP_FNS=x,y` keeps one
+// for functions whose name contains any listed substring.
+static PLIRON_FN_COUNTER: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static PLIRON_FORCE_FP: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn pliron_force_fp() -> bool {
+    PLIRON_FORCE_FP.with(|c| c.get())
+}
+
 impl<M: ABIMachineSpec> Callee<M> {
     /// Create a new body ABI instance.
     pub fn new(
@@ -1218,6 +1274,39 @@ impl<M: ABIMachineSpec> Callee<M> {
         sigs: &SigSet,
     ) -> CodegenResult<Self> {
         trace!("ABI: func signature {:?}", f.signature);
+        // PLIRON: whether any value's vector type is wider than 256 bits;
+        // the x64 backend uses it to keep zmm16-31 out of functions whose
+        // values are all narrow, where parking a narrow vreg in a high
+        // register miscompiles (see PLIRON patch 49).
+        let has_wide_vector = f
+            .dfg
+            .values()
+            .any(|v| f.dfg.value_type(v).is_vector() && f.dfg.value_type(v).bits() > 256);
+
+        {
+            static FN_DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            static FP_FNS: std::sync::OnceLock<Option<alloc::string::String>> =
+                std::sync::OnceLock::new();
+            static FP_RANGE: std::sync::OnceLock<Option<alloc::string::String>> =
+                std::sync::OnceLock::new();
+            let ord = PLIRON_FN_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let name = alloc::format!("{}", f.name);
+            if *FN_DUMP.get_or_init(|| std::env::var_os("PLIRON_FN_DUMP").is_some()) {
+                eprintln!("fn {ord}: {name}");
+            }
+            let fp_fns = FP_FNS.get_or_init(|| std::env::var("PLIRON_FP_FNS").ok());
+            let mut force = fp_fns.as_deref().map_or(false, |pats| {
+                pats.split(',').any(|p| !p.is_empty() && name.contains(p))
+            });
+            if let Some(range) = FP_RANGE.get_or_init(|| std::env::var("PLIRON_FP_RANGE").ok()) {
+                if let Some((a, b)) = range.split_once(':') {
+                    if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                        force |= ord >= a && ord < b;
+                    }
+                }
+            }
+            PLIRON_FORCE_FP.with(|c| c.set(force));
+        }
 
         let flags = isa.flags().clone();
         let sig = sigs.abi_sig_for_signature(&f.signature);
@@ -1328,6 +1417,7 @@ impl<M: ABIMachineSpec> Callee<M> {
             flags,
             isa_flags: isa_flags.clone(),
             stack_limit,
+            has_wide_vector,
             _mach: PhantomData,
         })
     }
@@ -1546,7 +1636,9 @@ impl<M: ABIMachineSpec> Callee<M> {
 
     /// Get the ABI-dependent MachineEnv for managing register allocation.
     pub fn machine_env(&self) -> &MachineEnv {
-        M::get_machine_env(&self.flags, self.call_conv)
+        // PLIRON: pass the per-function wide-vector signal so backends can
+        // narrow the env (see `get_machine_env_for`).
+        M::get_machine_env_for(self.has_wide_vector, &self.flags, self.call_conv)
     }
 
     /// The offsets of all sized stack slots (not spill slots) for debuginfo purposes.
@@ -1590,7 +1682,16 @@ impl<M: ABIMachineSpec> Callee<M> {
                 } => {
                     // However, we have to respect the extension mode for stack
                     // slots, or else we grab the wrong bytes on big-endian.
-                    let ext = M::get_ext_mode(sigs[self.sig].call_conv, extension);
+                    // PLIRON: Apple-packed argument slots are only `ty` wide
+                    // (a `u16` at +8, an `i8` at +0xa): a word-sized load
+                    // would read the neighbouring arguments' bytes as the
+                    // "extension".
+                    let cc = sigs[self.sig].call_conv;
+                    let ext = if cc == isa::CallConv::AppleAarch64 {
+                        ArgumentExtension::None
+                    } else {
+                        M::get_ext_mode(cc, extension)
+                    };
                     let ty =
                         if ext != ArgumentExtension::None && M::word_bits() > ty_bits(ty) as u32 {
                             M::word_type()
@@ -1658,6 +1759,9 @@ impl<M: ABIMachineSpec> Callee<M> {
         idx: usize,
         from_regs: ValueRegs<Reg>,
         vregs: &mut VRegAllocator<M::I>,
+        // PLIRON: the value is known zero-extended already; a register
+        // `uext` slot then takes it as-is (see `Lower::gen_return`).
+        skip_uext: bool,
     ) -> (SmallVec<[RetPair; 2]>, SmallInstVec<M::I>) {
         let mut reg_pairs = smallvec![];
         let mut ret = smallvec![];
@@ -1673,6 +1777,11 @@ impl<M: ABIMachineSpec> Callee<M> {
                             let from_bits = ty_bits(ty) as u8;
                             let ext = M::get_ext_mode(sigs[self.sig].call_conv, extension);
                             let vreg = match (ext, from_bits) {
+                                (ir::ArgumentExtension::Uext, n)
+                                    if n < word_bits && skip_uext && n <= 16 =>
+                                {
+                                    from_reg
+                                }
                                 (ir::ArgumentExtension::Uext, n)
                                 | (ir::ArgumentExtension::Sext, n)
                                     if n < word_bits =>
@@ -1793,6 +1902,10 @@ impl<M: ABIMachineSpec> Callee<M> {
     /// up all arguments, as well as a `CallArgList` list representing
     /// the arguments passed in registers.  The latter need to be added
     /// as constraints to the actual call instruction.
+    /// PLIRON: `skip_uext[i]` (indexed parallel to `args`) marks arg `i`'s
+    /// source register as already zero-extended to its narrow width; a
+    /// `uext` register slot then takes the source reg as-is (mirroring
+    /// `gen_copy_regs_to_retval`'s `skip_uext`). Pass `&[]` when unknown.
     pub fn gen_call_args(
         &self,
         sigs: &SigSet,
@@ -1801,6 +1914,7 @@ impl<M: ABIMachineSpec> Callee<M> {
         is_tail_call: bool,
         flags: &settings::Flags,
         vregs: &mut VRegAllocator<M::I>,
+        skip_uext: &[bool],
     ) -> (CallArgList, SmallInstVec<M::I>) {
         let mut uses: CallArgList = smallvec![];
         let mut insts = smallvec![];
@@ -1885,10 +1999,31 @@ impl<M: ABIMachineSpec> Callee<M> {
                         // or sign-extension that is required by the ABI.
                         let (ty, extension) = match *slot {
                             ABIArgSlot::Reg { ty, extension, .. } => (ty, extension),
+                            // PLIRON: an Apple-packed stack argument slot is
+                            // only `ty` wide; widening to the word and storing
+                            // 8 bytes clobbered the next arguments and the
+                            // caller's frame above the outgoing area (an `i8
+                            // uext` at sp+0xa zeroed two bytes of a by-ref
+                            // array copy at sp+0x10: rustlantis seed 2598).
+                            ABIArgSlot::Stack { ty, .. } if call_conv == isa::CallConv::AppleAarch64 => {
+                                (ty, ir::ArgumentExtension::None)
+                            }
                             ABIArgSlot::Stack { ty, extension, .. } => (ty, extension),
                         };
                         let ext = M::get_ext_mode(call_conv, extension);
-                        let (vreg, ty) = if ext != ir::ArgumentExtension::None
+                        // PLIRON: a register arg whose source already
+                        // holds the zero-extended form (PLIRON_NARROWEXT
+                        // bit 512; x64 extends this to i32 via
+                        // `PLIRON_ARGUEXT`) needs no `uxtb`/`uxth`/`movl`;
+                        // stack slots still widen so the outgoing slot's
+                        // bytes are fully defined. `skip_uext` is only
+                        // populated for widths the backend approved.
+                        let clean = matches!(*slot, ABIArgSlot::Reg { .. })
+                            && ext == ir::ArgumentExtension::Uext
+                            && ty_bits(ty) < word_bits
+                            && skip_uext.get(idx).copied().unwrap_or(false);
+                        let (vreg, ty) = if !clean
+                            && ext != ir::ArgumentExtension::None
                             && ty_bits(ty) < word_bits
                         {
                             assert_eq!(word_rc, from_reg.class());
@@ -2232,6 +2367,17 @@ impl<M: ABIMachineSpec> Callee<M> {
             return Err(CodegenError::ImplLimitExceeded);
         }
 
+        // PLIRON: remember this frame's breakdown for `pliron_last_frame`.
+        PLIRON_LAST_FRAME.with(|c| {
+            c.set([
+                self.stackslots_size,
+                bytes * spillslots as u32,
+                frame_layout.clobber_size,
+                frame_layout.outgoing_args_size,
+                frame_layout.fixed_frame_storage_size,
+            ])
+        });
+
         self.frame_layout = Some(frame_layout);
         Ok(())
     }
@@ -2255,16 +2401,41 @@ impl<M: ABIMachineSpec> Callee<M> {
     /// This should include any stack frame or other setup necessary to use the
     /// other methods (`load_arg`, `store_retval`, and spillslot accesses.)
     pub fn gen_prologue(&self) -> SmallInstVec<M::I> {
+        let mut insts = self.gen_prologue_setup();
+        insts.extend(self.gen_prologue_body());
+        insts
+    }
+
+    /// PLIRON: the frame-record half of the prologue (shrink-wrapping
+    /// emits it at entry and `gen_prologue_body` at the save point).
+    pub fn gen_prologue_setup(&self) -> SmallInstVec<M::I> {
+        M::gen_prologue_frame_setup(self.call_conv, &self.flags, &self.isa_flags, self.frame_layout())
+    }
+
+    /// PLIRON: an epilogue for a return before the save point: tear down
+    /// the frame record and return, no callee-save restores.
+    pub fn gen_epilogue_frame_only(&self) -> SmallInstVec<M::I> {
+        let frame_layout = self.frame_layout();
+        let mut insts: SmallInstVec<M::I> =
+            M::gen_epilogue_frame_restore(self.call_conv, &self.flags, &self.isa_flags, frame_layout);
+        insts.extend(M::gen_return(self.call_conv, &self.isa_flags, frame_layout));
+        insts
+    }
+
+    /// PLIRON: whether the stack check / probe sequence would be empty
+    /// (shrink-wrapping does not move them).
+    pub fn pliron_no_stack_checks(&self) -> bool {
+        let fl = self.frame_layout();
+        let total = fl.clobber_size + fl.fixed_frame_storage_size + fl.outgoing_args_size + fl.setup_area_size;
+        self.stack_limit.is_none()
+            && (!self.flags.enable_probestack() || total < (1 << self.flags.probestack_size_log2()))
+    }
+
+    /// The prologue after the frame record: stack checks, callee saves,
+    /// frame allocation.
+    pub fn gen_prologue_body(&self) -> SmallInstVec<M::I> {
         let frame_layout = self.frame_layout();
         let mut insts = smallvec![];
-
-        // Set up frame.
-        insts.extend(M::gen_prologue_frame_setup(
-            self.call_conv,
-            &self.flags,
-            &self.isa_flags,
-            &frame_layout,
-        ));
 
         // The stack limit check needs to cover all the stack adjustments we
         // might make, up to the next stack limit check in any function we

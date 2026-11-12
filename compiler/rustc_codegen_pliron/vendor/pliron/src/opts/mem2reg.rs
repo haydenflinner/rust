@@ -175,7 +175,7 @@ fn prune_candidates(candidates: &mut Vec<AllocCandidate>, ctx: &Context) {
             .deref(ctx)
             .get_parent_region(ctx)
             .expect("Alloc op must be in a region");
-        cand.alloc_info.ptr.uses(ctx).iter().all(|r#use| {
+        cand.alloc_info.ptr.uses_iter(ctx).all(|r#use| {
             let user_op = r#use.user_op();
             let user_op_obj = Operation::get_op_dyn(user_op, ctx);
             op_cast::<dyn PromotableOpInterface>(user_op_obj.as_ref()).is_some_and(|piface| {
@@ -208,7 +208,7 @@ fn compute_candidate_live_in_and_defining_blocks(
 
     // Compute blocks that contain uses of this pointer.
     let mut user_blocks: ISet<Ptr<BasicBlock>> = ISet::default();
-    for u in ptr.uses(ctx) {
+    for u in ptr.uses_iter(ctx) {
         if let Some(block) = u.user_op().deref(ctx).get_parent_block() {
             user_blocks.insert(block);
         }
@@ -426,7 +426,7 @@ fn process_rename_block(
 
     // Push phi args for this block.
     for &(ref cand, arg_idx) in new_phis_in_block.get(&block).into_iter().flatten() {
-        let new_val = block.deref(ctx).get_argument(arg_idx);
+        let new_val = block.deref(ctx).get_argument(ctx, arg_idx);
         reaching_def_map
             .get_mut(&cand.alloc_info.ptr)
             .unwrap()

@@ -1,0 +1,6058 @@
+//! Jump threading on the final Cranelift IR (`PLIRON_JUMPTHREAD`).
+//!
+//! After SROA, Rust's `Option`/`bool`-returning helpers become merges whose
+//! incoming values are often constants (`None` = null, `true`/`false`), and the
+//! merge block immediately tests them: `jump b(0)` … `b(v): brif v, …`.
+//! Cranelift has no jump threading, so each such edge pays a materialised
+//! constant, a jump and a test. Here a predecessor edge whose block arguments
+//! decide the merge block's branch is retargeted straight to the taken
+//! successor. Only merge blocks made of a few pure integer ops are threaded,
+//! and only when no use of the merge block's values is reachable from the new
+//! target without passing through the merge block, so dominance still holds.
+
+use cranelift_codegen::cursor::{Cursor, FuncCursor};
+use cranelift_codegen::dominator_tree::DominatorTree;
+use cranelift_codegen::entity::SecondaryMap;
+use cranelift_codegen::entity::packed_option::ReservedValue;
+use cranelift_codegen::flowgraph::ControlFlowGraph;
+use cranelift_codegen::ir::condcodes::{CondCode, IntCC};
+use cranelift_codegen::loop_analysis::LoopAnalysis;
+use cranelift_codegen::ir::types;
+use cranelift_codegen::ir::{
+    Block, BlockArg, BlockCall, ExceptionTableItem, Function, Inst, InstBuilder, InstructionData,
+    Opcode, ProgramPoint, Type, Value, ValueDef,
+};
+use crate::vmap::VMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+const MAX_BODY: usize = 12;
+
+fn mask(v: u64, bits: u32) -> u64 {
+    if bits >= 64 {
+        v
+    } else {
+        v & ((1u64 << bits) - 1)
+    }
+}
+
+fn sext(v: u64, bits: u32) -> i64 {
+    if bits >= 64 {
+        v as i64
+    } else {
+        let s = 64 - bits;
+        ((v << s) as i64) >> s
+    }
+}
+
+fn bits(func: &Function, v: Value) -> Option<u32> {
+    let ty = func.dfg.value_type(v);
+    (ty.is_int() && ty.bits() <= 64).then(|| ty.bits())
+}
+
+/// Constant value of `v`: from `env`, or an `iconst` anywhere in the function.
+pub fn known(func: &Function, env: &FxHashMap<Value, u64>, v: Value) -> Option<u64> {
+    let v = func.dfg.resolve_aliases(v);
+    if let Some(&c) = env.get(&v) {
+        return Some(c);
+    }
+    let ValueDef::Result(inst, 0) = func.dfg.value_def(v) else {
+        return None;
+    };
+    match func.dfg.insts[inst] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => Some(mask(imm.bits() as u64, bits(func, v)?)),
+        _ => None,
+    }
+}
+
+fn icmp(cc: IntCC, a: u64, b: u64, w: u32) -> bool {
+    let (sa, sb) = (sext(a, w), sext(b, w));
+    match cc {
+        IntCC::Equal => a == b,
+        IntCC::NotEqual => a != b,
+        IntCC::SignedLessThan => sa < sb,
+        IntCC::SignedGreaterThanOrEqual => sa >= sb,
+        IntCC::SignedGreaterThan => sa > sb,
+        IntCC::SignedLessThanOrEqual => sa <= sb,
+        IntCC::UnsignedLessThan => a < b,
+        IntCC::UnsignedGreaterThanOrEqual => a >= b,
+        IntCC::UnsignedGreaterThan => a > b,
+        IntCC::UnsignedLessThanOrEqual => a <= b,
+    }
+}
+
+/// Evaluate one pure body instruction of a merge block.
+pub fn eval(
+    func: &Function,
+    env: &FxHashMap<Value, u64>,
+    nz: &dyn Fn(Value) -> bool,
+    rg: &dyn Fn(Value) -> Option<(u64, u64)>,
+    inst: Inst,
+) -> Option<u64> {
+    static ARITH: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| crate::pass_enabled("PLIRON_EVAL_ARITH"));
+    let res = func.dfg.first_result(inst);
+    let w = bits(func, res)?;
+    let r = match func.dfg.insts[inst] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => imm.bits() as u64,
+        InstructionData::IntCompare { cond, args, .. } => {
+            let aw = bits(func, args[0])?;
+            let (ka, kb) = (known(func, env, args[0]), known(func, env, args[1]));
+            let ranged = range_cmp(cond, ka, kb, rg(args[0]), rg(args[1]), aw);
+            match (ka, kb) {
+                _ if ranged.is_some() => u64::from(ranged == Some(true)),
+                (Some(a), Some(b)) => icmp(cond, a, b, aw) as u64,
+                (Some(0), None) | (None, Some(0)) => {
+                    let x = if ka.is_some() { args[1] } else { args[0] };
+                    match (cond, nz(x)) {
+                        (IntCC::Equal, true) => 0,
+                        (IntCC::NotEqual, true) => 1,
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
+        }
+        InstructionData::Unary { opcode, arg } => {
+            let aw = bits(func, arg)?;
+            let a = known(func, env, arg)?;
+            match opcode {
+                Opcode::Uextend | Opcode::Ireduce => a,
+                Opcode::Sextend => sext(a, aw) as u64,
+                Opcode::Bnot => !a,
+                Opcode::Ineg => a.wrapping_neg(),
+                Opcode::Clz => {
+                    let am = mask(a, aw);
+                    u64::from(if am == 0 { aw } else { am.leading_zeros() - (64 - aw) })
+                }
+                Opcode::Ctz => {
+                    let am = mask(a, aw);
+                    u64::from(if am == 0 { aw } else { am.trailing_zeros() })
+                }
+                Opcode::Popcnt => u64::from(mask(a, aw).count_ones()),
+                Opcode::Bswap => mask(a, aw).swap_bytes() >> 64u32.saturating_sub(aw),
+                Opcode::Bitrev => mask(a, aw).reverse_bits() >> 64u32.saturating_sub(aw),
+                Opcode::Bmask => 0u64.wrapping_sub(u64::from(a != 0)),
+                _ => return None,
+            }
+        }
+        InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args,
+        } => {
+            let c = known(func, env, args[0])?;
+            known(func, env, args[if c != 0 { 1 } else { 2 }])?
+        }
+        InstructionData::Binary { opcode, args } => {
+            let (a, b) = (known(func, env, args[0])?, known(func, env, args[1])?);
+            match opcode {
+                Opcode::Band => a & b,
+                Opcode::Bor => a | b,
+                Opcode::Bxor => a ^ b,
+                Opcode::Iadd => a.wrapping_add(b),
+                Opcode::Isub => a.wrapping_sub(b),
+                Opcode::Imul if *ARITH => a.wrapping_mul(b),
+                Opcode::Udiv if *ARITH && b != 0 => a / b,
+                Opcode::Urem if *ARITH && b != 0 => a % b,
+                Opcode::Ishl if *ARITH => a << (b & u64::from(w - 1)),
+                Opcode::Ushr if *ARITH => a >> (b & u64::from(w - 1)),
+                Opcode::Umulhi => (((a as u128) * (b as u128)) >> w) as u64,
+                Opcode::Smulhi => {
+                    ((sext(a, w) as i128 * sext(b, w) as i128) >> w) as u64
+                }
+                Opcode::Sshr if *ARITH => (sext(a, w) >> (b & u64::from(w - 1))) as u64,
+                Opcode::Rotl | Opcode::Rotr if *ARITH => {
+                    let s = (b & u64::from(w - 1)) as u32;
+                    let (l, r) = if opcode == Opcode::Rotl {
+                        (s, w - s)
+                    } else {
+                        (w - s, s)
+                    };
+                    if s == 0 { a } else { (a << l) | (a >> r) }
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    Some(mask(r, w))
+}
+
+type KBits = FxHashMap<Value, (u64, u64)>;
+
+/// Known `(zero, one)` bit masks of `v` from constants, `env`, `kenv` and
+/// bitwise ops / constant shifts / extends on them.
+fn kbits(
+    func: &Function,
+    env: &FxHashMap<Value, u64>,
+    kenv: &KBits,
+    v: Value,
+    depth: u32,
+) -> (u64, u64) {
+    let v = func.dfg.resolve_aliases(v);
+    let Some(w) = bits(func, v) else {
+        return (0, 0);
+    };
+    let full = mask(u64::MAX, w);
+    if let Some(c) = known(func, env, v) {
+        return (!c & full, c);
+    }
+    if let Some(&k) = kenv.get(&v) {
+        return k;
+    }
+    let Some(i) = func.dfg.value_def(v).inst() else {
+        return (0, 0);
+    };
+    if depth >= 6 {
+        return (0, 0);
+    }
+    let sub = |x: Value| kbits(func, env, kenv, x, depth + 1);
+    let op = |opcode: Opcode, a: (u64, u64), b: (u64, u64)| -> (u64, u64) {
+        let s = (b.0 | b.1 == full)
+            .then_some(b.1)
+            .filter(|&s| s < u64::from(w));
+        match (opcode, s) {
+            (Opcode::Band, _) => (a.0 | b.0, a.1 & b.1),
+            (Opcode::Bor, _) => (a.0 & b.0, a.1 | b.1),
+            (Opcode::Bxor, _) => ((a.0 & b.0) | (a.1 & b.1), (a.0 & b.1) | (a.1 & b.0)),
+            (Opcode::Ishl, Some(s)) => ((a.0 << s) | ((1u64 << s) - 1), a.1 << s),
+            (Opcode::Ushr, Some(s)) => ((a.0 >> s) | !(full >> s), a.1 >> s),
+            _ => (0, 0),
+        }
+    };
+    let r = match func.dfg.insts[i] {
+        InstructionData::Binary { opcode, args } => op(opcode, sub(args[0]), sub(args[1])),
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => {
+            let a = sub(arg);
+            let aw = bits(func, arg).unwrap_or(w);
+            (a.0 | (full & !mask(u64::MAX, aw)), a.1)
+        }
+        InstructionData::Unary {
+            opcode: Opcode::Ireduce,
+            arg,
+        } => sub(arg),
+        // Zero-extending loads: the upper bits are known zero.
+        InstructionData::Load { opcode, .. } => match opcode {
+            Opcode::Uload8 => (full & !0xFFu64, 0),
+            Opcode::Uload16 => (full & !0xFFFFu64, 0),
+            Opcode::Uload32 => (full & !0xFFFF_FFFFu64, 0),
+            _ => (0, 0),
+        },
+        _ => (0, 0),
+    };
+    (r.0 & full, r.1 & full)
+}
+
+/// Constant result of body instruction `i` from known bits: fully known
+/// values, and `x ==/!= k` where a known bit of `x` differs from `k`.
+fn kfold(func: &Function, env: &FxHashMap<Value, u64>, kenv: &KBits, i: Inst) -> Option<u64> {
+    if kenv.is_empty() {
+        return None;
+    }
+    if let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[i] {
+        if !matches!(cond, IntCC::Equal | IntCC::NotEqual) {
+            return None;
+        }
+        let (x, k) = match (known(func, env, args[0]), known(func, env, args[1])) {
+            (None, Some(k)) => (args[0], k),
+            (Some(k), None) => (args[1], k),
+            _ => return None,
+        };
+        let (z, o) = kbits(func, env, kenv, x, 0);
+        return ((o & !k) | (z & k) != 0).then_some(u64::from(cond == IntCC::NotEqual));
+    }
+    let r = func.dfg.first_result(i);
+    let full = mask(u64::MAX, bits(func, r)?);
+    let (z, o) = kbits(func, env, kenv, r, 0);
+    (z | o == full).then_some(o)
+}
+
+pub fn pure_op(func: &Function, inst: Inst) -> bool {
+    use Opcode::*;
+    matches!(
+        func.dfg.insts[inst].opcode(),
+        Iconst
+            | Icmp
+            | Uextend
+            | Sextend
+            | Ireduce
+            | Bnot
+            | Band
+            | Bor
+            | Bxor
+            | Iadd
+            | Isub
+            | Select
+            | Ishl
+            | Ushr
+            | StackAddr
+    ) && func.dfg.inst_results(inst).len() == 1
+}
+
+/// For each block, the other blocks that use one of its values (params or results).
+fn users(func: &Function) -> FxHashMap<Block, FxHashSet<Block>> {
+    let mut out: FxHashMap<Block, FxHashSet<Block>> = FxHashMap::default();
+    let def_block = |v: Value| match func.dfg.value_def(v) {
+        ValueDef::Result(i, _) => func.layout.inst_block(i),
+        ValueDef::Param(b, _) => Some(b),
+        _ => None,
+    };
+    for b in func.layout.blocks() {
+        for inst in func.layout.block_insts(b) {
+            let mut note = |v: Value| {
+                if let Some(d) = def_block(v)
+                    && d != b
+                {
+                    out.entry(d).or_default().insert(b);
+                }
+            };
+            for &v in func.dfg.inst_args(inst) {
+                note(v);
+            }
+            for bc in func.dfg.insts[inst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                for a in bc.args(&func.dfg.value_lists) {
+                    if let BlockArg::Value(v) = a {
+                        note(v);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+const MAX_WALK: usize = 4096;
+
+/// Values known non-null: `!nonnull` loads, inbounds offsets of non-null
+/// pointers, and block params whose every incoming argument is non-null
+/// (greatest fixpoint).
+/// `c` computes `a != 0` (`Some((a, true))`) or `a == 0` (`Some((a,
+/// false))`) as a 0/1 value, through the wrappers Rust's bool lowering
+/// leaves: `select c', 0, 1` / `select c', 1, 0`, `ireduce`, `uextend`,
+/// `band _, 1`.
+fn nz_test_of(func: &Function, c: Value, depth: u32) -> Option<(Value, bool)> {
+    if depth > 6 {
+        return None;
+    }
+    let none = FxHashMap::default();
+    let c = func.dfg.resolve_aliases(c);
+    let i = func.dfg.value_def(c).inst()?;
+    match func.dfg.insts[i] {
+        InstructionData::IntCompare { cond, args, .. } if matches!(cond, IntCC::Equal | IntCC::NotEqual) => {
+            let ne = cond == IntCC::NotEqual;
+            match (known(func, &none, args[0]), known(func, &none, args[1])) {
+                (None, Some(0)) => Some((func.dfg.resolve_aliases(args[0]), ne)),
+                (Some(0), None) => Some((func.dfg.resolve_aliases(args[1]), ne)),
+                _ => None,
+            }
+        }
+        InstructionData::Ternary { opcode: Opcode::Select, args } => {
+            match (known(func, &none, args[1]), known(func, &none, args[2])) {
+                (Some(0), Some(1)) => nz_test_of(func, args[0], depth + 1).map(|(a, ne)| (a, !ne)),
+                (Some(1), Some(0)) => nz_test_of(func, args[0], depth + 1),
+                _ => None,
+            }
+        }
+        InstructionData::Unary { opcode: Opcode::Ireduce | Opcode::Uextend, arg } => nz_test_of(func, arg, depth + 1),
+        InstructionData::Binary { opcode: Opcode::Band, args } => {
+            match (known(func, &none, args[0]), known(func, &none, args[1])) {
+                (None, Some(1)) => nz_test_of(func, args[0], depth + 1),
+                (Some(1), None) => nz_test_of(func, args[1], depth + 1),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Site-qualified facts (docs/codegen-plan.md "Direction", level 2). A
+/// `!nonnull` load result or an inbounds offset is non-null *at the
+/// points its site justifies*; the plain tables (`nonnull`, `derived`)
+/// key facts by value and so only hold them where the value's own
+/// definition covers every use. When a pass merges a value into a
+/// survivor defined elsewhere (`carry_one`'s site rule refuses the plain
+/// carry) the fact still holds at the original's uses: record it here
+/// with the original's site, and `NonNull` answers queries at a use
+/// point by dominance (`site` dominates the use).
+#[derive(Default, Clone)]
+pub struct SiteFacts {
+    pub nonnull: FxHashMap<Value, Vec<ProgramPoint>>,
+    pub derived: FxHashMap<Value, Vec<(Value, ProgramPoint)>>,
+}
+
+impl SiteFacts {
+    pub fn is_empty(&self) -> bool {
+        self.nonnull.is_empty() && self.derived.is_empty()
+    }
+    pub fn add_nonnull(&mut self, v: Value, s: ProgramPoint) {
+        let e = self.nonnull.entry(v).or_default();
+        if !e.contains(&s) {
+            e.push(s);
+        }
+    }
+    pub fn add_derived(&mut self, v: Value, base: Value, s: ProgramPoint) {
+        let e = self.derived.entry(v).or_default();
+        if !e.contains(&(base, s)) {
+            e.push((base, s));
+        }
+    }
+}
+
+/// A memo key for a `(value, use point)` query.
+pub type AtKey = (Value, (bool, u32));
+fn at_key(v: Value, at: ProgramPoint) -> AtKey {
+    use cranelift_codegen::entity::EntityRef;
+    match at {
+        ProgramPoint::Inst(i) => (v, (false, i.index() as u32)),
+        ProgramPoint::Block(b) => (v, (true, b.index() as u32)),
+    }
+}
+
+pub struct NonNull<'a> {
+    loads: &'a FxHashSet<Value>,
+    derived: &'a VMap<Value>,
+    /// Site-qualified facts and the dominator tree that answers "does
+    /// the site cover this use" (`with_sites`); `None` keeps the plain
+    /// value-keyed answers.
+    sites: Option<&'a SiteFacts>,
+    dt: Option<DominatorTree>,
+    params: FxHashSet<Value>,
+    /// `PLIRON_NN_ADDR`, read once — `pass_enabled` does a TLS-tracked
+    /// lookup per call, which is too hot inside `is_deps`.
+    nn_addr: bool,
+    /// `PLIRON_NNBB`: `black_box v` keeps `v`'s non-null proof (the op
+    /// returns `v`'s bits; hiding identity must not hide type-level
+    /// facts). Opt-in until measured.
+    nn_bb: bool,
+    /// `PLIRON_NN_ANYINT`: seed scalar-int params of every width, not just
+    /// i64 — wasm32 iterator pointers are i32, and a `!= 0` proof is
+    /// width-agnostic anyway (`non_zero_const` masks to the value's own
+    /// width). The i64-only seed left wasm's `Option`-niche `eqz(ptr)`
+    /// tests unfolded.
+    nn_anyint: bool,
+    /// `new_ext` only: per block, the `(address, offset)` pairs a load or
+    /// store dereferenced in it or its unique-predecessor chain. See
+    /// `deref_step`.
+    deref: Option<FxHashMap<Block, Vec<(Value, i64)>>>,
+}
+
+impl<'a> NonNull<'a> {
+    pub fn new(
+        func: &Function,
+        cfg: &ControlFlowGraph,
+        loads: &'a FxHashSet<Value>,
+        derived: &'a VMap<Value>,
+    ) -> Self {
+        Self::new_ext(func, cfg, loads, derived, false)
+    }
+
+    /// `ext` adds two proofs that survive passes which drop `derived`
+    /// marks (`PLIRON_NFOLD2`): an edge's `x + k` after `x` was
+    /// dereferenced on every path to it, and either operand of an
+    /// inbounds `iadd` whose recorded base is gone.
+    pub fn new_ext(
+        func: &Function,
+        cfg: &ControlFlowGraph,
+        loads: &'a FxHashSet<Value>,
+        derived: &'a VMap<Value>,
+        ext: bool,
+    ) -> Self {
+        let mut nn = NonNull {
+            loads,
+            derived,
+            sites: None,
+            dt: None,
+            params: FxHashSet::default(),
+            nn_addr: crate::pass_enabled("PLIRON_NN_ADDR"),
+            nn_bb: crate::env_is("PLIRON_NNBB", "1"),
+            nn_anyint: crate::pass_enabled("PLIRON_NN_ANYINT"),
+            deref: ext.then(|| deref_chains(func, cfg)),
+        };
+        if loads.is_empty() {
+            return nn;
+        }
+        let entry = func.layout.entry_block();
+        for b in func.layout.blocks() {
+            if Some(b) != entry {
+                nn.params.extend(
+                    func.dfg
+                        .block_params(b)
+                        .iter()
+                        .copied()
+                        .filter(|&p| {
+                            let ty = func.dfg.value_type(p);
+                            ty == types::I64
+                                || (nn.nn_anyint && ty.is_int() && ty.bits() <= 64)
+                        }),
+                );
+            }
+        }
+        // Each seeded param survives iff every edge arg feeding it
+        // proves non-null on that edge. Evaluate each (param, edge)
+        // check once and record which params the proof relied on;
+        // evictions then propagate only to dependent checks instead of
+        // rescanning every terminator per fixpoint round. `params`
+        // only shrinks, so a positive `params` hit is the only kind of
+        // dependence — a miss can never become a hit.
+        struct Chk {
+            p: Value,
+            t: Inst,
+            ei: usize,
+            v: Value,
+            deps: Vec<Value>,
+        }
+        let mut checks: Vec<Chk> = Vec::new();
+        let mut dependents: FxHashMap<Value, Vec<usize>> = FxHashMap::default();
+        let mut evict: Vec<Value> = Vec::new();
+        // Reused proof-scratch set — `Chk` keeps a Vec copy, so the set
+        // itself is per-(param, edge) scratch, not a fresh alloc.
+        let mut deps = FxHashSet::default();
+        // `is_deps` results are stable while `params` is frozen — memoize
+        // so a value feeding many edges is proven once. Cleared before the
+        // eviction pass, which re-proves against the shrinking set.
+        let mut memo = Some(FxHashMap::default());
+        // Only in-edges of blocks with candidate params can evict — walk
+        // those preds via the CFG instead of every edge in the function.
+        for d in func.layout.blocks() {
+            let bparams = func.dfg.block_params(d);
+            if !bparams.iter().any(|p| nn.params.contains(p)) {
+                continue;
+            }
+            for pred in cfg.pred_iter(d) {
+                let t = pred.inst;
+                for (ei, bc) in func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if bc.block(&func.dfg.value_lists) != d {
+                        continue;
+                    }
+                    let args: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                    for (i, &p) in bparams.iter().enumerate() {
+                        if !nn.params.contains(&p) {
+                            continue;
+                        }
+                        let Some(&BlockArg::Value(v)) = args.get(i) else {
+                            evict.push(p);
+                            continue;
+                        };
+                        let v = func.dfg.resolve_aliases(v);
+                        deps.clear();
+                        if nn.edge_aux_deps(func, t, ei, v, 0, &mut deps, &mut memo) {
+                            dependents_entry(&mut dependents, &deps, checks.len());
+                            checks.push(Chk {
+                                p,
+                                t,
+                                ei,
+                                v,
+                                deps: deps.iter().copied().collect(),
+                            });
+                        } else {
+                            if pliron_cfg::tracing_on() {
+                                tracing::trace!(target: "pliron::jumpthread", "nn evict0 {p}: edge {t}:{ei} arg {v} derived={:?}", nn.derived.get(&v))
+                            };
+                            evict.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        memo = None;
+        let mut dead: FxHashSet<Value> = FxHashSet::default();
+        while let Some(q) = evict.pop() {
+            if pliron_cfg::tracing_on() {
+                tracing::trace!(target: "pliron::jumpthread", "nn evict {q}")
+            };
+            nn.params.remove(&q);
+            dead.insert(q);
+            for ci in dependents
+                .get(&q)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+            {
+                let c = &mut checks[ci];
+                if dead.contains(&c.p) {
+                    continue;
+                }
+                deps.clear();
+                if nn.edge_aux_deps(func, c.t, c.ei, c.v, 0, &mut deps, &mut memo) {
+                    // Still proven — the dep set may have moved, so
+                    // re-point the check at what it now relies on.
+                    c.deps = deps.iter().copied().collect();
+                    dependents_entry(&mut dependents, &deps, ci);
+                } else {
+                    dead.insert(c.p);
+                    evict.push(c.p);
+                }
+            }
+        }
+        nn
+    }
+
+    /// Wrap a caller-kept `params` set — skips the seed+proof fixpoint
+    /// entirely. The set must only ever *shrink* between rounds (drop
+    /// params whose in-edges changed); it may contain dead values —
+    /// queries only name live ones, so stragglers are harmless.
+    fn from_params(
+        loads: &'a FxHashSet<Value>,
+        derived: &'a VMap<Value>,
+        params: FxHashSet<Value>,
+    ) -> Self {
+        NonNull {
+            loads,
+            derived,
+            sites: None,
+            dt: None,
+            params,
+            nn_addr: crate::pass_enabled("PLIRON_NN_ADDR"),
+            nn_bb: crate::env_is("PLIRON_NNBB", "1"),
+            nn_anyint: crate::pass_enabled("PLIRON_NN_ANYINT"),
+            deref: None,
+        }
+    }
+
+    /// Drop proofs for params of `evict` blocks — an in-edge's args
+    /// feed every param slot of its target, so a new or rewritten edge
+    /// invalidates the whole block's entries.
+    pub(crate) fn evict_params(&mut self, func: &Function, evict: &FxHashSet<Block>) {
+        if evict.is_empty() {
+            return;
+        }
+        self.params.retain(|&p| {
+            !matches!(func.dfg.value_def(p), ValueDef::Param(b, _) if evict.contains(&b))
+        });
+    }
+
+    /// `new`, plus site-qualified facts answered by dominance at the
+    /// use point (`is_m_at`). The seeding fixpoint is unchanged.
+    pub fn with_sites(
+        func: &Function,
+        cfg: &ControlFlowGraph,
+        loads: &'a FxHashSet<Value>,
+        derived: &'a VMap<Value>,
+        sites: &'a SiteFacts,
+    ) -> Self {
+        let mut nn = Self::new_ext(func, cfg, loads, derived, false);
+        if !sites.is_empty() {
+            nn.sites = Some(sites);
+            nn.dt = Some(DominatorTree::with_function(func, cfg));
+        }
+        nn
+    }
+
+    /// A recorded site covers the use when it dominates it; a site whose
+    /// instruction or block left the layout covers nothing.
+    fn site_covers(&self, func: &Function, s: ProgramPoint, at: ProgramPoint) -> bool {
+        let Some(dt) = &self.dt else {
+            return false;
+        };
+        let live = match s {
+            ProgramPoint::Inst(i) => func.layout.inst_block(i).is_some(),
+            ProgramPoint::Block(b) => func.layout.is_block_inserted(b),
+        };
+        let at_live = match at {
+            ProgramPoint::Inst(i) => func.layout.inst_block(i).is_some(),
+            ProgramPoint::Block(b) => func.layout.is_block_inserted(b),
+        };
+        live && at_live && dt.dominates(s, at, &func.layout)
+    }
+
+    fn site_nn(&self, func: &Function, v: Value, at: Option<ProgramPoint>) -> bool {
+        let (Some(sites), Some(at)) = (self.sites, at) else {
+            return false;
+        };
+        sites
+            .nonnull
+            .get(&v)
+            .is_some_and(|ss| ss.iter().any(|&s| self.site_covers(func, s, at)))
+    }
+
+    fn site_derived(&self, func: &Function, v: Value, at: Option<ProgramPoint>) -> Option<Value> {
+        let (Some(sites), Some(at)) = (self.sites, at) else {
+            return None;
+        };
+        sites
+            .derived
+            .get(&v)?
+            .iter()
+            .filter(|&&(_, s)| self.site_covers(func, s, at))
+            // Recorded bases go stale as passes alias or delete them:
+            // a chain ending at the reserved slot means the fact is
+            // unusable, not that the query is unanswerable — skip it and
+            // try the next covering site.
+            .filter_map(|&(b, _)| func.dfg.try_resolve_aliases(b))
+            .next()
+    }
+
+    /// `is` at a use point: the plain facts plus the site-qualified ones
+    /// whose site dominates `at`.
+    pub fn is_m_at(
+        &self,
+        func: &Function,
+        v: Value,
+        at: ProgramPoint,
+        memo: &mut FxHashMap<AtKey, bool>,
+    ) -> bool {
+        let v = func.dfg.resolve_aliases(v);
+        let k = at_key(v, at);
+        if let Some(&r) = memo.get(&k) {
+            return r;
+        }
+        let r = self.is_deps_at(func, v, Some(at), &mut FxHashSet::default());
+        memo.insert(k, r);
+        r
+    }
+
+    pub fn is(&self, func: &Function, v: Value) -> bool {
+        self.is_deps(func, v, &mut FxHashSet::default())
+    }
+
+    /// `is` behind a caller-owned memo. Answers depend on `func` as it
+    /// stands at query time, so the memo is only sound across a span
+    /// where `func` does not change — `round`'s edge scan and
+    /// `fold_null_tests`' collection both qualify; a caller that
+    /// rewrites `func` between queries must drop the memo too.
+    pub fn is_m(&self, func: &Function, v: Value, memo: &mut FxHashMap<Value, bool>) -> bool {
+        let v = func.dfg.resolve_aliases(v);
+        if let Some(&r) = memo.get(&v) {
+            return r;
+        }
+        let r = self.is(func, v);
+        memo.insert(v, r);
+        r
+    }
+
+    /// `is_deps` behind a per-value memo — legal only while `params` is
+    /// frozen (the `new` seeding pass); eviction shrinks `params`, which
+    /// can change answers, so callers there pass `None`.
+    fn is_deps_m(
+        &self,
+        func: &Function,
+        v: Value,
+        deps: &mut FxHashSet<Value>,
+        memo: Option<&mut FxHashMap<Value, (bool, Vec<Value>)>>,
+    ) -> bool {
+        let Some(m) = memo else {
+            return self.is_deps(func, v, deps);
+        };
+        let v = func.dfg.resolve_aliases(v);
+        if let Some((r, ds)) = m.get(&v) {
+            deps.extend(ds.iter().copied());
+            return *r;
+        }
+        let mut d2 = FxHashSet::default();
+        let r = self.is_deps(func, v, &mut d2);
+        deps.extend(d2.iter().copied());
+        m.insert(v, (r, d2.into_iter().collect()));
+        r
+    }
+
+    fn is_deps(&self, func: &Function, v: Value, deps: &mut FxHashSet<Value>) -> bool {
+        self.is_deps_at(func, v, None, deps)
+    }
+
+    fn is_deps_at(
+        &self,
+        func: &Function,
+        v: Value,
+        at: Option<ProgramPoint>,
+        deps: &mut FxHashSet<Value>,
+    ) -> bool {
+        // `select c, a, b` is non-null iff both arms are; every term on
+        // the worklist must justify itself (a `!nonnull` load, a param
+        // the fixpoint kept, a symbol/stack address, or an `inbounds`
+        // offset of a non-null base).
+        let mut work = vec![func.dfg.resolve_aliases(v)];
+        let mut seen: FxHashSet<Value> = FxHashSet::default();
+        'terms: while let Some(mut v) = work.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            for _ in 0..8 {
+                if self.loads.contains(&v)
+                    || addr_of_symbol(func, v, self.nn_addr)
+                    || non_zero_const(func, v)
+                    || self.site_nn(func, v, at)
+                {
+                    continue 'terms;
+                }
+                if self.params.contains(&v) {
+                    deps.insert(v);
+                    continue 'terms;
+                }
+                if let Some(i) = func.dfg.value_def(v).inst()
+                    && let InstructionData::Ternary {
+                        opcode: Opcode::Select,
+                        args,
+                    } = func.dfg.insts[i]
+                {
+                    work.push(func.dfg.resolve_aliases(args[1]));
+                    work.push(func.dfg.resolve_aliases(args[2]));
+                    continue 'terms;
+                }
+                // `black_box v` returns `v` unchanged: it hides the
+                // value's *identity*, not its type-level facts — a
+                // non-null arg stays non-null (`nnargs`-seeded `&T`/
+                // `&str` data ptrs keep feeding iterator niche folds
+                // through `black_box(&s)`; LLVM re-derives the same fact
+                // from `nonnull`-annotated phis).
+                if self.nn_bb
+                    && let Some(i) = func.dfg.value_def(v).inst()
+                    && let InstructionData::Unary {
+                        opcode: Opcode::BlackBox,
+                        arg,
+                    } = func.dfg.insts[i]
+                {
+                    v = func.dfg.resolve_aliases(arg);
+                    continue;
+                }
+                match self.derived_base(func, v) {
+                    Some(b) => {
+                        v = b;
+                        continue;
+                    }
+                    None => {
+                        // The base was deleted and both operands are
+                        // values: the base is one of them, and an
+                        // inbounds offset from null by a non-zero
+                        // amount is UB, so either operand non-null
+                        // suffices.
+                        if let Some(b) = self.site_derived(func, v, at) {
+                            v = b;
+                            continue;
+                        }
+                        if let Some((a, b)) = self.tomb_pair(func, v)
+                            && (self.is_deps_at(func, a, at, deps) || self.is_deps_at(func, b, at, deps))
+                        {
+                            continue 'terms;
+                        }
+                        return false;
+                    }
+                }
+            }
+            // Derived chain too deep to prove.
+            return false;
+        }
+        true
+    }
+}
+
+fn dependents_entry(
+    dependents: &mut FxHashMap<Value, Vec<usize>>,
+    deps: &FxHashSet<Value>,
+    ci: usize,
+) {
+    for &q in deps {
+        let l = dependents.entry(q).or_default();
+        if !l.contains(&ci) {
+            l.push(ci);
+        }
+    }
+}
+
+/// `iconst` that stays non-zero after masking to its type width — the
+/// `NonNull::dangling()` (=1) a `Vec::new`/`str::new` iterator merges
+/// with the real data pointer.
+fn non_zero_const(func: &Function, v: Value) -> bool {
+    let Some(i) = func.dfg.value_def(v).inst() else {
+        return false;
+    };
+    let InstructionData::UnaryImm {
+        opcode: Opcode::Iconst,
+        imm,
+    } = func.dfg.insts[i]
+    else {
+        return false;
+    };
+    mask(imm.bits() as u64, bits(func, v).unwrap_or(64)) != 0
+}
+
+/// `nr` clones `o` — carry `derived`'s inbounds mark over, renaming the
+/// recorded base through `map`. Tombstones propagate deliberately:
+/// `NonNull` recovers the live base positionally from the clone's def.
+pub fn prop_derived(
+    dfg: &cranelift_codegen::ir::DataFlowGraph,
+    derived: &mut VMap<Value>,
+    o: Value,
+    nr: Value,
+    map: &FxHashMap<Value, Value>,
+) {
+    let Some(&b) = derived.get(&o) else {
+        return;
+    };
+    let b = dfg
+        .value_alias_dest_for_serialization(b)
+        .filter(|&d| d != Value::reserved_value())
+        .map(|d| map.get(&dfg.resolve_aliases(d)).copied().unwrap_or(d))
+        .unwrap_or(b);
+    derived.insert(nr, b);
+}
+
+fn is_iconst(func: &Function, v: Value) -> bool {
+    func.dfg.resolved_value_def(v).inst().is_some_and(|i| {
+        matches!(
+            func.dfg.insts[i],
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                ..
+            }
+        )
+    })
+}
+
+fn zero_iconst(func: &Function, v: Value) -> bool {
+    func.dfg.resolved_value_def(v).inst().is_some_and(|i| {
+        matches!(
+            func.dfg.insts[i],
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm
+            } if imm.bits() == 0
+        )
+    })
+}
+
+impl NonNull<'_> {
+    /// Debug: is `v` an admitted non-null param?
+    pub fn params_debug(&self, _func: &Function, v: Value) -> bool {
+        self.params.contains(&v)
+    }
+
+    /// Debug: `derived` base for `v`, if present.
+    pub fn derived_debug(&self, func: &Function, v: Value) -> Option<Value> {
+        self.derived.get(&func.dfg.resolve_aliases(v)).copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_nn_bb(&mut self, v: bool) {
+        self.nn_bb = v;
+    }
+
+    /// Is `v` provably non-null on edge `ei` of terminator `t`? Beyond
+    /// the context-free `is`, the edge's own condition carries facts:
+    /// `brif (icmp eq s,0)`'s false arm means `s != 0`; when `s` is a
+    /// niche select `select(k,0,x)` it also means `!k` and `x != 0`
+    /// — the shape `Option::is_none` produces at loop tails.
+    pub fn is_edge(&self, func: &Function, t: Inst, ei: usize, v: Value) -> bool {
+        let mut memo = None;
+        self.edge_aux_deps(
+            func,
+            t,
+            ei,
+            func.dfg.resolve_aliases(v),
+            0,
+            &mut FxHashSet::default(),
+            &mut memo,
+        )
+    }
+
+    fn edge_aux_deps(
+        &self,
+        func: &Function,
+        t: Inst,
+        ei: usize,
+        v: Value,
+        d: usize,
+        deps: &mut FxHashSet<Value>,
+        memo: &mut Option<FxHashMap<Value, (bool, Vec<Value>)>>,
+    ) -> bool {
+        if self.is_deps_m(func, v, deps, memo.as_mut()) {
+            return true;
+        }
+        if self.deref_step(func, t, v) {
+            return true;
+        }
+        if d > 6 {
+            return false;
+        }
+        let InstructionData::Brif { arg: c, .. } = func.dfg.insts[t] else {
+            return false;
+        };
+        let Some(ci) = func.dfg.resolved_value_def(c).inst() else {
+            return false;
+        };
+        let InstructionData::IntCompare {
+            opcode: Opcode::Icmp,
+            args: cmp_args,
+            cond,
+        } = func.dfg.insts[ci]
+        else {
+            return false;
+        };
+        if cond != IntCC::Equal && cond != IntCC::NotEqual {
+            return false;
+        }
+        // The edge must assert `s != 0` for the compared operand `s`.
+        let (s, nz) = if zero_iconst(func, cmp_args[1]) {
+            (cmp_args[0], (cond == IntCC::Equal) == (ei != 0))
+        } else if zero_iconst(func, cmp_args[0]) {
+            (cmp_args[1], (cond == IntCC::Equal) == (ei != 0))
+        } else {
+            return false;
+        };
+        // On this edge `s` is nonzero iff `nz`.
+        if !nz {
+            return false;
+        }
+        let s = func.dfg.resolve_aliases(s);
+        if v == s {
+            return true;
+        }
+        // `s = select(k, 0, x)`: nonzero gives `!k` and `x != 0`.
+        let Some(si) = func.dfg.value_def(s).inst() else {
+            return false;
+        };
+        let InstructionData::Ternary {
+            opcode: Opcode::Select,
+            args: sa,
+        } = func.dfg.insts[si]
+        else {
+            return false;
+        };
+        if !zero_iconst(func, sa[1]) {
+            return false;
+        }
+        if v == func.dfg.resolve_aliases(sa[2]) {
+            return true;
+        }
+        // `v = select(k, _, b)`: `!k` on this edge collapses v to b.
+        if let Some(vi) = func.dfg.value_def(v).inst()
+            && let InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args: va,
+            } = func.dfg.insts[vi]
+            && func.dfg.resolve_aliases(va[0]) == func.dfg.resolve_aliases(sa[0])
+        {
+            return self.edge_aux_deps(
+                func,
+                t,
+                ei,
+                func.dfg.resolve_aliases(va[2]),
+                d + 1,
+                deps,
+                memo,
+            );
+        }
+        // `v` an inbounds offset of a base that is nn on this edge.
+        if let Some(base) = self.derived_base(func, v) {
+            return self.edge_aux_deps(
+                func,
+                t,
+                ei,
+                func.dfg.resolve_aliases(base),
+                d + 1,
+                deps,
+                memo,
+            );
+        }
+        false
+    }
+
+    /// `ext` only: the two value operands of an inbounds `iadd` whose
+    /// recorded base is a tombstone.
+    fn tomb_pair(&self, func: &Function, v: Value) -> Option<(Value, Value)> {
+        self.deref.as_ref()?;
+        let mut b = *self.derived.get(&v)?;
+        for _ in 0..16 {
+            match func.dfg.value_alias_dest_for_serialization(b) {
+                Some(d) if d != Value::reserved_value() => b = d,
+                _ => break,
+            }
+        }
+        if func.dfg.value_is_real(b) {
+            return None;
+        }
+        let i = func.dfg.value_def(v).inst()?;
+        let InstructionData::Binary { opcode: Opcode::Iadd, args } = func.dfg.insts[i] else {
+            return None;
+        };
+        if is_iconst(func, args[0]) || is_iconst(func, args[1]) {
+            return None;
+        }
+        Some((func.dfg.resolve_aliases(args[0]), func.dfg.resolve_aliases(args[1])))
+    }
+
+    /// `ext` only: on the edge leaving terminator `t`, `v = x + k` (i64,
+    /// `0 < k < 2^31`) is non-null when `x + off` (`0 <= off <= k`) was
+    /// dereferenced in `t`'s block or the unique-predecessor chain above
+    /// it: that address is a valid, hence non-null, user-space address
+    /// below 2^63, so `x + k` neither wraps nor is 0. sameargs rebuilds a
+    /// loop's `p + 1` cursor without its inbounds mark (regex's
+    /// `InstPtrs` varint loop).
+    fn deref_step(&self, func: &Function, t: Inst, v: Value) -> bool {
+        let Some(deref) = &self.deref else { return false };
+        if func.dfg.value_type(v) != types::I64 {
+            return false;
+        }
+        let Some(i) = func.dfg.value_def(v).inst() else { return false };
+        let InstructionData::Binary { opcode: Opcode::Iadd, args } = func.dfg.insts[i] else {
+            return false;
+        };
+        let none = FxHashMap::default();
+        let (x, k) = match (known(func, &none, args[0]), known(func, &none, args[1])) {
+            (None, Some(k)) => (args[0], k),
+            (Some(k), None) => (args[1], k),
+            _ => return false,
+        };
+        if k == 0 || k >= 1 << 31 {
+            return false;
+        }
+        let x = func.dfg.resolve_aliases(x);
+        let Some(b) = func.layout.inst_block(t) else { return false };
+        deref
+            .get(&b)
+            .is_some_and(|l| l.iter().any(|&(a, off)| a == x && off >= 0 && off <= k as i64))
+    }
+
+    /// `derived[v]` with a live base: entries go stale as passes alias
+    /// or delete the recorded base — resolve it, and when the target is
+    /// a tombstone recover positionally from the def: an inbounds
+    /// `iadd`/`isub` offset's base is its single non-const operand.
+    fn derived_base(&self, func: &Function, v: Value) -> Option<Value> {
+        let &b = self.derived.get(&v)?;
+        // Bases are recorded at lowering and can alias later params —
+        // chase the chain to its canonical value; a tombstone (alias to
+        // the reserved slot) means the recorded base was deleted, so
+        // recover positionally below.
+        let mut b = b;
+        for _ in 0..16 {
+            match func.dfg.value_alias_dest_for_serialization(b) {
+                Some(d) if d != Value::reserved_value() => b = d,
+                _ => break,
+            }
+        }
+        if func.dfg.value_is_real(b) {
+            return Some(b);
+        }
+        let i = func.dfg.value_def(v).inst()?;
+        let InstructionData::Binary {
+            opcode: Opcode::Iadd | Opcode::Isub,
+            args,
+        } = func.dfg.insts[i]
+        else {
+            return None;
+        };
+        let mut nc = args.iter().filter(|&&a| !is_iconst(func, a));
+        let (Some(&b0), None) = (nc.next(), nc.next()) else {
+            return None;
+        };
+        Some(func.dfg.resolve_aliases(b0))
+    }
+}
+
+/// Per block, the `(address, offset)` pairs loads and stores dereference in
+/// it and in its unique-predecessor chain (up to 8 blocks up).
+fn deref_chains(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Vec<(Value, i64)>> {
+    let mut own: FxHashMap<Block, Vec<(Value, i64)>> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for i in func.layout.block_insts(b) {
+            let (a, off) = match func.dfg.insts[i] {
+                InstructionData::Load { arg, offset, .. } => (arg, i64::from(i32::from(offset))),
+                InstructionData::Store { args, offset, .. } => (args[1], i64::from(i32::from(offset))),
+                _ => continue,
+            };
+            own.entry(b).or_default().push((func.dfg.resolve_aliases(a), off));
+        }
+    }
+    let mut out = FxHashMap::default();
+    for b in func.layout.blocks() {
+        let mut l: Vec<(Value, i64)> = Vec::new();
+        let mut cur = b;
+        for _ in 0..8 {
+            if let Some(o) = own.get(&cur) {
+                l.extend_from_slice(o);
+            }
+            let mut ps = cfg.pred_iter(cur);
+            match (ps.next(), ps.next()) {
+                (Some(p), None) if p.block != b => cur = p.block,
+                _ => break,
+            }
+        }
+        if !l.is_empty() {
+            out.insert(b, l);
+        }
+    }
+    out
+}
+
+/// Addresses of symbols, thread-locals and stack slots are never null.
+fn addr_of_symbol(func: &Function, v: Value, nn_addr: bool) -> bool {
+    nn_addr
+        && func.dfg.value_def(v).inst().is_some_and(|i| {
+            matches!(
+                func.dfg.insts[i].opcode(),
+                Opcode::TlsValue | Opcode::SymbolValue | Opcode::FuncAddr | Opcode::StackAddr
+            )
+        })
+}
+
+/// Trace the `src → dst` edge at destination index `di` back through
+/// single-predecessor `jump` chains to the `brif` whose arm selects it.
+/// Returns `(guard_block, condition, taken_when_true)`.
+fn edge_guard(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    mut src: Block,
+    mut di: usize,
+) -> Option<(Block, Value, bool)> {
+    for _ in 0..64 {
+        let t = func.layout.last_inst(src)?;
+        match func.dfg.insts[t] {
+            InstructionData::Brif { arg: c, .. } => return Some((src, c, di == 0)),
+            InstructionData::Jump { .. } => {
+                // `src` falls through unconditionally; its single
+                // predecessor's terminator holds the guard.
+                let mut preds = cfg.pred_iter(src);
+                let p = preds.next()?;
+                if preds.next().is_some() {
+                    return None;
+                }
+                let dests = func.dfg.insts[p.inst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+                // If `src` is reachable on more than one arm the edge
+                // carries no arm information.
+                let mut hit = dests
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, bc)| bc.block(&func.dfg.value_lists) == src)
+                    .map(|(i, _)| i);
+                di = hit.next()?;
+                if hit.next().is_some() {
+                    return None;
+                }
+                src = p.block;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `v` is provably `!= k` (`k` masked to `v`'s width): constants,
+/// zero-extend loads, known bits (`band`/`bor`/shifts), selects whose
+/// arms both qualify, or a block param in `cand` (the greatest-fixpoint
+/// set `ne_params` computes — iterator decode pipelines route values
+/// through cycles of params like `Chars`' forwarder merges, which a
+/// plain recursion can't prove).
+fn ne_const(
+    func: &Function,
+    env: &FxHashMap<Value, u64>,
+    cand: &FxHashSet<Value>,
+    v: Value,
+    k: u64,
+    depth: u32,
+) -> bool {
+    ne_const_deps(func, env, cand, v, k, depth, &mut FxHashSet::default())
+}
+
+fn ne_const_deps(
+    func: &Function,
+    env: &FxHashMap<Value, u64>,
+    cand: &FxHashSet<Value>,
+    v: Value,
+    k: u64,
+    depth: u32,
+    deps: &mut FxHashSet<Value>,
+) -> bool {
+    if depth >= 8 {
+        return false;
+    }
+    let v = func.dfg.resolve_aliases(v);
+    let Some(w) = bits(func, v) else {
+        return false;
+    };
+    let k = mask(k, w);
+    if let Some(c) = known(func, env, v) {
+        return c != k;
+    }
+    match func.dfg.value_def(v) {
+        ValueDef::Param(..) => {
+            let ok = cand.contains(&v);
+            if ok {
+                deps.insert(v);
+            }
+            ok
+        }
+        ValueDef::Result(i, _) => match func.dfg.insts[i].opcode() {
+            // Zero-extend loads clear every bit above the load width.
+            Opcode::Uload8 => k >> 8 != 0,
+            Opcode::Uload16 => k >> 16 != 0,
+            Opcode::Uload32 => k >> 32 != 0,
+            Opcode::Select => {
+                let InstructionData::Ternary { args: sa, .. } = func.dfg.insts[i] else {
+                    return false;
+                };
+                ne_const_deps(func, env, cand, sa[1], k, depth + 1, deps)
+                    && ne_const_deps(func, env, cand, sa[2], k, depth + 1, deps)
+            }
+            _ => {
+                let kenv = FxHashMap::default();
+                let (z, o) = kbits(func, env, &kenv, v, 0);
+                ((o & !k) | (z & k)) != 0
+            }
+        },
+        _ => false,
+    }
+}
+
+/// Greatest fixpoint: block params whose every value is provably `!= k`
+/// (`k` masked per param width). Every param starts a candidate; one is
+/// dropped when a non-self incoming arg can't be shown `!= k` (self edges
+/// preserve the value, adding no candidates — cycles of provable params
+/// survive the fixpoint).
+fn ne_params(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    env: &FxHashMap<Value, u64>,
+    k: u64,
+) -> FxHashSet<Value> {
+    // Edges out of unreachable blocks contribute no runtime values; the
+    // pass runs before dead-block sweeps, so count only reachable preds.
+    let mut reach: FxHashSet<Block> = FxHashSet::default();
+    let mut work = Vec::new();
+    if let Some(e) = func.layout.entry_block() {
+        reach.insert(e);
+        work.push(e);
+    }
+    while let Some(b) = work.pop() {
+        for s in cfg.succ_iter(b) {
+            if reach.insert(s) {
+                work.push(s);
+            }
+        }
+    }
+    let mut args_of: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+    let mut cand: FxHashSet<Value> = FxHashSet::default();
+    for b in func.layout.blocks() {
+        if !reach.contains(&b) {
+            continue;
+        }
+        for (pidx, &p) in func.dfg.block_params(b).iter().enumerate() {
+            if bits(func, p).is_none() {
+                continue;
+            }
+            let mut args = Vec::new();
+            let mut ok = true;
+            for pred in cfg.pred_iter(b) {
+                if !reach.contains(&pred.block) {
+                    continue;
+                }
+                let dests = func.dfg.insts[pred.inst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+                for bc in dests {
+                    if bc.block(&func.dfg.value_lists) != b {
+                        continue;
+                    }
+                    match bc.args(&func.dfg.value_lists).nth(pidx) {
+                        Some(BlockArg::Value(a)) => {
+                            let a = func.dfg.resolve_aliases(a);
+                            if a != p {
+                                args.push(a);
+                            }
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+            // No non-self args (entry params, pure self-loops): nothing
+            // proves `!= k`.
+            if ok && !args.is_empty() {
+                args_of.insert(p, args);
+                cand.insert(p);
+            }
+        }
+    }
+    // Evaluate every candidate's args once. A param arg is proven only
+    // by its own candidacy (`ValueDef::Param => cand.contains`), so the
+    // deps a check recorded are exactly the params whose eviction
+    // re-fails it — the fixpoint is worklist propagation, not rescans.
+    let mut dependents: FxHashMap<Value, Vec<Value>> = FxHashMap::default();
+    let mut work: Vec<Value> = Vec::new();
+    for (&p, args) in &args_of {
+        let mut fail = false;
+        let mut pd: Vec<Value> = Vec::new();
+        for &a in args {
+            let mut deps = FxHashSet::default();
+            if !ne_const_deps(func, env, &cand, a, k, 0, &mut deps) {
+                fail = true;
+                break;
+            }
+            pd.extend(deps);
+        }
+        if fail {
+            work.push(p);
+        } else {
+            for q in pd {
+                dependents.entry(q).or_default().push(p);
+            }
+        }
+    }
+    while let Some(q) = work.pop() {
+        if !cand.remove(&q) {
+            continue;
+        }
+        for &p in dependents.get(&q).into_iter().flatten() {
+            work.push(p);
+        }
+    }
+    cand
+}
+
+/// Region-scoped non-null facts (`PLIRON_INLINENN`): a value is non-null
+/// inside the listed inlined regions (an inlined callee's `nonnull`
+/// param, bound to the caller's value only within the clone). A block's
+/// region comes from `block_region`, nesting from `region_parent`; a
+/// `derived` value inherits its base's facts.
+pub struct RegionNN<'a> {
+    pub facts: &'a FxHashMap<Value, Vec<pliron::context::Ptr<pliron::basic_block::BasicBlock>>>,
+    pub block_region: &'a FxHashMap<Block, pliron::context::Ptr<pliron::basic_block::BasicBlock>>,
+    pub region_parent: &'a pliron::cols::ColMap<
+        pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+        pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+    >,
+}
+
+impl RegionNN<'_> {
+    /// `v` is non-null at instructions of block `b`.
+    pub fn holds(&self, func: &Function, derived: &VMap<Value>, v: Value, b: Block) -> bool {
+        let mut v = func.dfg.resolve_aliases(v);
+        for _ in 0..8 {
+            if let Some(rs) = self.facts.get(&v) {
+                let mut r = self.block_region.get(&b).copied();
+                for _ in 0..64 {
+                    let Some(x) = r else { break };
+                    if rs.contains(&x) {
+                        return true;
+                    }
+                    r = self.region_parent.get(x).copied();
+                }
+            }
+            let Some(&base) = derived.get(&v) else { return false };
+            let Some(b) = func.dfg.try_resolve_aliases(base) else {
+                return false;
+            };
+            v = b;
+        }
+        false
+    }
+}
+
+/// `icmp eq/ne x, 0` with `x` known non-null → constant. Also the
+/// `Option<NonNull>`-niche tests `icmp eq/ne (select c, 0, X), 0` (a
+/// select is null exactly when `c` picks the zero arm) and the block-param
+/// equivalent (a param is null exactly on zero-arg edges; when all edges
+/// funnel through one `brif`, the test reduces to that condition) — the
+/// shapes `slice::Iter::next()`/`Chars` leave after Option lowering.
+/// The same select shape with a non-zero sentinel (`icmp eq/ne
+/// (select c, X, K), K` with `X` provably `!= K`, e.g. `Option<char>`'s
+/// `-1`) reduces to `!c`.
+/// The value a block param takes when its block has one predecessor
+/// whose terminator reaches it through exactly one arm (a `jump`, or one
+/// `brif` arm); `v` itself otherwise. Up to four levels.
+fn single_edge_source(func: &Function, cfg: &ControlFlowGraph, v: Value) -> Value {
+    let mut x = func.dfg.resolve_aliases(v);
+    for _ in 0..4 {
+        let ValueDef::Param(d, pidx) = func.dfg.value_def(x) else { break };
+        let mut preds = cfg.pred_iter(d);
+        let (Some(p), None) = (preds.next(), preds.next()) else { break };
+        let mut arm = None;
+        for bc in func.dfg.insts[p.inst].branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+            if bc.block(&func.dfg.value_lists) == d {
+                if arm.is_some() {
+                    return x;
+                }
+                arm = Some(*bc);
+            }
+        }
+        let Some(bc) = arm else { break };
+        let Some(BlockArg::Value(a)) = bc.args(&func.dfg.value_lists).nth(pidx) else { break };
+        let a = func.dfg.resolve_aliases(a);
+        if a == x {
+            break;
+        }
+        x = a;
+    }
+    x
+}
+
+fn fold_null_tests(func: &mut Function, nn: &NonNull, rnn: Option<&RegionNN>) -> usize {
+    let none = FxHashMap::default();
+    enum Fold {
+        Const(i64),
+        Alias(Value),
+        Neg(Value),
+        NN(Value),
+    }
+    // `brif`/`select` conditions are only guaranteed nonzero-vs-zero;
+    // an `icmp` result is canonically 0/1, so aliasing `c` directly is
+    // only safe when `c` itself is a canonical boolean.
+    let booly = |func: &Function, v: Value| {
+        func.dfg
+            .value_def(v)
+            .inst()
+            .is_some_and(|i| matches!(func.dfg.insts[i].opcode(), Opcode::Icmp | Opcode::Fcmp))
+    };
+    let sentinel = crate::pass_enabled("PLIRON_SENTINEL");
+    let paramnull = crate::pass_enabled("PLIRON_PARAMNULL");
+    // Removes the zip/enumerate per-element null test (on since
+    // 2026-11-03 with the late fold, `ivrefold2` and `looprot2`;
+    // `PLIRON_NULLSRC=0` disables). Alone it cost regex ~5% on 10-31.
+    let single_src = pliron_cfg::env_is("PLIRON_NULLSRC", "1");
+    let mut hits = Vec::new();
+    let mut cfg_lazy: Option<ControlFlowGraph> = None;
+    let mut dt_lazy: Option<DominatorTree> = None;
+    // `ne_params` sets per sentinel constant, built on first use.
+    let mut ne_sets: FxHashMap<u64, FxHashSet<Value>> = FxHashMap::default();
+    // `nn` queries run only inside this immutable scan — `hits` apply
+    // after — so one memo covers them all.
+    let mut nnm: FxHashMap<AtKey, bool> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        for inst in func.layout.block_insts(b) {
+            let InstructionData::IntCompare { cond, args, .. } = func.dfg.insts[inst] else {
+                continue;
+            };
+            if !matches!(cond, IntCC::Equal | IntCC::NotEqual)
+                || func.dfg.value_type(args[0]).is_vector()
+            {
+                continue;
+            }
+            let ne = cond == IntCC::NotEqual;
+            let (x, k) = match (known(func, &none, args[0]), known(func, &none, args[1])) {
+                (Some(k), None) => (args[1], k),
+                (None, Some(k)) => (args[0], k),
+                _ => continue,
+            };
+            let Some(w) = bits(func, x) else {
+                continue;
+            };
+            let k = mask(k, w);
+            if k != 0 {
+                if !sentinel {
+                    continue;
+                }
+                // `select c, X, K == K` iff `!c` when `X != K`;
+                // `select c, K, X` mirrors. The sentinel test of a
+                // niche-encoded enum (`Option<char>`'s `-1`).
+                let x = func.dfg.resolve_aliases(x);
+                let Some(d) = func.dfg.value_def(x).inst() else {
+                    continue;
+                };
+                let InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args: sa,
+                } = func.dfg.insts[d]
+                else {
+                    continue;
+                };
+                let cfg = cfg_lazy.get_or_insert_with(|| ControlFlowGraph::with_function(func));
+                let cand = ne_sets
+                    .entry(k)
+                    .or_insert_with(|| ne_params(func, cfg, &none, k));
+                let eq_is_c = if known(func, &none, sa[2]) == Some(k)
+                    && ne_const(func, &none, cand, sa[1], k, 0)
+                {
+                    false
+                } else if known(func, &none, sa[1]) == Some(k)
+                    && ne_const(func, &none, cand, sa[2], k, 0)
+                {
+                    true
+                } else {
+                    continue;
+                };
+                let c = sa[0];
+                if func.dfg.value_type(c) != func.dfg.value_type(func.dfg.first_result(inst)) {
+                    continue;
+                }
+                // `x == K` ⇔ `eq_is_c ? c : !c`; `ne` inverts.
+                let f = match (ne, eq_is_c) {
+                    (false, true) | (true, false) if booly(func, c) => Fold::Alias(c),
+                    (false, true) | (true, false) => Fold::NN(c),
+                    _ => Fold::Neg(c),
+                };
+                hits.push((inst, f));
+                continue;
+            }
+            // A param with exactly one incoming edge is that edge's arg
+            // (earlier folds leave the `Option` merge's second level with a
+            // single `jump` in): look through it, a few levels deep.
+            let mut x = func.dfg.resolve_aliases(x);
+            if single_src {
+                let cfg = cfg_lazy.get_or_insert_with(|| ControlFlowGraph::with_function(func));
+                for _ in 0..4 {
+                    // `select (a != 0), a, 0` is `a` (and `select (a == 0), 0, a`):
+                    // the second level of an `Option` merge after if-conversion.
+                    // `select c, a, b` with `c` a constant (through
+                    // single-edge params: the zip's `Some` flag after
+                    // edgespec) is the chosen arm.
+                    if let Some(i) = func.dfg.value_def(x).inst()
+                        && let InstructionData::Ternary { opcode: Opcode::Select, args: sa } = func.dfg.insts[i]
+                    {
+                        let (c, t, f) = (sa[0], func.dfg.resolve_aliases(sa[1]), func.dfg.resolve_aliases(sa[2]));
+                        let z = |v: Value| known(func, &none, v) == Some(0);
+                        if let Some(k) = known(func, &none, single_edge_source(func, cfg, c)) {
+                            x = if k != 0 { t } else { f };
+                            continue;
+                        }
+                        match nz_test_of(func, c, 0) {
+                            Some((a, true)) if a == t && z(f) => {
+                                x = t;
+                                continue;
+                            }
+                            Some((a, false)) if a == f && z(t) => {
+                                x = f;
+                                continue;
+                            }
+                            _ => break,
+                        }
+                    }
+                    let a = single_edge_source(func, cfg, x);
+                    if a == x {
+                        break;
+                    }
+                    x = a;
+                }
+            }
+            let ib = func.layout.inst_block(inst);
+            if pliron_cfg::tracing_on() {
+                tracing::trace!(target: "pliron::jumpthread", "nulltest {inst}: x={x} (from {}) nn={}", args[0], nn.is_m_at(func, x, ProgramPoint::Inst(inst), &mut nnm));
+            }
+            if nn.is_m_at(func, x, ProgramPoint::Inst(inst), &mut nnm) || rnn.zip(ib).is_some_and(|(r, ib)| r.holds(func, nn.derived, x, ib)) {
+                hits.push((inst, Fold::Const((cond == IntCC::NotEqual) as i64)));
+                continue;
+            }
+
+            // A block param is the other form Rust's niche layout takes
+            // after SROA: `p` merges the `Some` pointer with the `None`
+            // zero. `p == 0` iff a zero edge was taken; when every edge
+            // funnels through the same `brif c`, the test is that
+            // condition itself.
+            if paramnull
+                && let ValueDef::Param(d, pidx) = func.dfg.value_def(x)
+            {
+                let cfg = cfg_lazy.get_or_insert_with(|| ControlFlowGraph::with_function(func));
+                let mut edges: Vec<(bool, bool)> = Vec::new();
+                let mut guard: Option<(Block, Value)> = None;
+                let mut ok = true;
+                for pred in cfg.pred_iter(d) {
+                    let dests = func.dfg.insts[pred.inst]
+                        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+                    for (di, bc) in dests.iter().enumerate() {
+                        if bc.block(&func.dfg.value_lists) != d {
+                            continue;
+                        }
+                        let Some(BlockArg::Value(arg)) = bc.args(&func.dfg.value_lists).nth(pidx)
+                        else {
+                            ok = false;
+                            break;
+                        };
+                        let Some((gb, c, arm)) = edge_guard(func, cfg, pred.block, di) else {
+                            ok = false;
+                            break;
+                        };
+                        match guard {
+                            None => guard = Some((gb, c)),
+                            Some((pb, pc)) if pb == gb && pc == c => {}
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        let arg = func.dfg.resolve_aliases(arg);
+                        match known(func, &none, arg) {
+                            Some(0) => edges.push((arm, true)),
+                            Some(_) => edges.push((arm, false)),
+                            None if nn.is_m_at(func, arg, ProgramPoint::Inst(pred.inst), &mut nnm)
+                                || rnn.is_some_and(|r| r.holds(func, nn.derived, arg, pred.block)) =>
+                            {
+                                edges.push((arm, false))
+                            }
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let (mut zarm, mut saw_x) = (None, false);
+                for &(arm, is_z) in &edges {
+                    if is_z {
+                        match zarm {
+                            None => zarm = Some(arm),
+                            Some(z) if z == arm => {}
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        saw_x = true;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let Some(az) = zarm else {
+                    // Every edge passes a non-null value — only meaningful
+                    // with at least one edge (an entry param has none and
+                    // would fold vacuously).
+                    if !saw_x {
+                        continue;
+                    }
+                    hits.push((inst, Fold::Const(ne as i64)));
+                    continue;
+                };
+                if !saw_x || edges.iter().any(|&(a, z)| !z && a == az) {
+                    continue;
+                }
+                let Some((_, c)) = guard else {
+                    continue;
+                };
+                if func.dfg.value_type(c) != func.dfg.value_type(func.dfg.first_result(inst)) {
+                    continue;
+                }
+                // `c` must dominate the test: every path to the merge
+                // block passes the guard, so it does — except a guard
+                // inside the merge block itself (self-edge), where the
+                // compare could precede `c`'s def.
+                let dt = dt_lazy.get_or_insert_with(|| DominatorTree::with_function(func, cfg));
+                let pp = match func.dfg.value_def(c) {
+                    ValueDef::Result(ci, _) => ProgramPoint::Inst(ci),
+                    ValueDef::Param(cb, _) => ProgramPoint::Block(cb),
+                    _ => continue,
+                };
+                if !dt.try_dominates(pp, inst, &func.layout) {
+                    continue;
+                }
+                // `p == 0` ⇔ arm `az` taken ⇔ (az ? c : !c); `ne` inverts.
+                let f = match (ne, az) {
+                    (false, true) | (true, false) if booly(func, c) => Fold::Alias(c),
+                    (false, true) | (true, false) => Fold::NN(c),
+                    _ => Fold::Neg(c),
+                };
+                hits.push((inst, f));
+                continue;
+            }
+            let Some(d) = func.dfg.value_def(x).inst() else {
+                continue;
+            };
+            let InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args: sa,
+            } = func.dfg.insts[d]
+            else {
+                continue;
+            };
+            // `select c, 0, X == 0` iff `c` (X ≠ 0); `select c, X, 0` mirrors.
+            let t0 = known(func, &none, sa[1]) == Some(0) && nn.is_m_at(func, sa[2], ProgramPoint::Inst(inst), &mut nnm);
+            let t1 = known(func, &none, sa[2]) == Some(0) && nn.is_m_at(func, sa[1], ProgramPoint::Inst(inst), &mut nnm);
+            let c = sa[0];
+            let f = match (t0, t1, ne) {
+                (true, _, false) | (false, true, true) if booly(func, c) => Fold::Alias(c),
+                (true, _, false) | (false, true, true) => Fold::NN(c),
+                (true, _, true) | (false, true, false) => Fold::Neg(c),
+                _ => continue,
+            };
+            hits.push((inst, f));
+        }
+    }
+    let n = hits.len();
+    for (inst, f) in hits {
+        match f {
+            Fold::Const(k) => {
+                let ty = func.dfg.value_type(func.dfg.first_result(inst));
+                func.replace(inst).iconst(ty, k);
+            }
+            Fold::Alias(c) => {
+                let res = func.dfg.first_result(inst);
+                func.dfg.clear_results(inst);
+                func.layout.remove_inst(inst);
+                func.dfg.change_to_alias(res, c);
+            }
+            Fold::Neg(c) => {
+                func.replace(inst).icmp_imm_s(IntCC::Equal, c, 0);
+            }
+            Fold::NN(c) => {
+                func.replace(inst).icmp_imm_s(IntCC::NotEqual, c, 0);
+            }
+        }
+    }
+    n
+}
+
+/// `brif (icmp cc (select c, K, x), K)` where `x` isn't provably `!= K`
+/// (`fold_null_tests` can't collapse the icmp — no `NonNull` on the arm).
+/// Splitting the branch on `c` still kills the select, because every
+/// rewritten edge knows which side of `c` it is on:
+///
+/// ```text
+/// b:   brif c, K_target{sel→k_op, sel2→sentinel arm, …}, mid
+/// mid: brif (icmp cc x, k_op), T{sel→x, sel2→x-side arm, …},
+///                            F{same}
+/// ```
+///
+/// `K_target` is the edge the original brif took when `sel == K` (`T` for
+/// `eq`, `F` for `ne`). On the `mid` edges `sel` is `x`, so the original
+/// compare survives verbatim as `icmp cc x, K`; on the direct edge `sel`
+/// is `K`, so no test is needed at all. Every `select c,·,·` appearing in
+/// a rewritten edge arg folds to the arm that edge's `c`-side picks, which
+/// is what removes the whole `cmov`-cluster `Chars::next()`/
+/// `split_terminator` iterators emit per element.
+///
+/// `sel` uses inside an outcome block can fold too: `K_target` sees
+/// `sel == K` on every path into it (`x == K` on the mid edge is the same
+/// value), `X_target` sees `sel == x` — provided the block had no other
+/// preds, so `b`/`mid` alone decide entry.
+pub fn split_niche_tests(func: &mut Function, an: &crate::pipeline::Analysis) -> usize {
+    struct Plan {
+        b: Block,
+        term: Inst,
+        icmp_inst: Inst,
+        sel: Value,
+        sel_inst: Inst,
+        cond: IntCC,
+        c: Value,
+        k_op: Value,
+        xop: Value,
+        sent: usize,
+        k_target: Block,
+        x_target: Block,
+        in_k: Vec<Inst>,
+        in_x: Vec<Inst>,
+        kargs: Vec<BlockArg>,
+        xargs_t: Vec<BlockArg>,
+        xargs_f: Vec<BlockArg>,
+    }
+    let none = FxHashMap::default();
+    let mut changed = 0usize;
+    loop {
+        // Alias-resolved operand → every inst (incl. edge args) using it.
+        let mut uses: FxHashMap<Value, Vec<Inst>> = FxHashMap::default();
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                for v in func.dfg.inst_values(i) {
+                    uses.entry(func.dfg.resolve_aliases(v)).or_default().push(i);
+                }
+            }
+        }
+        let cfg = ControlFlowGraph::with_function(func);
+        // Collect every viable split against the pre-apply state, then
+        // apply them in a batch — the old loop rebuilt `uses` and the
+        // cfg per accepted split. A plan goes stale if an earlier apply
+        // rewrote one of its insts or gave a target block a new `mid`
+        // pred its `sole_pred` check can't see, so those are deferred to
+        // the next `outer` round.
+        let mut plans: Vec<Plan> = Vec::new();
+        for b in func.layout.blocks() {
+            let Some(term) = func.layout.last_inst(b) else {
+                continue;
+            };
+            let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[term] else {
+                continue;
+            };
+            let Some(icmp_inst) = func.dfg.resolved_value_def(arg).inst() else {
+                continue;
+            };
+            let InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                cond,
+                args: iargs,
+            } = func.dfg.insts[icmp_inst]
+            else {
+                continue;
+            };
+            if !matches!(cond, IntCC::Equal | IntCC::NotEqual)
+                || func.dfg.value_type(iargs[0]).is_vector()
+            {
+                continue;
+            }
+            // The icmp must be a single-use test feeding this brif; a
+            // shared compare would keep `sel` alive for its other use.
+            if !matches!(
+                uses.get(&func.dfg.resolve_aliases(arg))
+                    .map(|v| v.as_slice()),
+                Some([t]) if *t == term
+            ) {
+                continue;
+            }
+            // Normalize `x` to the select and `k` to the const arm.
+            let (x, k) = match (known(func, &none, iargs[0]), known(func, &none, iargs[1])) {
+                (Some(k), None) => (iargs[1], k),
+                (None, Some(k)) => (iargs[0], k),
+                _ => continue,
+            };
+            let sel = func.dfg.resolve_aliases(x);
+            let Some(sel_inst) = func.dfg.value_def(sel).inst() else {
+                continue;
+            };
+            let InstructionData::Ternary {
+                opcode: Opcode::Select,
+                args: sa,
+            } = func.dfg.insts[sel_inst]
+            else {
+                continue;
+            };
+            let Some(w) = bits(func, sel) else {
+                continue;
+            };
+            let k = mask(k, w);
+            // Which select arm is the sentinel constant? `sel == K` on
+            // that side of `c`; `x` is the other arm.
+            let sent = if known(func, &none, sa[1]) == Some(k) {
+                1
+            } else if known(func, &none, sa[2]) == Some(k) {
+                2
+            } else {
+                continue;
+            };
+            let (c, k_op, xop) = (sa[0], sa[sent], sa[3 - sent]);
+            // Nested niche selects (`select (icmp sel,0), K, sel` — the
+            // `Option<Option>` chains in `split_terminator`) would just
+            // re-create this test one level down in `mid`: the inner
+            // select stays, we add a block, and the next iteration splits
+            // again. Require `x` to be a plain value.
+            if let Some(xi) = func.dfg.resolved_value_def(xop).inst()
+                && matches!(
+                    func.dfg.insts[xi],
+                    InstructionData::Ternary {
+                        opcode: Opcode::Select,
+                        ..
+                    }
+                )
+            {
+                continue;
+            }
+            // `K_target`: original edge taken when `sel == K`.
+            let (k_call, x_call) = if cond == IntCC::Equal {
+                (&blocks[0], &blocks[1])
+            } else {
+                (&blocks[1], &blocks[0])
+            };
+            let (k_target, x_target) = (
+                k_call.block(&func.dfg.value_lists),
+                x_call.block(&func.dfg.value_lists),
+            );
+            if k_target == x_target || k_target == b || x_target == b {
+                continue;
+            }
+            // `sel` may only be used by the icmp, by this brif's edge
+            // args, or inside an outcome block whose only pred is `b`
+            // (so the rewrite leaves `b`/`mid` as its sole deciders).
+            let mut in_k = Vec::new();
+            let mut in_x = Vec::new();
+            let mut ok = true;
+            for &u in uses.get(&sel).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if u == icmp_inst || u == term {
+                    continue;
+                }
+                let Some(ub) = func.layout.inst_block(u) else {
+                    ok = false;
+                    break;
+                };
+                if ub == k_target {
+                    in_k.push(u);
+                } else if ub == x_target {
+                    in_x.push(u);
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let sole_pred = |d: Block| {
+                let mut n = 0;
+                for p in cfg.pred_iter(d) {
+                    if p.block != b {
+                        return false;
+                    }
+                    n += 1;
+                }
+                n == 1
+            };
+            if (!in_k.is_empty() && !sole_pred(k_target))
+                || (!in_x.is_empty() && !sole_pred(x_target))
+            {
+                continue;
+            }
+            // Measured: splitting pays when `sel` is purely test+dispatch
+            // (chars_*/str iterators — the select only existed to encode
+            // `None`, so every use folds and the cmov cluster dies). When
+            // `sel` feeds real work inside an outcome block (tokenize's
+            // `uload8`), the extra block boundary on the hot path costs
+            // more than the removed cmov saves (~35% regression). Opt back
+            // in with `PLIRON_SELTEST_INUSE=1`.
+            if (!in_k.is_empty() || !in_x.is_empty())
+                && !crate::config::config().is("PLIRON_SELTEST_INUSE", "1")
+            {
+                continue;
+            }
+            // `k_op`/`xop` must dominate their new use sites: both are
+            // operands of the select in `b`'s test chain — defined at or
+            // before the select, so they reach `mid` and both targets.
+            // Build the rewritten edges.
+            let kargs: Vec<BlockArg> = k_call
+                .args(&func.dfg.value_lists)
+                .map(|a| fold_sel_arg(func, a, c, sent))
+                .collect();
+            let xargs_t: Vec<BlockArg> = blocks[0]
+                .args(&func.dfg.value_lists)
+                .map(|a| fold_sel_arg(func, a, c, 3 - sent))
+                .collect();
+            let xargs_f: Vec<BlockArg> = blocks[1]
+                .args(&func.dfg.value_lists)
+                .map(|a| fold_sel_arg(func, a, c, 3 - sent))
+                .collect();
+            plans.push(Plan {
+                b,
+                term,
+                icmp_inst,
+                sel,
+                sel_inst,
+                cond,
+                c,
+                k_op,
+                xop,
+                sent,
+                k_target,
+                x_target,
+                in_k,
+                in_x,
+                kargs,
+                xargs_t,
+                xargs_f,
+            });
+        }
+        // Defer any plan whose key insts an earlier apply rewrote or
+        // removed, or whose targets gained a `mid` pred — both make the
+        // plan's collected facts stale. The use index is refetched each
+        // round anyway for the dead-select sweep; here it needs one
+        // fetch for all of them.
+        let mut mutated: FxHashSet<Inst> = FxHashSet::default();
+        let mut claimed: FxHashSet<Block> = FxHashSet::default();
+        let mut dead_sweep: Vec<Inst> = Vec::new();
+        let prev = changed;
+        for pl in plans {
+            if claimed.contains(&pl.k_target)
+                || claimed.contains(&pl.x_target)
+                || [pl.term, pl.icmp_inst, pl.sel_inst]
+                    .into_iter()
+                    .chain(pl.in_k.iter().copied())
+                    .chain(pl.in_x.iter().copied())
+                    .any(|i| mutated.contains(&i))
+            {
+                continue;
+            }
+            claimed.extend([pl.k_target, pl.x_target]);
+            mutated.extend(pl.in_k.iter().copied().chain(pl.in_x.iter().copied()));
+            mutated.extend([pl.term, pl.icmp_inst, pl.sel_inst]);
+            let Plan {
+                b,
+                term,
+                icmp_inst,
+                sel,
+                sel_inst,
+                cond,
+                c,
+                k_op,
+                xop,
+                sent,
+                k_target,
+                x_target,
+                in_k,
+                in_x,
+                kargs,
+                xargs_t,
+                xargs_f,
+            } = pl;
+            // Rewrite in-block uses before touching edges: `k_target`
+            // sees `sel == k_op`, `x_target` sees `sel == xop`.
+            for (us, repl) in [(&in_k, k_op), (&in_x, xop)] {
+                for &u in us {
+                    let repl_map: FxHashMap<Value, Value> = func
+                        .dfg
+                        .inst_values(u)
+                        .filter(|&v| func.dfg.resolve_aliases(v) == sel)
+                        .map(|v| (v, repl))
+                        .collect();
+                    func.dfg
+                        .map_inst_values(u, |v| repl_map.get(&v).copied().unwrap_or(v));
+                }
+            }
+            if pliron_cfg::tracing_on() {
+                tracing::debug!(
+                    target: "pliron::jumpthread",
+                    "seltest {b}: sel={sel} c={c} in_k={} in_x={} kargs={} xt={} xf={}",
+                    in_k.len(),
+                    in_x.len(),
+                    kargs.len(),
+                    xargs_t.len(),
+                    xargs_f.len()
+                )
+            };
+            // Splice `mid` in and re-point `b`'s brif at it. `blocks[0]`
+            // is the cond-true arm: `k_target` when `cond == Equal`.
+            let (t_blk, f_blk) = if cond == IntCC::Equal {
+                (k_target, x_target)
+            } else {
+                (x_target, k_target)
+            };
+            let mid = func.dfg.make_block();
+            func.layout.insert_block_after(mid, b);
+            {
+                let mut pos = FuncCursor::new(func).at_bottom(mid);
+                let t = pos.ins().icmp(cond, xop, k_op);
+                pos.ins().brif(t, t_blk, &xargs_t, f_blk, &xargs_f);
+            }
+            func.layout.remove_inst(term);
+            let mut pos = FuncCursor::new(func).at_bottom(b);
+            if sent == 1 {
+                pos.ins().brif(c, k_target, &kargs, mid, &[]);
+            } else {
+                pos.ins().brif(c, mid, &[], k_target, &kargs);
+            }
+            // `sel`/icmp are dead now (all uses rewritten); the other
+            // `select c`s folded out of the edge args may be too — queue
+            // them for the batched sweep below.
+            func.dfg.clear_results(icmp_inst);
+            func.layout.remove_inst(icmp_inst);
+            dead_sweep.push(sel_inst);
+            for i in func.layout.block_insts(b).collect::<Vec<_>>() {
+                if i == sel_inst {
+                    continue;
+                }
+                if let InstructionData::Ternary {
+                    opcode: Opcode::Select,
+                    args,
+                } = func.dfg.insts[i]
+                {
+                    if func.dfg.resolve_aliases(args[0]) == func.dfg.resolve_aliases(c) {
+                        dead_sweep.push(i);
+                    }
+                }
+            }
+            changed += 1;
+        }
+        if changed == prev {
+            break;
+        }
+        // One use index for the whole sweep: removals only delete
+        // uses, so a stale entry just skips a removal the next
+        // outer round catches — a per-inst whole-function scan
+        // was O(dead × fn). Shared snapshot: applies that added insts
+        // changed `num_insts` so `an.uses` rebuilds; a same-shape
+        // refetch may serve a stale snapshot, which the comment
+        // above already tolerates.
+        let uses = an.uses(func);
+        for di in dead_sweep {
+            if func.layout.inst_block(di).is_none() {
+                continue;
+            }
+            let r = func.dfg.resolve_aliases(func.dfg.first_result(di));
+            if uses.is_used(r) {
+                continue;
+            }
+            func.dfg.clear_results(di);
+            func.layout.remove_inst(di);
+        }
+    }
+    changed
+}
+
+/// On a rewritten niche-split edge `c`'s side is known: any
+/// `select c, a, b` in the args folds to arm `side` (1 or 2).
+fn fold_sel_arg(func: &Function, a: BlockArg, c: Value, side: usize) -> BlockArg {
+    let BlockArg::Value(a) = a else {
+        return a;
+    };
+    let r = func.dfg.resolve_aliases(a);
+    let Some(i) = func.dfg.value_def(r).inst() else {
+        return BlockArg::Value(a);
+    };
+    let InstructionData::Ternary {
+        opcode: Opcode::Select,
+        args: sa,
+    } = func.dfg.insts[i]
+    else {
+        return BlockArg::Value(a);
+    };
+    if func.dfg.resolve_aliases(sa[0]) == func.dfg.resolve_aliases(c) {
+        BlockArg::Value(sa[side])
+    } else {
+        BlockArg::Value(a)
+    }
+}
+
+enum Arg {
+    V(Value),
+    K(u64, Type),
+    /// Clone of a merge-block body inst, args already rewritten to `Arg`s
+    /// resolved in the pred — materialized before `pinst` at apply time.
+    R(Inst, Vec<Arg>),
+}
+
+/// Resolve `v` (a merge-block value) to something usable on the threaded
+/// edge: an incoming edge arg, a known constant, a cloneable pure body
+/// inst (bounded depth), or the value itself if its def dominates `pinst`.
+fn map_val(
+    func: &Function,
+    argv: &FxHashMap<Value, Value>,
+    body_vals: &FxHashSet<Value>,
+    env: &FxHashMap<Value, u64>,
+    dom: &DominatorTree,
+    pinst: Inst,
+    v: Value,
+    out: &mut Vec<Arg>,
+    depth: usize,
+) -> bool {
+    if let Some(&pv) = argv.get(&v) {
+        out.push(Arg::V(pv));
+        return true;
+    }
+    if !body_vals.contains(&v) {
+        // An external value is a legal edge arg only if its def
+        // dominates the threaded branch — dominating `b` is not enough
+        // (`pinst` may have arms that never reach `b`'s dominator).
+        let pp = match func.dfg.value_def(v) {
+            ValueDef::Result(di, _) => ProgramPoint::Inst(di),
+            ValueDef::Param(db, _) => ProgramPoint::Block(db),
+            _ => return false,
+        };
+        if !dom.try_dominates(pp, pinst, &func.layout) {
+            return false;
+        }
+        out.push(Arg::V(v));
+        return true;
+    }
+    // `env` tracks 64 bits; it can't describe a wider param (and `iconst`
+    // tops out at i64).
+    if let Some(&k) = env.get(&v) {
+        if func.dfg.value_type(v).bits() <= 64 {
+            out.push(Arg::K(k, func.dfg.value_type(v)));
+            return true;
+        }
+        return false;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let Some(di) = func.dfg.value_def(v).inst() else {
+        return false;
+    };
+    if !pure_op(func, di) || func.dfg.inst_results(di).len() != 1 {
+        return false;
+    }
+    let args: Vec<Value> = func.dfg.inst_args(di).to_vec();
+    let mut subs = Vec::with_capacity(args.len());
+    for a in args {
+        let a = func.dfg.resolve_aliases(a);
+        let mut tmp = Vec::with_capacity(1);
+        if !map_val(
+            func,
+            argv,
+            body_vals,
+            env,
+            dom,
+            pinst,
+            a,
+            &mut tmp,
+            depth - 1,
+        ) {
+            return false;
+        }
+        subs.push(tmp.pop().unwrap());
+    }
+    out.push(Arg::R(di, subs));
+    true
+}
+
+/// Emit an `Arg` before `pinst`, cloning remat insts in order.
+fn emit_arg(func: &mut Function, pinst: Inst, a: &Arg) -> Value {
+    match a {
+        Arg::V(v) => *v,
+        Arg::K(k, ty) => FuncCursor::new(func)
+            .at_inst(pinst)
+            .ins()
+            .iconst(*ty, *k as i64),
+        Arg::R(di, subs) => {
+            let vals: Vec<Value> = subs.iter().map(|s| emit_arg(func, pinst, s)).collect();
+            let ni = func.dfg.clone_inst(*di);
+            // `-g`: the copy is the same source operation.
+            func.set_srcloc(ni, func.srcloc(*di));
+            func.dfg.overwrite_inst_values(ni, vals.into_iter());
+            func.layout.insert_inst(ni, pinst);
+            func.dfg.first_result(ni)
+        }
+    }
+}
+
+/// A retargeted edge `pinst`'s destination `di` → `s`. With `repair`, the values
+/// of the bypassed merge block that are used from `s` on become new params of
+/// `s` (fed by the merge block's own branch `term`/`ti` and by the new edge).
+struct Edit {
+    pinst: Inst,
+    di: usize,
+    s: Block,
+    args: Vec<Arg>,
+    /// (merge term, arm, needed exports, region, other edges into `s`
+    /// that must also feed the new params — (pred inst, dest idx)).
+    repair: Option<(Inst, usize, Vec<Value>, Vec<Block>, Vec<(Inst, usize)>)>,
+    /// Resolved args for each `repair` extra edge, filled in by the
+    /// post-edit dominance validation (parallel to the `extra` list).
+    eargs: Vec<Vec<Arg>>,
+}
+
+/// Blocks reachable from the entry without passing `defb`, in the graph
+/// where each planned edit's `pinst -> s` edge already exists (the old
+/// `pinst -> b` edges are kept too — an over-approximation that can only
+/// reject, never accept wrongly).
+fn reach_avoid(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    new_succs: &FxHashMap<Block, Vec<Block>>,
+    defb: Block,
+) -> FxHashSet<Block> {
+    let mut seen = FxHashSet::default();
+    let Some(entry) = func.layout.entry_block() else {
+        return seen;
+    };
+    if entry == defb {
+        return seen;
+    }
+    seen.insert(entry);
+    let mut work = vec![entry];
+    while let Some(x) = work.pop() {
+        let extra = new_succs.get(&x).into_iter().flatten().copied();
+        for nx in cfg.succ_iter(x).chain(extra) {
+            if nx != defb && seen.insert(nx) {
+                work.push(nx);
+            }
+        }
+    }
+    seen
+}
+
+/// Constants a block's body computes without any incoming-edge context
+/// (`iconst`s and pure folds of them). Those are the only merge values
+/// safe to rematerialize on a repair edge when the original def stops
+/// dominating it — a fresh `iconst` dominates every use by construction.
+fn const_env(func: &Function, b: Block) -> FxHashMap<Value, u64> {
+    let mut env = FxHashMap::default();
+    let nz = |_: Value| false;
+    let rg = |_: Value| None;
+    for i in func.layout.block_insts(b) {
+        if !pure_op(func, i) {
+            continue;
+        }
+        if let Some(c) = eval(func, &env, &nz, &rg, i) {
+            env.insert(func.dfg.first_result(i), c);
+        }
+    }
+    env
+}
+
+/// Blocks reachable from `s` without entering `b`, or None past MAX_WALK.
+fn region(cfg: &ControlFlowGraph, b: Block, s: Block) -> Option<Vec<Block>> {
+    let mut seen: FxHashSet<Block> = FxHashSet::default();
+    let mut order = Vec::new();
+    let mut work = vec![s];
+    while let Some(x) = work.pop() {
+        if x == b || !seen.insert(x) {
+            continue;
+        }
+        order.push(x);
+        if order.len() > MAX_WALK {
+            return None;
+        }
+        work.extend(cfg.succ_iter(x));
+    }
+    Some(order)
+}
+
+/// Thread one round; returns the number of edges retargeted.
+///
+/// `evict` lets a caller keep a `NonNull` across rounds: it collects the
+/// blocks whose in-edges changed — an applied edit retargets `e.pinst`'s
+/// edge onto `e.s`, and a `repair` additionally appends args onto the
+/// `term`/`extra`/`reg` edges — so every touched target's param proofs
+/// are stale. Fresh params appended by a repair are simply absent from
+/// the kept set (unproven) — sound, just less proven.
+pub(crate) fn round<'a>(
+    func: &mut Function,
+    loads: &'a FxHashSet<Value>,
+    derived: &'a VMap<Value>,
+    sites: &'a SiteFacts,
+    nn: &mut Option<NonNull<'a>>,
+    domcond: bool,
+    cfg: &ControlFlowGraph,
+    domtree: &DominatorTree,
+    mut evict: Option<&mut FxHashSet<Block>>,
+) -> usize {
+    // Both whole-function indexes are consulted only once a candidate
+    // edge actually threads — lazy so a no-work round is a linear scan.
+    let mut users_l: Option<FxHashMap<Block, FxHashSet<Block>>> = None;
+    let mut facts_l: Option<FxHashMap<Block, Cmp>> = None;
+    let entry = func.layout.entry_block();
+    let kb_on = crate::pass_enabled("PLIRON_KBITS");
+    let range2 = crate::pass_enabled("PLIRON_RANGE2");
+    let bodyk = crate::pass_enabled("PLIRON_BODYK");
+    let stale_chk = crate::pass_enabled("PLIRON_JTSTALE");
+    let dbg = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
+    let def_block = |v: Value| match func.dfg.value_def(v) {
+        ValueDef::Result(i, _) => func.layout.inst_block(i),
+        ValueDef::Param(b, _) => Some(b),
+        _ => None,
+    };
+    let mut edits: Vec<Edit> = Vec::new();
+    let mut touched: FxHashSet<Inst> = FxHashSet::default();
+    // Blocks taking part in any edit, and blocks no later edit may touch.
+    let mut seen: FxHashSet<Block> = FxHashSet::default();
+    let mut locked: FxHashSet<Block> = FxHashSet::default();
+    // `region(b, s)` and `facts_at(pblock)` are stable for the whole edit-
+    // collection phase (the cfg is immutable until edits apply below), but
+    // were being recomputed per predecessor edge — a merge block has only
+    // two `s` candidates yet one walk per pred. Memoize per round.
+    let mut regions: FxHashMap<(Block, Block), Option<Vec<Block>>> = FxHashMap::default();
+    let mut fact_memo: FxHashMap<Block, Vec<Cmp>> = FxHashMap::default();
+    // Per-edge scratch, cleared and reused across (pred, dest) pairs —
+    // these used to be five fresh HashMap allocations per edge.
+    let mut args: Vec<BlockArg> = Vec::new();
+    let mut env: FxHashMap<Value, u64> = FxHashMap::default();
+    let mut argv: FxHashMap<Value, Value> = FxHashMap::default();
+    let mut pn: FxHashSet<Value> = FxHashSet::default();
+    let mut kenv: KBits = FxHashMap::default();
+    let mut prange: FxHashMap<Value, (u64, u64)> = FxHashMap::default();
+    // `NonNull::is_m` memo — valid for the whole collection phase since
+    // `func` is only rewritten once `edits` apply below. RefCell so the
+    // `&dyn Fn` `nz` closure can share it.
+    let nnm = std::cell::RefCell::new(FxHashMap::<Value, bool>::default());
+    let prof_r = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
+    let (mut n_blk, mut n_gate, mut n_edge, mut n_eval) = (0usize, 0usize, 0usize, 0usize);
+    for b in func.layout.blocks() {
+        n_blk += 1;
+        if Some(b) == entry || locked.contains(&b) {
+            continue;
+        }
+        let Some(term) = func.layout.last_inst(b) else {
+            continue;
+        };
+        // All but the terminator, in order — recreated on each use to
+        // skip the per-block `Vec` (this loop runs every round).
+        let body = || func.layout.block_insts(b).filter(|&i| i != term);
+        // Cheapest gate first: a non-`brif` terminator rejects the block
+        // before any body scan — most blocks end in `jump`/`return`.
+        let InstructionData::Brif {
+            arg: cond,
+            blocks: targets,
+            ..
+        } = func.dfg.insts[term]
+        else {
+            continue;
+        };
+        // `iconst`s cost nothing to evaluate through the env map; budget
+        // the real ops only (long niche-merge chains — `Option<char>`
+        // flag test + sentinel compare — otherwise exceed MAX_BODY).
+        // Count and purity share one scan.
+        let mut real = 0usize;
+        if !body().all(|i| {
+            real += usize::from(
+                !bodyk
+                    || !matches!(
+                        func.dfg.insts[i],
+                        InstructionData::UnaryImm {
+                            opcode: Opcode::Iconst,
+                            ..
+                        }
+                    ),
+            );
+            pure_op(func, i)
+        }) || real > MAX_BODY
+        {
+            continue;
+        }
+        n_gate += 1;
+
+        let params = func.dfg.block_params(b);
+        let mut body_vals_l: Option<FxHashSet<Value>> = None;
+        for pred in cfg.pred_iter(b) {
+            let (pinst, pblock) = (pred.inst, pred.block);
+            if pblock == b || touched.contains(&pinst) || locked.contains(&pblock) {
+                continue;
+            }
+            if !matches!(func.dfg.insts[pinst].opcode(), Opcode::Jump | Opcode::Brif) {
+                continue;
+            }
+            let dests = func.dfg.insts[pinst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+            for (di, bc) in dests.iter().enumerate() {
+                if bc.block(&func.dfg.value_lists) != b {
+                    continue;
+                }
+                n_edge += 1;
+                args.clear();
+                args.extend(bc.args(&func.dfg.value_lists));
+                if args.len() != params.len() {
+                    continue;
+                }
+                // A real candidate edge — the first one per round builds
+                // the NonNull fixpoint; blocks failing the gates above
+                // never reach it.
+                let nnr = nn.get_or_insert_with(|| {
+                    let t = std::time::Instant::now();
+                    let r = NonNull::with_sites(func, cfg, loads, derived, sites);
+                    let el = t.elapsed();
+                    if pliron_cfg::tracing_on()
+                        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO)
+                        && el.as_millis() > 0
+                    {
+                        tracing::info!(target: "pliron::jumpthread", "    nnnew {el:?}");
+                    }
+                    r
+                });
+                env.clear();
+                argv.clear();
+                pn.clear();
+                let mut ok = true;
+                // The args are values of the *pred's* scope. On a back edge
+                // into a loop header they can be the header's own params
+                // (the previous iteration's bindings), so they must not be
+                // looked up in `env`, which holds this edge's new
+                // bindings (`known(.., &env, v)` read arg `v1019` as the
+                // freshly bound `v1019 = 0`).
+                let outer: FxHashMap<Value, u64> = FxHashMap::default();
+                for (&p, a) in params.iter().zip(&args) {
+                    let BlockArg::Value(v) = *a else {
+                        ok = false;
+                        break;
+                    };
+                    let v = func.dfg.resolve_aliases(v);
+                    // A back-edge arg defined in `b` itself (another of its
+                    // params, or a body value) is this trip's binding: the
+                    // threaded edge skips `b`, so from the next trip on it
+                    // would carry the value `b` last bound — the entry's.
+                    // indexmap's `erase_indices` zip rotated `old`/`new`
+                    // through the merge block's params and looped on
+                    // `start + 1` forever. A param passed back to itself
+                    // is the one safe case (`b` would rebind it unchanged).
+                    if stale_chk && v != p && def_block(v) == Some(b) {
+                        ok = false;
+                        break;
+                    }
+                    argv.insert(p, v);
+                    if let Some(c) = known(func, &outer, v) {
+                        env.insert(p, c);
+                    } else if nnr.is_m(func, v, &mut nnm.borrow_mut()) {
+                        pn.insert(p);
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                // Known bits of non-constant incoming args (e.g. a packed `Option` tag).
+                kenv.clear();
+                if kb_on {
+                    let none = FxHashMap::default();
+                    for (&p, &v) in &argv {
+                        if !env.contains_key(&p) {
+                            let k = kbits(func, &outer, &none, v, 0);
+                            if k != (0, 0) {
+                                kenv.insert(p, k);
+                            }
+                        }
+                    }
+                }
+                let nz = |v: Value| {
+                    let v = func.dfg.resolve_aliases(v);
+                    nnr.is_m(func, v, &mut nnm.borrow_mut()) || pn.contains(&v)
+                };
+                // Ranges of the incoming args implied by branches dominating the pred.
+                prange.clear();
+                let fs = fact_memo.entry(pblock).or_insert_with(|| {
+                    facts_at(
+                        &domtree,
+                        facts_l.get_or_insert_with(|| {
+                            if domcond {
+                                edge_facts(func, cfg)
+                            } else {
+                                FxHashMap::default()
+                            }
+                        }),
+                        pblock,
+                    )
+                });
+                if !fs.is_empty() {
+                    for (&p, &v) in &argv {
+                        if !env.contains_key(&p)
+                            && let Some(r) = urange(func, &fs, v, 0, range2)
+                        {
+                            prange.insert(p, r);
+                        }
+                    }
+                }
+                let rg = |v: Value| prange.get(&func.dfg.resolve_aliases(v)).copied();
+                for i in body() {
+                    if let Some(c) =
+                        eval(func, &env, &nz, &rg, i).or_else(|| kfold(func, &env, &kenv, i))
+                    {
+                        env.insert(func.dfg.first_result(i), c);
+                    }
+                }
+                n_eval += 1;
+                let taken = match known(func, &env, cond) {
+                    Some(c) => c != 0,
+                    None if nz(cond) => true,
+                    None if !kenv.is_empty() && kbits(func, &env, &kenv, cond, 0).1 != 0 => true,
+                    None => continue,
+                };
+                if dbg {
+                    if pliron_cfg::tracing_on() {
+                        tracing::debug!(target: "pliron::jumpthread",
+                            "jt take {pblock}->{b}->{s_tag} cond={cond} env={env:?} pn={pn:?} kenv={kenv:?} prange={prange:?} taken={taken}",
+                            s_tag = if taken { "T" } else { "F" }
+                        )
+                    };
+                    if let Some(di) = func.dfg.value_def(cond).inst() {
+                        for v in func.dfg.inst_args(di) {
+                            let r = func.dfg.resolve_aliases(*v);
+                            if pliron_cfg::tracing_on() {
+                                tracing::debug!(target: "pliron::jumpthread",
+                                    "  jt arg {r}: loads={} params={} derived={:?}",
+                                    nnr.loads.contains(&r),
+                                    nnr.params.contains(&r),
+                                    nnr.derived.get(&r),
+                                )
+                            };
+                        }
+                    }
+                }
+                let ti = if taken { 0 } else { 1 };
+                let t = targets[ti];
+                let s = t.block(&func.dfg.value_lists);
+                if s == b || locked.contains(&s) {
+                    if dbg {
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::jumpthread", "jt skip {b}->{s}: self/locked")
+                        };
+                    }
+                    continue;
+                }
+                let Some(reg) = regions
+                    .entry((b, s))
+                    .or_insert_with(|| region(&cfg, b, s))
+                    .clone()
+                else {
+                    if dbg {
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::jumpthread", "jt skip {b}->{s}: region>MAX_WALK")
+                        };
+                    }
+                    continue;
+                };
+                // B's values used from `s` on (resolved), in first-use order.
+                let mut needed: Vec<Value> = Vec::new();
+                if let Some(bu) = users_l.get_or_insert_with(|| users(func)).get(&b)
+                    && reg.iter().any(|x| bu.contains(x))
+                {
+                    for &x in &reg {
+                        if !bu.contains(&x) {
+                            continue;
+                        }
+                        for inst in func.layout.block_insts(x) {
+                            for v in func.dfg.inst_values(inst) {
+                                let r = func.dfg.resolve_aliases(v);
+                                if def_block(r) == Some(b) && !needed.contains(&r) {
+                                    needed.push(r);
+                                }
+                            }
+                        }
+                    }
+                }
+                let repair = !needed.is_empty();
+                // `s`'s other incoming edges (beyond the merge arm) must
+                // also feed the new params: append the needed b-values
+                // verbatim — legal when each def dominates that pred's
+                // terminator (true for loop-carried exports like
+                // tokenize's v1899, and always for the merge term's own
+                // second arm when both arms land on `s`).
+                let mut extra: Vec<(Inst, usize)> = Vec::new();
+                if repair {
+                    let mut okr = true;
+                    for pr in cfg.pred_iter(s) {
+                        let q = pr.inst;
+                        let qdests = func.dfg.insts[q]
+                            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+                        for (dj, qbc) in qdests.iter().enumerate() {
+                            if qbc.block(&func.dfg.value_lists) != s || (q == term && dj == ti) {
+                                continue;
+                            }
+                            for &w in &needed {
+                                let pp = match func.dfg.value_def(w) {
+                                    ValueDef::Result(di, _) => ProgramPoint::Inst(di),
+                                    ValueDef::Param(db, _) => ProgramPoint::Block(db),
+                                    _ => {
+                                        okr = false;
+                                        break;
+                                    }
+                                };
+                                if !domtree.try_dominates(pp, q, &func.layout) {
+                                    okr = false;
+                                    break;
+                                }
+                            }
+                            if !okr {
+                                break;
+                            }
+                            extra.push((q, dj));
+                        }
+                        if !okr {
+                            break;
+                        }
+                    }
+                    if !okr {
+                        if dbg {
+                            if pliron_cfg::tracing_on() {
+                                tracing::debug!(target: "pliron::jumpthread", "jt skip {b}->{s} from {pblock}: extra edge can't supply exports")
+                            };
+                        }
+                        continue;
+                    }
+                }
+                if repair
+                    && (seen.contains(&b)
+                        || seen.contains(&s)
+                        || seen.contains(&pblock)
+                        || reg.iter().any(|x| seen.contains(x))
+                        || !reg
+                            .iter()
+                            .filter(|x| {
+                                users_l
+                                    .get_or_insert_with(|| users(func))
+                                    .get(&b)
+                                    .is_some_and(|bu| bu.contains(x))
+                            })
+                            .all(|&x| domtree.block_dominates(s, x)))
+                {
+                    if dbg {
+                        if pliron_cfg::tracing_on() {
+                            tracing::debug!(target: "pliron::jumpthread",
+                                "jt skip {b}->{s} from {pblock}: repair seen={}/{}/{} regseen={} dom={}",
+                                seen.contains(&b),
+                                seen.contains(&s),
+                                seen.contains(&pblock),
+                                reg.iter().any(|x| seen.contains(x)),
+                                reg.iter()
+                                    .filter(|x| {
+                                    users_l
+                                        .get_or_insert_with(|| users(func))
+                                        .get(&b)
+                                        .is_some_and(|bu| bu.contains(x))
+                                })
+                                    .all(|&x| domtree.block_dominates(s, x))
+                            )
+                        };
+                    }
+                    continue;
+                }
+                let mut new = Vec::new();
+                let body_vals = body_vals_l.get_or_insert_with(|| {
+                    body().map(|i| func.dfg.first_result(i)).collect()
+                });
+                for a in t.args(&func.dfg.value_lists) {
+                    let BlockArg::Value(v) = a else {
+                        ok = false;
+                        break;
+                    };
+                    ok &= map_val(
+                        func,
+                        &argv,
+                        &body_vals,
+                        &env,
+                        &domtree,
+                        pinst,
+                        func.dfg.resolve_aliases(v),
+                        &mut new,
+                        4,
+                    );
+                }
+                for &w in &needed {
+                    ok &= map_val(
+                        func, &argv, &body_vals, &env, &domtree, pinst, w, &mut new, 4,
+                    );
+                }
+                if !ok {
+                    continue;
+                }
+                touched.insert(pinst);
+                seen.extend([b, s, pblock]);
+                let repair = repair.then(|| {
+                    touched.insert(term);
+                    locked.extend([b, s, pblock]);
+                    locked.extend(reg.iter().copied());
+                    (term, ti, needed, reg, extra)
+                });
+                edits.push(Edit {
+                    pinst,
+                    di,
+                    s,
+                    args: new,
+                    repair,
+                    eargs: Vec::new(),
+                });
+                break;
+            }
+        }
+    }
+    if prof_r {
+        tracing::info!(target: "pliron::jumpthread",
+            "    round-scan blk={n_blk} gate={n_gate} edge={n_edge} eval={n_eval} edits={}",
+            edits.len()
+        );
+    }
+    // The batch's planned `pinst -> s` edges can open fresh paths that
+    // bypass a def some appended edge arg relies on (an export fed
+    // verbatim to `s`'s other preds dominated them only because every
+    // route used to pass through `b` — think `s` looping back to its own
+    // pred). Re-check every value placed on an edge against the
+    // post-edit graph, rematerializing constants where possible and
+    // dropping the edit otherwise.
+    let mut new_succs: FxHashMap<Block, Vec<Block>> = FxHashMap::default();
+    for e in &edits {
+        if let Some(pb) = func.layout.inst_block(e.pinst) {
+            new_succs.entry(pb).or_default().push(e.s);
+        }
+    }
+    let mut memo: FxHashMap<Block, FxHashSet<Block>> = FxHashMap::default();
+    let mut post_safe = |func: &Function, v: Value, u: Inst| -> bool {
+        let pp = match func.dfg.value_def(v) {
+            ValueDef::Result(di, _) => ProgramPoint::Inst(di),
+            ValueDef::Param(db, _) => ProgramPoint::Block(db),
+            _ => return false,
+        };
+        if !domtree.try_dominates(pp, u, &func.layout) {
+            return false;
+        }
+        let Some(db) = def_block(v) else {
+            return false;
+        };
+        let Some(ub) = func.layout.inst_block(u) else {
+            return false;
+        };
+        if db == ub {
+            // Dominance within the block was just checked: the def
+            // sits before the terminator regardless of how the block
+            // is reached.
+            return true;
+        }
+        let r = memo
+            .entry(db)
+            .or_insert_with(|| reach_avoid(func, &cfg, &new_succs, db));
+        !r.contains(&ub)
+    };
+    let mut benvs: FxHashMap<Block, FxHashMap<Value, u64>> = FxHashMap::default();
+    let mut kept: Vec<Edit> = Vec::with_capacity(edits.len());
+    'edits: for mut e in edits {
+        // `V` leaves carried onto the retargeted edge itself.
+        let mut bad = {
+            let mut stack: Vec<&Arg> = e.args.iter().collect();
+            let mut bad = false;
+            while let Some(a) = stack.pop() {
+                match a {
+                    Arg::K(..) => {}
+                    Arg::R(_, subs) => stack.extend(subs.iter()),
+                    Arg::V(v) => {
+                        let v = func.dfg.resolve_aliases(*v);
+                        if !post_safe(func, v, e.pinst) {
+                            bad = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            bad
+        };
+        if !bad && let Some((term, _, needed, _, extra)) = &e.repair {
+            let b = func.layout.inst_block(*term).unwrap();
+            let benv = benvs.entry(b).or_insert_with(|| const_env(func, b));
+            for &(q, _) in extra {
+                let mut es = Vec::with_capacity(needed.len());
+                for &w in needed {
+                    let k = benv
+                        .get(&w)
+                        .filter(|_| func.dfg.value_type(w).bits() <= 64)
+                        .copied();
+                    if let Some(k) = k {
+                        es.push(Arg::K(k, func.dfg.value_type(w)));
+                    } else if post_safe(func, w, q) {
+                        es.push(Arg::V(w));
+                    } else {
+                        bad = true;
+                        break;
+                    }
+                }
+                if bad {
+                    break;
+                }
+                e.eargs.push(es);
+            }
+        }
+        if bad {
+            continue 'edits;
+        }
+        kept.push(e);
+    }
+    let n = kept.len();
+    for e in kept {
+        if let Some(ev) = evict.as_deref_mut() {
+            ev.insert(e.s);
+        }
+        if let Some((term, ti, needed, reg, extra)) = e.repair {
+            // Repairs append params to `e.s` and rewrite `reg`/`term`/
+            // `extra` inst operands — those terminators' edge args feed
+            // param proofs a kept `NonNull` holds, so evict their
+            // targets as well. Fresh params appended here are simply
+            // absent from the kept set (unproven) — sound.
+            if let Some(ev) = evict.as_deref_mut() {
+                let dfg = &func.dfg;
+                let mut dests = |i: Inst| {
+                    for bc in dfg
+                        .insts[i]
+                        .branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+                    {
+                        ev.insert(bc.block(&dfg.value_lists));
+                    }
+                };
+                dests(term);
+                for &(q, _) in &extra {
+                    dests(q);
+                }
+                for &x in &reg {
+                    if let Some(lt) = func.layout.last_inst(x) {
+                        dests(lt);
+                    }
+                }
+            }
+            let mut to: FxHashMap<Value, Value> = FxHashMap::default();
+            for &w in &needed {
+                let ty = func.dfg.value_type(w);
+                to.insert(w, func.dfg.append_block_param(e.s, ty));
+            }
+            for x in reg {
+                let insts: Vec<Inst> = func.layout.block_insts(x).collect();
+                for inst in insts {
+                    let repl: FxHashMap<Value, Value> = func
+                        .dfg
+                        .inst_values(inst)
+                        .filter_map(|v| to.get(&func.dfg.resolve_aliases(v)).map(|&n| (v, n)))
+                        .collect();
+                    if !repl.is_empty() {
+                        func.dfg
+                            .map_inst_values(inst, |v| repl.get(&v).copied().unwrap_or(v));
+                    }
+                }
+            }
+            // Every other edge into `s` feeds the new params — verbatim
+            // b-values when they still dominate that edge post-edit,
+            // freshly rematerialized constants otherwise (both resolved
+            // during validation into `e.eargs`).
+            for ((q, dj), es) in extra.iter().zip(&e.eargs) {
+                let dest_ok = {
+                    let dfg = &func.dfg;
+                    dfg.insts[*q].branch_destination(&dfg.jump_tables, &dfg.exception_tables)[*dj]
+                        .block(&dfg.value_lists)
+                        == e.s
+                };
+                if !dest_ok {
+                    continue;
+                }
+                let vals: Vec<Value> = es.iter().map(|a| emit_arg(func, *q, a)).collect();
+                let dfg = &mut func.dfg;
+                let bc = &mut dfg.insts[*q]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[*dj];
+                for v in vals {
+                    bc.append_argument(v, &mut dfg.value_lists);
+                }
+            }
+            let dfg = &mut func.dfg;
+            let bc = &mut dfg.insts[term]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[ti];
+            for &w in &needed {
+                bc.append_argument(w, &mut dfg.value_lists);
+            }
+        }
+        let mut args = Vec::with_capacity(e.args.len());
+        for a in &e.args {
+            args.push(BlockArg::Value(emit_arg(func, e.pinst, a)));
+        }
+        let bc = BlockCall::new(e.s, args, &mut func.dfg.value_lists);
+        let dfg = &mut func.dfg;
+        dfg.insts[e.pinst]
+            .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[e.di] = bc;
+    }
+    n
+}
+
+/// Splice `jump`-only successors that have no other predecessor into their
+/// predecessor, so a merge block and its test end up in one block.
+pub fn merge_chains(func: &mut Function, cd: &mut Cd) {
+    let prof = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
+    let t0 = prof.then(std::time::Instant::now);
+    let (cfg, _) = cd.get(func);
+    let entry = func.layout.entry_block();
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    let mut gone: FxHashSet<Block> = FxHashSet::default();
+    let (mut merges, mut moves) = (0usize, 0usize);
+    let (mut t_cfg, mut t_alias, mut t_move) = (0u128, 0u128, 0u128);
+    for x in blocks {
+        if gone.contains(&x) {
+            continue;
+        }
+        while let Some(term) = func.layout.last_inst(x) {
+            let InstructionData::Jump { destination, .. } = func.dfg.insts[term] else {
+                break;
+            };
+            let y = destination.block(&func.dfg.value_lists);
+            let tp = prof.then(std::time::Instant::now);
+            // `take(2)`, not `count()`: a shared merge block can have one
+            // predecessor list entry per dispatch arm, and counting them
+            // all per arm is O(arms x preds) on giant `br_table` fns.
+            if y == x || Some(y) == entry || cfg.pred_iter(y).take(2).count() != 1 {
+                break;
+            }
+            t_cfg += tp.map_or(0, |t| t.elapsed().as_nanos());
+            let args: Vec<Value> = destination
+                .args(&func.dfg.value_lists)
+                .filter_map(|a| match a {
+                    BlockArg::Value(v) => Some(v),
+                    _ => None,
+                })
+                .collect();
+            if args.len() != func.dfg.num_block_params(y) {
+                break;
+            }
+            // An arg that is one of y's own params (a dead y->x->y cycle or
+            // a param permutation) would alias a param to itself or a
+            // sibling; resolve first since existing aliases can mask it.
+            let pset: FxHashSet<Value> = func.dfg.block_params(y).iter().copied().collect();
+            if args
+                .iter()
+                .any(|&a| pset.contains(&func.dfg.resolve_aliases(a)))
+            {
+                break;
+            }
+            let tp = prof.then(std::time::Instant::now);
+            let params = func.dfg.detach_block_params(y);
+            let params: Vec<Value> = params.as_slice(&func.dfg.value_lists).to_vec();
+            for (p, a) in params.into_iter().zip(args) {
+                func.dfg.change_to_alias(p, a);
+            }
+            t_alias += tp.map_or(0, |t| t.elapsed().as_nanos());
+            func.layout.remove_inst(term);
+            let tp = prof.then(std::time::Instant::now);
+            let insts: Vec<Inst> = func.layout.block_insts(y).collect();
+            for i in insts {
+                func.layout.remove_inst(i);
+                func.layout.append_inst(i, x);
+                moves += 1;
+            }
+            func.layout.remove_block(y);
+            t_move += tp.map_or(0, |t| t.elapsed().as_nanos());
+            merges += 1;
+            gone.insert(y);
+        }
+    }
+    if merges + moves > 0 {
+        cd.stale();
+    }
+    if prof {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread",
+                "  merge_chains total {:?} merges={merges} moves={moves} cfg={}ms alias={}ms move={}ms",
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
+                t_cfg / 1_000_000,
+                t_alias / 1_000_000,
+                t_move / 1_000_000
+            )
+        };
+    }
+}
+
+/// A dispatch block `y`'s successors may use `y`'s params and results
+/// directly — which is exactly what strands them when an edge tries to
+/// thread past `y`. Rebind each sole-pred successor `s`: append a param
+/// for every `y` value `s`'s dominated cone consumes, feed it on `y`'s
+/// edge, and rename the uses. Once the exports travel as edge args an
+/// edgespec threading can land on `s` — an enum-discriminant dispatch
+/// whose use-cone is small (a couple of epilogue blocks) then folds.
+pub fn rebind_exports(
+    func: &mut Function,
+    an: &crate::pipeline::Analysis,
+    cd: &mut Cd,
+) -> usize {
+    let prof2 = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::DEBUG);
+    let t0 = prof2.then(std::time::Instant::now);
+    // cfg/dom stay local: callers in this step mutate the CFG without
+    // invalidating `an`, so its cfg/dt may be stale here. The use index
+    // is safe — `an.uses` keys on `num_insts` and rebuilds when the
+    // shape changed; same-shape stale entries overcount uses, which
+    // only keeps the cone walks conservative.
+    let uses = an.uses(func);
+    let (cfg, dom) = cd.get(func);
+    if prof2 {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread",
+                "    rebind setup {:.3}ms",
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()).as_secs_f64() * 1e3
+            )
+        };
+    }
+    let t0 = prof2.then(std::time::Instant::now);
+    let mut edits = Vec::new();
+    for y in func.layout.blocks().collect::<Vec<_>>() {
+        // Params then inst results — deterministic order.
+        let mut exports: Vec<Value> = func.dfg.block_params(y).to_vec();
+        for i in func.layout.block_insts(y) {
+            exports.extend(func.dfg.inst_results(i).iter().copied());
+        }
+        let Some(term) = func.layout.last_inst(y) else {
+            continue;
+        };
+        let dests = func.dfg.insts[term]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            .to_vec();
+        // Qualifying successors: `s`'s only pred edges must come from `y`'s
+        // own terminator — which also means idom(s) == y, so `s` dominates a
+        // site iff `s` is the node directly below `y` on the site's
+        // dominator chain. Attribute each export use-site to that arm with
+        // one idom walk; the old per-(succ, export, site)
+        // `block_dominates` product was quadratic on giant dispatches
+        // (arms × exports × sites × dom depth).
+        let mut quals: Vec<Block> = Vec::new();
+        let mut done: FxHashSet<Block> = FxHashSet::default();
+        for bc in &dests {
+            let s = bc.block(&func.dfg.value_lists);
+            // Every edge into `s` must leave `y`'s terminator — `pred_iter`
+            // counts instructions, so a brif with both arms on `s` still
+            // qualifies (all its calls get args appended below).
+            if s == y || !done.insert(s) || !cfg.pred_iter(s).all(|e| e.inst == term) {
+                continue;
+            }
+            quals.push(s);
+        }
+        if quals.is_empty() {
+            continue;
+        }
+        let qual: FxHashSet<Block> = quals.iter().copied().collect();
+        // s -> w -> insts inside s's cone that use w.
+        let mut cone: FxHashMap<Block, FxHashMap<Value, Vec<Inst>>> = FxHashMap::default();
+        for &w in &exports {
+            let ss = uses.sites(w);
+            if ss.is_empty() {
+                continue;
+            }
+            for &(b, i) in ss {
+                if b == y {
+                    continue;
+                }
+                let mut cur = b;
+                let arm = loop {
+                    match dom.idom(cur) {
+                        Some(d) if d == y => break Some(cur),
+                        Some(d) => cur = d,
+                        None => break None,
+                    }
+                };
+                let Some(s) = arm else {
+                    continue;
+                };
+                if !qual.contains(&s) {
+                    continue;
+                }
+                cone.entry(s).or_default().entry(w).or_default().push(i);
+            }
+        }
+        for s in quals {
+            let Some(ws) = cone.get(&s) else {
+                continue;
+            };
+            // `y` values consumed from `s`'s dominated cone — `s` owns the
+            // only path there, so a param can carry each.
+            let needed: Vec<Value> = exports
+                .iter()
+                .copied()
+                .filter(|w| ws.contains_key(w))
+                .collect();
+            if needed.len() > 8 {
+                continue;
+            }
+            let insts: Vec<Inst> = needed.iter().flat_map(|w| ws[w].iter().copied()).collect();
+            edits.push((y, term, s, needed, insts));
+        }
+    }
+    if prof2 {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread",
+                "    rebind scan {:.3}ms (edits={})",
+                t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()).as_secs_f64() * 1e3,
+                edits.len()
+            )
+        };
+    }
+    let t0 = prof2.then(std::time::Instant::now);
+    let n = edits.len();
+    // Edge args grouped by term — a giant dispatch has an edit per arm,
+    // and a full destination rescan per edit is O(arms²).
+    let mut appends: FxHashMap<Inst, Vec<(Block, Vec<Value>)>> = FxHashMap::default();
+    for (_y, term, s, needed, insts) in edits {
+        let mut repl: FxHashMap<Value, Value> = FxHashMap::default();
+        for &w in &needed {
+            let ty = func.dfg.value_type(w);
+            let p = func.dfg.append_block_param(s, ty);
+            repl.insert(w, p);
+        }
+        // Rewrite only the insts that reference a `needed` value inside
+        // the cone — the site index says exactly where they are (a site
+        // rewired by an earlier edit just produces an empty remap).
+        let insts: FxHashSet<Inst> = insts.into_iter().collect();
+        for i in insts {
+            let to: FxHashMap<Value, Value> = func
+                .dfg
+                .inst_values(i)
+                .filter_map(|v| repl.get(&func.dfg.resolve_aliases(v)).map(|&n| (v, n)))
+                .collect();
+            if !to.is_empty() {
+                func.dfg
+                    .map_inst_values(i, |v| to.get(&v).copied().unwrap_or(v));
+            }
+        }
+        appends.entry(term).or_default().push((s, needed));
+    }
+    for (term, ss) in appends {
+        // Per-call arg order is `ss`'s edit order for this block — each
+        // successor appears once, so a lookup keeps it O(1) per call.
+        let map: FxHashMap<Block, Vec<Value>> = ss.into_iter().collect();
+        let dfg = &mut func.dfg;
+        for bc in
+            dfg.insts[term].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+        {
+            if let Some(needed) = map.get(&bc.block(&dfg.value_lists)) {
+                for &w in needed {
+                    bc.append_argument(w, &mut dfg.value_lists);
+                }
+            }
+        }
+    }
+    if prof2 {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread", "    rebind apply {:.3}ms", t0.map_or(std::time::Duration::ZERO, |t| t.elapsed()).as_secs_f64() * 1e3)
+        };
+    }
+    n
+}
+
+/// `PLIRON_REDUCIBLE=1`: block-cloning transforms (`dispatch_dup`,
+/// `taildup`) refuse a clone that would create a loop side entrance.
+pub fn keep_reducible() -> bool {
+    pliron_cfg::env_is("PLIRON_REDUCIBLE", "1")
+}
+
+/// Would giving `p` a copy of `y`'s terminator create a loop side
+/// entrance? The copy gives `p` direct edges to `y`'s successors; an edge
+/// from `p` into a loop `p` is not in, landing anywhere but the header,
+/// makes the CFG irreducible. Cranelift doesn't mind, but waffle's wasm
+/// backend turns an irreducible CFG reducible by block duplication that is
+/// exponential in loop nesting (regex-syntax's `Seq::cross_reverse`
+/// compiled at 3x its instruction count's bytes; spliced into a caller's
+/// loops, 10x — docs/history/2026-10-27-wasm-size.md). `la` must be
+/// current for `func`.
+pub(crate) fn side_enters(func: &Function, la: &LoopAnalysis, p: Block, y: Block) -> bool {
+    let Some(t) = func.layout.last_inst(y) else {
+        return false;
+    };
+    func.dfg.insts[t]
+        .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        .iter()
+        .any(|bc| {
+            let s = bc.block(&func.dfg.value_lists);
+            let mut lp = la.innermost_loop(s);
+            while let Some(l) = lp {
+                if la.loop_header(l) != s && !la.is_in_loop(p, l) {
+                    return true;
+                }
+                lp = la.loop_parent(l);
+            }
+            false
+        })
+}
+
+/// Clone a small pure dispatch block into a `jump` predecessor — the pred's
+/// edge then carries the dispatch's test and branch args itself (the
+/// `select→icmp` discriminant in the pred folds against the clone to a
+/// raw `brif`). Legal only while every def of `y` is used inside `y` —
+/// `rebind_exports` creates exactly that shape by moving shared uses
+/// onto successor params.
+pub fn dispatch_dup(func: &mut Function, cfg: &ControlFlowGraph, dom: &DominatorTree) -> usize {
+    let entry = func.layout.entry_block();
+    // `PLIRON_REDUCIBLE`: loop forest for the side-entrance test, built on
+    // the first surviving candidate.
+    let reducible = keep_reducible();
+    let mut la: Option<LoopAnalysis> = None;
+    // Values with any use outside their def block: a `y` whose defs all
+    // stay internal can be cloned without stranding downstream uses.
+    // Built lazily — the whole-function scan only pays when a dispatch
+    // candidate actually survives the cheap gates below.
+    let mut escaping: Option<FxHashSet<Value>> = None;
+    let mut edits = Vec::new();
+    for p in func.layout.blocks() {
+        let Some(term) = func.layout.last_inst(p) else {
+            continue;
+        };
+        let InstructionData::Jump { destination, .. } = func.dfg.insts[term] else {
+            continue;
+        };
+        let y = destination.block(&func.dfg.value_lists);
+        if y == p || Some(y) == entry {
+            continue;
+        }
+        let insts: Vec<Inst> = func.layout.block_insts(y).collect();
+        let Some((&yterm, body)) = insts.split_last() else {
+            continue;
+        };
+        if body.len() > 12 || !body.iter().all(|&i| pure_op(func, i)) {
+            continue;
+        }
+        if !matches!(
+            func.dfg.insts[yterm],
+            InstructionData::Brif { .. } | InstructionData::Jump { .. }
+        ) {
+            continue;
+        }
+        let params = func.dfg.block_params(y).to_vec();
+        let args: Vec<Value> = destination
+            .args(&func.dfg.value_lists)
+            .filter_map(|a| match a {
+                BlockArg::Value(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        if args.len() != params.len() {
+            continue;
+        }
+        // A `y` param re-bound to `y` itself can't be cloned.
+        let pset: FxHashSet<Value> = params.iter().copied().collect();
+        if args
+            .iter()
+            .any(|&a| pset.contains(&func.dfg.resolve_aliases(a)))
+        {
+            continue;
+        }
+        let map: FxHashMap<Value, Value> = params.iter().copied().zip(args).collect();
+        let mut ok = true;
+        // `y` insts and branch args must resolve to clones or to values
+        // dominating `p`'s tail.
+        for i in insts.iter().take(body.len()).chain([&yterm]) {
+            for v in func.dfg.inst_values(*i) {
+                let v = func.dfg.resolve_aliases(v);
+                if map.contains_key(&v) {
+                    continue;
+                }
+                let okd = match func.dfg.value_def(v) {
+                    ValueDef::Param(b, _) => {
+                        b == y || (func.layout.is_block_inserted(b) && dom.block_dominates(b, p))
+                    }
+                    ValueDef::Result(di, _) => {
+                        func.layout.inst_block(di) == Some(y)
+                            || dom.try_dominates(di, term, &func.layout)
+                    }
+                    _ => false,
+                };
+                if !okd {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                break;
+            }
+        }
+        // Nothing `y` defines may be observed outside `y`.
+        if ok {
+            let esc = escaping.get_or_insert_with(|| {
+                let mut e: FxHashSet<Value> = FxHashSet::default();
+                for x in func.layout.blocks() {
+                    for i in func.layout.block_insts(x) {
+                        for v in func.dfg.inst_values(i) {
+                            let v = func.dfg.resolve_aliases(v);
+                            let db = match func.dfg.value_def(v) {
+                                ValueDef::Param(b, _) => Some(b),
+                                ValueDef::Result(di, _) => func.layout.inst_block(di),
+                                _ => None,
+                            };
+                            if db.is_some_and(|b| b != x) {
+                                e.insert(v);
+                            }
+                        }
+                    }
+                }
+                e
+            });
+            for i in insts.iter().take(body.len()) {
+                for r in func.dfg.inst_results(*i).iter() {
+                    if esc.contains(&func.dfg.resolve_aliases(*r)) {
+                        ok = false;
+                    }
+                }
+            }
+            if params.iter().any(|pv| esc.contains(pv)) {
+                ok = false;
+            }
+        }
+        if ok && reducible {
+            let la = la.get_or_insert_with(|| {
+                let mut la = LoopAnalysis::new();
+                la.compute(func, cfg, dom);
+                la
+            });
+            if side_enters(func, la, p, y) {
+                ok = false;
+            }
+        }
+        if ok {
+            edits.push((p, term, y, map));
+        }
+    }
+    let mut n = 0;
+    for (_p, term, y, mut map) in edits {
+        let insts: Vec<Inst> = func.layout.block_insts(y).collect();
+        let Some((&yterm, body)) = insts.split_last() else {
+            continue;
+        };
+        for &i in body {
+            let ni = func.dfg.clone_inst(i);
+            // `-g`: the copy is the same source operation.
+            func.set_srcloc(ni, func.srcloc(i));
+            let vals: Vec<Value> = func
+                .dfg
+                .inst_values(ni)
+                .map(|v| {
+                    let v = func.dfg.resolve_aliases(v);
+                    *map.get(&v).unwrap_or(&v)
+                })
+                .collect();
+            func.dfg.overwrite_inst_values(ni, vals.into_iter());
+            func.layout.insert_inst(ni, term);
+            let nrs = func.dfg.inst_results(ni).to_vec();
+            for (r, nr) in func.dfg.inst_results(i).to_vec().into_iter().zip(nrs) {
+                map.insert(r, nr);
+            }
+        }
+        let sub =
+            |bc: BlockCall, map: &FxHashMap<Value, Value>, func: &Function| -> Vec<BlockArg> {
+                bc.args(&func.dfg.value_lists)
+                    .map(|a| match a {
+                        BlockArg::Value(v) => {
+                            let v = func.dfg.resolve_aliases(v);
+                            BlockArg::Value(*map.get(&v).unwrap_or(&v))
+                        }
+                        a => a,
+                    })
+                    .collect()
+            };
+        let mut cur = FuncCursor::new(func).at_inst(term);
+        let made = match cur.func.dfg.insts[yterm] {
+            InstructionData::Jump { destination, .. } => {
+                let d = destination.block(&cur.func.dfg.value_lists);
+                let args = sub(destination, &map, cur.func);
+                Some(cur.ins().jump(d, &args))
+            }
+            InstructionData::Brif { arg, blocks, .. } => {
+                let c = cur.func.dfg.resolve_aliases(arg);
+                let c = *map.get(&c).unwrap_or(&c);
+                let (tb, eb) = (
+                    blocks[0].block(&cur.func.dfg.value_lists),
+                    blocks[1].block(&cur.func.dfg.value_lists),
+                );
+                let ta = sub(blocks[0], &map, cur.func);
+                let ea = sub(blocks[1], &map, cur.func);
+                Some(cur.ins().brif(c, tb, &ta, eb, &ea))
+            }
+            _ => None,
+        };
+        if made.is_none() {
+            continue;
+        }
+        func.layout.remove_inst(term);
+        n += 1;
+    }
+    n
+}
+
+/// Retarget edges into blocks that only `jump` onward straight to the final
+/// target, so a constant arg reaches the block that tests it. Each forwarded
+/// arg must be a param of the bypassed block or defined where it dominates
+/// the predecessor's branch. Returns the edges retargeted.
+fn bypass_forwarders(
+    func: &mut Function,
+    cd: Option<(&ControlFlowGraph, &DominatorTree)>,
+    mut evict: Option<&mut FxHashSet<Block>>,
+) -> usize {
+    // A caller-held cfg/domtree is reusable: retargets only shrink `b`'s
+    // pred lists (a stale entry fails the `bc.block == b` re-check) and
+    // can only strengthen dominance — both directions stay conservative.
+    let (cfg_l, dt_l);
+    let (cfg, domtree) = match cd {
+        Some((c, d)) => (c, d),
+        None => {
+            cfg_l = ControlFlowGraph::with_function(func);
+            dt_l = DominatorTree::with_function(func, &cfg_l);
+            (&cfg_l, &dt_l)
+        }
+    };
+    let entry = func.layout.entry_block();
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    // Block params used outside their own block: bypassing that block would
+    // leave those uses undominated.
+    let mut escaping: FxHashSet<Value> = FxHashSet::default();
+    let mut uses: FxHashMap<Value, u32> = FxHashMap::default();
+    for &x in &blocks {
+        for i in func.layout.block_insts(x) {
+            let mut note = |v: Value| {
+                let v = func.dfg.resolve_aliases(v);
+                *uses.entry(v).or_default() += 1;
+                if let ValueDef::Param(d, _) = func.dfg.value_def(v)
+                    && d != x
+                {
+                    escaping.insert(v);
+                }
+            };
+            func.dfg.inst_args(i).iter().for_each(|&v| note(v));
+            for bc in func.dfg.insts[i]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                for a in bc.args(&func.dfg.value_lists) {
+                    if let BlockArg::Value(v) = a {
+                        note(v);
+                    }
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    for b in blocks {
+        if Some(b) == entry
+            || func
+                .dfg
+                .block_params(b)
+                .iter()
+                .any(|p| escaping.contains(p))
+        {
+            continue;
+        }
+        let Some(term) = func.layout.last_inst(b) else {
+            continue;
+        };
+        // Cheap gates first: a forwarder ends in `jump t` — the body
+        // purity scan below only runs for blocks that are one.
+        let InstructionData::Jump { destination, .. } = func.dfg.insts[term] else {
+            continue;
+        };
+        let t = destination.block(&func.dfg.value_lists);
+        if t == b {
+            continue;
+        }
+        let mut targs = Vec::new();
+        for a in destination.args(&func.dfg.value_lists) {
+            match a {
+                BlockArg::Value(v) => targs.push(func.dfg.resolve_aliases(v)),
+                _ => targs.clear(),
+            }
+        }
+        if targs.len() != func.dfg.num_block_params(t) {
+            continue;
+        }
+        // Any other insts must be pure and used only by each other.
+        let body: Vec<Inst> = func.layout.block_insts(b).filter(|&i| i != term).collect();
+        let mut local: FxHashMap<Value, u32> = FxHashMap::default();
+        for &i in &body {
+            for &a in func.dfg.inst_args(i) {
+                *local.entry(func.dfg.resolve_aliases(a)).or_default() += 1;
+            }
+        }
+        if !body.iter().all(|&i| {
+            pure_op(func, i) && {
+                let r = func.dfg.first_result(i);
+                uses.get(&r).copied().unwrap_or(0) == local.get(&r).copied().unwrap_or(0)
+            }
+        }) {
+            continue;
+        }
+        let params = func.dfg.block_params(b).to_vec();
+        let preds: Vec<(Block, Inst)> = cfg.pred_iter(b).map(|p| (p.block, p.inst)).collect();
+        for (pb, pinst) in preds {
+            if pb == b
+                || !matches!(
+                    func.dfg.insts[pinst].opcode(),
+                    Opcode::Jump | Opcode::Brif | Opcode::BrTable
+                )
+            {
+                continue;
+            }
+            // Index dests in place — `to_vec()` materializes every arm
+            // of a br_table (16k entries per pred on giant dispatch fns)
+            // though only the ones targeting `b` matter.
+            let ndest = func.dfg.insts[pinst]
+                .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                .len();
+            for di in 0..ndest {
+                let bc = &func.dfg.insts[pinst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)[di];
+                if bc.block(&func.dfg.value_lists) != b {
+                    continue;
+                }
+                let pargs: Vec<BlockArg> = bc.args(&func.dfg.value_lists).collect();
+                if pargs.len() != params.len() {
+                    continue;
+                }
+                let mut new = Vec::with_capacity(targs.len());
+                for &v in &targs {
+                    if let Some(k) = params.iter().position(|&p| p == v) {
+                        new.push(pargs[k]);
+                        continue;
+                    }
+                    let ok = match func.dfg.value_def(v) {
+                        ValueDef::Result(i, _) => {
+                            i != pinst && domtree.try_dominates(i, pinst, &func.layout)
+                        }
+                        ValueDef::Param(d, _) => domtree.block_dominates(d, pb),
+                        _ => false,
+                    };
+                    if !ok {
+                        break;
+                    }
+                    new.push(BlockArg::Value(v));
+                }
+                if new.len() != targs.len() {
+                    continue;
+                }
+                let nbc = BlockCall::new(t, new, &mut func.dfg.value_lists);
+                let dfg = &mut func.dfg;
+                dfg.insts[pinst]
+                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[di] =
+                    nbc;
+                if let Some(ev) = evict.as_deref_mut() {
+                    ev.insert(t);
+                }
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// `v` with truth-preserving casts stripped: `uextend` keeps zero-ness,
+/// and `ireduce` of a `uextend` back to the source width is the source.
+fn truth_root(func: &Function, v: Value) -> Value {
+    let mut v = func.dfg.resolve_aliases(v);
+    for _ in 0..8 {
+        let ValueDef::Result(i, 0) = func.dfg.value_def(v) else { break };
+        match func.dfg.insts[i] {
+            InstructionData::Unary { opcode: Opcode::Uextend, arg } => {
+                v = func.dfg.resolve_aliases(arg);
+            }
+            InstructionData::Unary { opcode: Opcode::Ireduce, arg } => {
+                let a = func.dfg.resolve_aliases(arg);
+                match func.dfg.value_def(a) {
+                    ValueDef::Result(j, 0)
+                        if let InstructionData::Unary { opcode: Opcode::Uextend, arg: x } = func.dfg.insts[j]
+                            && func.dfg.value_type(x) == func.dfg.value_type(v) =>
+                    {
+                        v = func.dfg.resolve_aliases(x);
+                    }
+                    _ => break,
+                }
+            }
+            _ => break,
+        }
+    }
+    v
+}
+
+/// The truth of `c` on entry to `x`, from a dominating `brif` on the same
+/// value: walk up through blocks with a single incoming edge until one
+/// leaves a two-way `brif` whose condition has `c`'s truth root. Returns
+/// the decision and the blocks walked.
+fn join_decided(func: &Function, cfg: &ControlFlowGraph, mut x: Block, c: Value) -> Option<(bool, Vec<Block>)> {
+    let mut chain = Vec::new();
+    for _ in 0..8 {
+        chain.push(x);
+        let mut it = cfg.pred_iter(x);
+        let e = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        if let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[e.inst] {
+            let (t, f) = (blocks[0].block(&func.dfg.value_lists), blocks[1].block(&func.dfg.value_lists));
+            if t != f && truth_root(func, arg) == c {
+                return Some((t == x, chain));
+            }
+        }
+        x = e.block;
+    }
+    None
+}
+
+/// Fold `brif c` where the path into its block already decided `c`, and
+/// thread `jump`s into a block that is nothing but `brif c` when the
+/// predecessor's path decided it (`PLIRON_JOINTHREAD`). An
+/// `Option`-returning helper inlined into a loop re-tests its tag where
+/// the loop's exits join (serde_json's `parse_whitespace`: `peek()`'s
+/// tag decides the loop, and the exit block tests it again for the
+/// caller's `match`); that test keeps the merged tag live past the merge
+/// block, so the merge itself can't be threaded. Each predecessor reached
+/// only through one arm of a `brif` on the same value goes straight to
+/// the decided successor. The test block has no params and no other
+/// insts, so the successor's args dominate it and hence every
+/// predecessor. Returns the branches folded plus the edges retargeted.
+pub fn thread_join_tests(func: &mut Function) -> usize {
+    let mut n = 0;
+    for _ in 0..4 {
+        let cfg = ControlFlowGraph::with_function(func);
+        let mut edits: Vec<(Inst, Block, bool)> = Vec::new();
+        let mut walked: FxHashSet<Block> = FxHashSet::default();
+        for b in func.layout.blocks() {
+            if !func.dfg.block_params(b).is_empty() {
+                continue;
+            }
+            let Some(term) = func.layout.first_inst(b) else { continue };
+            if func.layout.last_inst(b) != Some(term) {
+                continue;
+            }
+            let InstructionData::Brif { arg, .. } = func.dfg.insts[term] else { continue };
+            let c = truth_root(func, arg);
+            for e in cfg.pred_iter(b) {
+                if e.block == b || func.dfg.insts[e.inst].opcode() != Opcode::Jump {
+                    continue;
+                }
+                if let Some((k, chain)) = join_decided(func, &cfg, e.block, c) {
+                    walked.extend(chain);
+                    edits.push((e.inst, b, k));
+                }
+            }
+        }
+        // A block reached only through one arm of a `brif` on the same
+        // value (directly or down a single-edge chain) tests a decided
+        // condition: its own `brif` becomes a `jump`. Removing an edge
+        // never breaks another walk's single-edge premise.
+        let mut folds: Vec<(Inst, bool)> = Vec::new();
+        for b in func.layout.blocks() {
+            let Some(term) = func.layout.last_inst(b) else { continue };
+            let InstructionData::Brif { arg, .. } = func.dfg.insts[term] else { continue };
+            if let Some((k, _)) = join_decided(func, &cfg, b, truth_root(func, arg)) {
+                folds.push((term, k));
+            }
+        }
+        for &(term, taken) in &folds {
+            let InstructionData::Brif { blocks, .. } = func.dfg.insts[term] else { unreachable!() };
+            let d = blocks[if taken { 0 } else { 1 }];
+            let db = d.block(&func.dfg.value_lists);
+            let args: Vec<BlockArg> = d.args(&func.dfg.value_lists).collect();
+            func.replace(term).jump(db, &args);
+        }
+        if !folds.is_empty() {
+            n += folds.len();
+            continue;
+        }
+        // A retarget adds an edge into its destination; one landing in a
+        // block another decision walked through would break that walk's
+        // single-edge premise, so it waits for the next round.
+        let mut k = 0;
+        for (pi, b, taken) in edits {
+            let term = func.layout.last_inst(b).unwrap();
+            let InstructionData::Brif { blocks, .. } = func.dfg.insts[term] else { unreachable!() };
+            let d = blocks[if taken { 0 } else { 1 }];
+            let db = d.block(&func.dfg.value_lists);
+            if walked.contains(&db) {
+                continue;
+            }
+            let args: Vec<BlockArg> = d.args(&func.dfg.value_lists).collect();
+            let nbc = BlockCall::new(db, args, &mut func.dfg.value_lists);
+            let dfg = &mut func.dfg;
+            dfg.insts[pi].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[0] = nbc;
+            k += 1;
+        }
+        n += k;
+        if k == 0 {
+            break;
+        }
+    }
+    n
+}
+
+/// The icmp a branch condition tests, through `band 1` and extends of its 0/1 result.
+pub(crate) fn cond_icmp(func: &Function, v: Value) -> Option<Inst> {
+    let env = FxHashMap::default();
+    let mut v = func.dfg.resolve_aliases(v);
+    for _ in 0..6 {
+        let i = func.dfg.value_def(v).inst()?;
+        match func.dfg.insts[i] {
+            InstructionData::IntCompare {
+                opcode: Opcode::Icmp,
+                ..
+            } => return Some(i),
+            InstructionData::Unary {
+                opcode: Opcode::Uextend | Opcode::Ireduce,
+                arg,
+            } => v = func.dfg.resolve_aliases(arg),
+            InstructionData::Binary {
+                opcode: Opcode::Band,
+                args,
+            } => {
+                let (a, b) = (
+                    func.dfg.resolve_aliases(args[0]),
+                    func.dfg.resolve_aliases(args[1]),
+                );
+                if known(func, &env, b) == Some(1) {
+                    v = a;
+                } else if known(func, &env, a) == Some(1) {
+                    v = b;
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+pub(crate) type Cmp = (IntCC, Value, Value);
+
+/// A scalar icmp as `(cc, x, y)`; `(x - y) ==/!= 0` becomes `x ==/!= y`.
+pub(crate) fn norm_icmp(func: &Function, i: Inst) -> Option<Cmp> {
+    let InstructionData::IntCompare {
+        opcode: Opcode::Icmp,
+        cond,
+        args,
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    let (mut a, mut b) = (
+        func.dfg.resolve_aliases(args[0]),
+        func.dfg.resolve_aliases(args[1]),
+    );
+    if func.dfg.value_type(a).is_vector() {
+        return None;
+    }
+    if matches!(cond, IntCC::Equal | IntCC::NotEqual) {
+        let env = FxHashMap::default();
+        if known(func, &env, a) == Some(0) {
+            std::mem::swap(&mut a, &mut b);
+        }
+        if known(func, &env, b) == Some(0)
+            && let Some(d) = func.dfg.value_def(a).inst()
+            && let InstructionData::Binary {
+                opcode: Opcode::Isub,
+                args: s,
+            } = func.dfg.insts[d]
+        {
+            return Some((
+                cond,
+                func.dfg.resolve_aliases(s[0]),
+                func.dfg.resolve_aliases(s[1]),
+            ));
+        }
+    }
+    Some((cond, a, b))
+}
+
+/// What a true fact `f` says about query `q`, if anything.
+fn implied(f: Cmp, q: Cmp) -> Option<bool> {
+    use IntCC::*;
+    let (fc, fx, fy) = f;
+    let qc = if (q.1, q.2) == (fx, fy) {
+        q.0
+    } else if (q.1, q.2) == (fy, fx) {
+        q.0.swap_args()
+    } else {
+        return None;
+    };
+    if qc == fc {
+        return Some(true);
+    }
+    if qc == fc.complement() {
+        return Some(false);
+    }
+    match fc {
+        Equal => Some(matches!(
+            qc,
+            UnsignedGreaterThanOrEqual
+                | UnsignedLessThanOrEqual
+                | SignedGreaterThanOrEqual
+                | SignedLessThanOrEqual
+        )),
+        UnsignedLessThan | UnsignedGreaterThan | SignedLessThan | SignedGreaterThan => match qc {
+            NotEqual => Some(true),
+            Equal => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Decide `a cc b` when one side is the constant `k` and the other lies in
+/// the unsigned range `[lo, hi]` (`w`-bit compare).
+fn range_cmp(
+    cc: IntCC,
+    a: Option<u64>,
+    b: Option<u64>,
+    ra: Option<(u64, u64)>,
+    rb: Option<(u64, u64)>,
+    w: u32,
+) -> Option<bool> {
+    use IntCC::*;
+    let (cc, (lo, hi), k) = match (a, b) {
+        (None, Some(k)) => (cc, ra?, k),
+        (Some(k), None) => (cc.swap_args(), rb?, k),
+        _ => return None,
+    };
+    let half = 1u64 << (w - 1);
+    let cc = match cc {
+        _ if hi >= half || k >= half => cc,
+        SignedLessThan => UnsignedLessThan,
+        SignedLessThanOrEqual => UnsignedLessThanOrEqual,
+        SignedGreaterThan => UnsignedGreaterThan,
+        SignedGreaterThanOrEqual => UnsignedGreaterThanOrEqual,
+        c => c,
+    };
+    let dec = |t: bool, f: bool| {
+        if t {
+            Some(true)
+        } else if f {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    match cc {
+        UnsignedLessThan => dec(hi < k, lo >= k),
+        UnsignedLessThanOrEqual => dec(hi <= k, lo > k),
+        UnsignedGreaterThan => dec(lo > k, hi <= k),
+        UnsignedGreaterThanOrEqual => dec(lo >= k, hi < k),
+        Equal => dec(lo == k && hi == k, k < lo || k > hi),
+        NotEqual => dec(k < lo || k > hi, lo == k && hi == k),
+        _ => None,
+    }
+}
+
+/// Unsigned range of `v` from its width, `uextend`/`band` with a constant,
+/// and the facts `fs` known where it is used.
+fn full_range(func: &Function, v: Value) -> Option<(u64, u64)> {
+    if func.dfg.value_type(v).is_vector() {
+        return None;
+    }
+    let w = bits(func, v)?;
+    Some((0, mask(u64::MAX, w)))
+}
+
+fn urange_or_full(
+    func: &Function,
+    fs: &[Cmp],
+    v: Value,
+    depth: u32,
+    range2: bool,
+) -> Option<(u64, u64)> {
+    urange(func, fs, v, depth, range2).or_else(|| range2.then(|| full_range(func, v)).flatten())
+}
+
+fn urange(func: &Function, fs: &[Cmp], v: Value, depth: u32, range2: bool) -> Option<(u64, u64)> {
+    let v = func.dfg.resolve_aliases(v);
+    let w = bits(func, v)?;
+    if func.dfg.value_type(v).is_vector() {
+        return None;
+    }
+    let full = mask(u64::MAX, w);
+    let (mut lo, mut hi) = (0u64, full);
+    let env = FxHashMap::default();
+    for &(cc, a, b) in fs {
+        let (cc, k) = if a == v {
+            (cc, known(func, &env, b))
+        } else if b == v {
+            (cc.swap_args(), known(func, &env, a))
+        } else {
+            continue;
+        };
+        let Some(k) = k else { continue };
+        match cc {
+            IntCC::UnsignedLessThan if k > 0 => hi = hi.min(k - 1),
+            IntCC::UnsignedLessThanOrEqual => hi = hi.min(k),
+            IntCC::UnsignedGreaterThan if k < full => lo = lo.max(k + 1),
+            IntCC::UnsignedGreaterThanOrEqual => lo = lo.max(k),
+            IntCC::Equal => {
+                lo = lo.max(k);
+                hi = hi.min(k);
+            }
+            _ => {}
+        }
+    }
+    if depth < if range2 { 8 } else { 4 }
+        && let Some(i) = func.dfg.value_def(v).inst()
+    {
+        match func.dfg.insts[i] {
+            InstructionData::Unary {
+                opcode: Opcode::Uextend,
+                arg,
+            } => {
+                if let Some((l, h)) = urange_or_full(func, fs, arg, depth + 1, range2) {
+                    lo = lo.max(l);
+                    hi = hi.min(h);
+                }
+            }
+            InstructionData::Binary {
+                opcode: opcode @ (Opcode::Iadd | Opcode::Isub),
+                args,
+            } => {
+                if range2
+                    && opcode == Opcode::Isub
+                    && let Some(k) = known(func, &env, args[0])
+                    && let Some((l, h)) = urange_or_full(func, fs, args[1], depth + 1, range2)
+                    && h <= k
+                {
+                    lo = lo.max(k - h);
+                    hi = hi.min(k - l);
+                }
+                if let Some(k) = known(func, &env, args[1])
+                    && let Some((l, h)) = urange_or_full(func, fs, args[0], depth + 1, range2)
+                {
+                    let (l2, h2) = if opcode == Opcode::Isub {
+                        (l.wrapping_sub(k), h.wrapping_sub(k))
+                    } else {
+                        (l.wrapping_add(k), h.wrapping_add(k))
+                    };
+                    // Only when the whole range moves without wrapping.
+                    let nowrap = if opcode == Opcode::Isub {
+                        l >= k
+                    } else {
+                        h <= full - k
+                    };
+                    if nowrap {
+                        lo = lo.max(l2);
+                        hi = hi.min(h2);
+                    }
+                }
+            }
+            InstructionData::Unary {
+                opcode: opcode @ (Opcode::Clz | Opcode::Ctz | Opcode::Popcnt),
+                arg,
+            } if range2 => {
+                if let Some((l, h)) = urange_or_full(func, fs, arg, depth + 1, range2) {
+                    let w = bits(func, arg)?;
+                    let r = match opcode {
+                        Opcode::Clz => {
+                            let clzw = |x: u64| {
+                                if x == 0 {
+                                    w
+                                } else {
+                                    x.leading_zeros() - (64 - w)
+                                }
+                            };
+                            (u64::from(clzw(h)), u64::from(clzw(l)))
+                        }
+                        Opcode::Ctz => (0, u64::from(if l > 0 { w - 1 } else { w })),
+                        Opcode::Popcnt => (u64::from(l > 0), u64::from(w)),
+                        _ => unreachable!(),
+                    };
+                    lo = lo.max(r.0);
+                    hi = hi.min(r.1);
+                }
+            }
+            InstructionData::Binary {
+                opcode: Opcode::Ushr,
+                args,
+            } if range2 => {
+                if let Some(s) = known(func, &env, args[1])
+                    && s < u64::from(w)
+                    && let Some((l, h)) = urange_or_full(func, fs, args[0], depth + 1, range2)
+                {
+                    lo = lo.max(l >> s);
+                    hi = hi.min(h >> s);
+                }
+            }
+            InstructionData::BinaryImm8 {
+                opcode: Opcode::Ushr,
+                arg,
+                imm,
+            } if range2 => {
+                let s = u64::from(imm);
+                if s < u64::from(w)
+                    && let Some((l, h)) = urange_or_full(func, fs, arg, depth + 1, range2)
+                {
+                    lo = lo.max(l >> s);
+                    hi = hi.min(h >> s);
+                }
+            }
+            InstructionData::Unary {
+                opcode: Opcode::Ireduce,
+                arg,
+            } => {
+                if let Some((l, h)) = urange(func, fs, arg, depth + 1, range2)
+                    && h <= full
+                {
+                    lo = lo.max(l);
+                    hi = hi.min(h);
+                }
+            }
+            InstructionData::Binary {
+                opcode: Opcode::Band,
+                args,
+            } => {
+                if let Some(m) = known(func, &env, args[1]).or(known(func, &env, args[0])) {
+                    hi = hi.min(m);
+                }
+            }
+            _ => {}
+        }
+    }
+    (lo <= hi && (lo, hi) != (0, full)).then_some((lo, hi))
+}
+
+/// The condition known on entry to each block whose only predecessor ends
+/// in `brif c` (`c` or its complement).
+pub(crate) fn edge_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Cmp> {
+    let mut fact: FxHashMap<Block, Cmp> = FxHashMap::default();
+    for b in func.layout.blocks() {
+        let mut preds = cfg.pred_iter(b);
+        let (Some(p), None) = (preds.next(), preds.next()) else {
+            continue;
+        };
+        if p.block == b {
+            continue;
+        }
+        let InstructionData::Brif { arg, blocks, .. } = func.dfg.insts[p.inst] else {
+            continue;
+        };
+        let t = blocks[0].block(&func.dfg.value_lists);
+        if t == blocks[1].block(&func.dfg.value_lists) {
+            continue;
+        }
+        let taken = b == t;
+        if selfact_on()
+            && let Some(f) = select_brif_fact(func, arg, taken)
+        {
+            fact.insert(b, f);
+            continue;
+        }
+        let Some((c, x, y)) = cond_icmp(func, arg).and_then(|i| norm_icmp(func, i)) else {
+            continue;
+        };
+        fact.insert(b, (if taken { c } else { c.complement() }, x, y));
+    }
+    fact
+}
+
+/// `PLIRON_SELFACT=1` (opt-in; docs/loop-unswitch-pressure.md section 1).
+fn selfact_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| pliron_cfg::env_is("PLIRON_SELFACT", "1"))
+}
+
+/// The fact a `brif arg` edge gives about the condition of a select with
+/// a zero arm: `arg` is the select (through `uextend`, or `ireduce` when
+/// nonzero) or `icmp eq/ne select, 0`. An inlined slice `next()` is
+/// `select(ptr == end, 0, ptr)` and the loop branches on it; the taken
+/// edge then knows `ptr != end`, which later re-tests ask.
+// r[impl clif.selfact]
+fn select_brif_fact(func: &Function, arg: Value, taken: bool) -> Option<Cmp> {
+    if let Some(f) = select_fact(func, arg, taken) {
+        return Some(f);
+    }
+    let i = func.dfg.value_def(func.dfg.resolve_aliases(arg)).inst()?;
+    let InstructionData::IntCompare {
+        opcode: Opcode::Icmp,
+        cond,
+        args,
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    if !matches!(cond, IntCC::Equal | IntCC::NotEqual) {
+        return None;
+    }
+    let env = FxHashMap::default();
+    let (a, b) = (func.dfg.resolve_aliases(args[0]), func.dfg.resolve_aliases(args[1]));
+    let v = if known(func, &env, b) == Some(0) {
+        a
+    } else if known(func, &env, a) == Some(0) {
+        b
+    } else {
+        return None;
+    };
+    // `v != 0` holds on the edge where `icmp ne v, 0` is true.
+    select_fact(func, v, (cond == IntCC::NotEqual) == taken)
+}
+
+/// What `v != 0` (`nonzero`) or `v == 0` says about the condition `c` of
+/// `v = select(c, 0, x)` / `select(c, x, 0)`. The zero-side direction
+/// needs the other arm to be a nonzero constant.
+fn select_fact(func: &Function, v: Value, nonzero: bool) -> Option<Cmp> {
+    let env = FxHashMap::default();
+    let mut v = func.dfg.resolve_aliases(v);
+    for _ in 0..4 {
+        let Some(i) = func.dfg.value_def(v).inst() else {
+            break;
+        };
+        match func.dfg.insts[i] {
+            InstructionData::Unary {
+                opcode: Opcode::Uextend,
+                arg,
+            } => v = func.dfg.resolve_aliases(arg),
+            // `ireduce x != 0` implies `x != 0`, not the converse.
+            InstructionData::Unary {
+                opcode: Opcode::Ireduce,
+                arg,
+            } if nonzero => v = func.dfg.resolve_aliases(arg),
+            _ => break,
+        }
+    }
+    let i = func.dfg.value_def(v).inst()?;
+    let InstructionData::Ternary {
+        opcode: Opcode::Select,
+        args,
+    } = func.dfg.insts[i]
+    else {
+        return None;
+    };
+    let [c, a, b] = args.map(|x| func.dfg.resolve_aliases(x));
+    let nz = |x: Value| known(func, &env, x).is_some_and(|k| k != 0);
+    // `c` true picks `a`.
+    let c_true = match (known(func, &env, a) == Some(0), known(func, &env, b) == Some(0)) {
+        (true, false) if nonzero => false,
+        (true, false) if nz(b) => true,
+        (false, true) if nonzero => true,
+        (false, true) if nz(a) => false,
+        _ => return None,
+    };
+    let (cc, x, y) = cond_icmp(func, c).and_then(|i| norm_icmp(func, i))?;
+    Some(if c_true { (cc, x, y) } else { (cc.complement(), x, y) })
+}
+
+/// Index constants known on entry to blocks whose only predecessor is a
+/// `br_table` listing them once (not as default): `idx == k`, and also
+/// `x == k` when `idx = ireduce x` and `x` is a `uextend` no wider than `idx`.
+fn table_facts(func: &Function, cfg: &ControlFlowGraph) -> FxHashMap<Block, Vec<(Value, u64)>> {
+    let mut m: FxHashMap<Block, Vec<(Value, u64)>> = FxHashMap::default();
+    let pool = &func.dfg.value_lists;
+    // Arms grouped by their dispatch inst — per-arm jump-table scans are
+    // O(arms²), so each table is walked once and per-target hits counted.
+    let mut by_inst: FxHashMap<Inst, Vec<(Block, cranelift_codegen::ir::JumpTable)>> =
+        FxHashMap::default();
+    for b in func.layout.blocks() {
+        let mut preds = cfg.pred_iter(b);
+        let (Some(p), None) = (preds.next(), preds.next()) else {
+            continue;
+        };
+        if p.block == b {
+            continue;
+        }
+        let InstructionData::BranchTable { table, .. } = func.dfg.insts[p.inst] else {
+            continue;
+        };
+        let jt = &func.dfg.jump_tables[table];
+        if jt.default_block().block(pool) == b {
+            continue;
+        }
+        by_inst.entry(p.inst).or_default().push((b, table));
+    }
+    for (pinst, arms) in by_inst {
+        let InstructionData::BranchTable { arg, .. } = func.dfg.insts[pinst] else {
+            continue;
+        };
+        let arg = func.dfg.resolve_aliases(arg);
+        // One pass over the shared table: target -> (count, first index).
+        let mut cnt: FxHashMap<Block, (u32, u64)> = FxHashMap::default();
+        for (k, c) in func.dfg.jump_tables[arms[0].1]
+            .as_slice()
+            .iter()
+            .enumerate()
+        {
+            let e = cnt.entry(c.block(pool)).or_default();
+            e.0 += 1;
+            e.1 = k as u64;
+        }
+        for (b, _) in arms {
+            let Some(&(1, k)) = cnt.get(&b) else {
+                continue;
+            };
+            let mut v = vec![(arg, k)];
+            if let Some(i) = func.dfg.value_def(arg).inst()
+                && let InstructionData::Unary {
+                    opcode: Opcode::Ireduce,
+                    arg: x,
+                } = func.dfg.insts[i]
+            {
+                let x = func.dfg.resolve_aliases(x);
+                if let Some(j) = func.dfg.value_def(x).inst()
+                    && let InstructionData::Unary {
+                        opcode: Opcode::Uextend,
+                        arg: n,
+                    } = func.dfg.insts[j]
+                    && bits(func, n)
+                        .zip(bits(func, arg))
+                        .is_some_and(|(n, a)| n <= a)
+                {
+                    v.push((x, k));
+                }
+            }
+            m.insert(b, v);
+        }
+    }
+    m
+}
+
+/// Facts holding throughout `b`: those of `b` and its dominators.
+pub(crate) fn facts_at(
+    domtree: &DominatorTree,
+    fact: &FxHashMap<Block, Cmp>,
+    b: Block,
+) -> Vec<Cmp> {
+    let mut fs = Vec::new();
+    if fact.is_empty() {
+        return fs;
+    }
+    let mut cur = Some(b);
+    for _ in 0..64 {
+        let Some(c) = cur else { break };
+        if let Some(&f) = fact.get(&c) {
+            fs.push(f);
+        }
+        cur = domtree.idom(c);
+    }
+    fs
+}
+
+/// Fold icmps decided by a dominating branch: a block whose only predecessor
+/// ends in `brif c` knows `c` (or its complement), as do the blocks it
+/// dominates; equal operands or a constant against a known range decide it.
+/// Returns the icmps folded.
+pub fn fold_dominated_conds(func: &mut Function) -> usize {
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    fold_dominated_conds_at(func, &cfg, &domtree)
+}
+
+pub(crate) fn fold_dominated_conds_at(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    domtree: &DominatorTree,
+) -> usize {
+    let folds = dominated_conds(func, cfg, domtree);
+    for &(i, k) in &folds {
+        let ty = func.dfg.value_type(func.dfg.first_result(i));
+        func.replace(i).iconst(ty, i64::from(k));
+    }
+    folds.len()
+}
+
+/// The values of `fold_dominated_conds` and `fold_const_branches` without rewriting `func`.
+pub fn known_values(func: &Function) -> FxHashMap<Value, u64> {
+    let cfg = ControlFlowGraph::with_function(func);
+    let domtree = DominatorTree::with_function(func, &cfg);
+    known_values_at(func, &cfg, &domtree)
+}
+
+/// `known_values` over caller-supplied cfg/domtree.
+pub fn known_values_at(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    domtree: &DominatorTree,
+) -> FxHashMap<Value, u64> {
+    let mut env: FxHashMap<Value, u64> = dominated_conds(func, cfg, domtree)
+        .into_iter()
+        .map(|(i, k)| (func.dfg.first_result(i), u64::from(k)))
+        .collect();
+    for _ in 0..2 {
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                if func.dfg.inst_results(i).len() == 1
+                    && !env.contains_key(&func.dfg.first_result(i))
+                    && let Some(c) = eval(func, &env, &|_| false, &|_| None, i)
+                {
+                    env.insert(func.dfg.first_result(i), c);
+                }
+            }
+        }
+    }
+    env
+}
+
+pub fn known_value(func: &Function, env: &FxHashMap<Value, u64>, v: Value) -> Option<u64> {
+    known(func, env, v)
+}
+
+fn dominated_conds(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    domtree: &DominatorTree,
+) -> Vec<(Inst, bool)> {
+    let fact = edge_facts(func, &cfg);
+    let tfact = table_facts(func, &cfg);
+    let range2 = crate::pass_enabled("PLIRON_RANGE2");
+    if !range2 && fact.is_empty() && tfact.is_empty() {
+        return Vec::new();
+    }
+    // One domtree DFS carries the inherited facts into each block
+    // instead of two ≤64-hop idom walks per block: `fs` is the chain
+    // nearest-first (stack top = the block itself), and `env` keeps the
+    // original furthest-ancestor-wins precedence — entries are only
+    // filled when an ancestor didn't already set them, and an undo log
+    // restores them on exit. The tree itself is CSR-built (`head`/`kids`)
+    // so this per-iteration scan doesn't pay a hashmap + Vec per edge.
+    let mut head: SecondaryMap<Block, u32> = SecondaryMap::new();
+    let mut deg: SecondaryMap<Block, u32> = SecondaryMap::new();
+    for b in func.layout.blocks() {
+        if let Some(p) = domtree.idom(b) {
+            deg[p] += 1;
+        }
+    }
+    let mut total = 0u32;
+    for b in func.layout.blocks() {
+        head[b] = total;
+        total += deg[b];
+    }
+    let mut kids = vec![Block::from_u32(0); total as usize];
+    let mut cur = head.clone();
+    for b in func.layout.blocks() {
+        if let Some(p) = domtree.idom(b) {
+            kids[cur[p] as usize] = b;
+            cur[p] += 1;
+        }
+    }
+    let mut fs: Vec<Cmp> = Vec::new();
+    let mut env: FxHashMap<Value, u64> = FxHashMap::default();
+    let mut undo: Vec<Value> = Vec::new();
+    let mut folds = Vec::new();
+    // Scratch reused per block — `fs`/`eqs` views and the `alts` lists
+    // were three small Vec allocs per factful block per iteration.
+    let mut fsv: Vec<Cmp> = Vec::new();
+    let mut eqs: Vec<(Value, Value)> = Vec::new();
+    let mut av: Vec<Value> = Vec::new();
+    let mut bv: Vec<Value> = Vec::new();
+    // (block, fs_mark, undo_mark, exiting) — enter pushes the block's
+    // own facts after recording marks, exit truncates back to them.
+    let mut stack: Vec<(Block, usize, usize, bool)> = func
+        .layout
+        .blocks()
+        .filter(|&b| domtree.idom(b).is_none())
+        .map(|b| (b, 0, 0, false))
+        .collect();
+    while let Some((b, fmark, umark, exit)) = stack.pop() {
+        if exit {
+            for &v in undo[umark..].iter() {
+                env.remove(&v);
+            }
+            undo.truncate(umark);
+            fs.truncate(fmark);
+            continue;
+        }
+        let (fmark, umark) = (fs.len(), undo.len());
+        if let Some(&f) = fact.get(&b) {
+            fs.push(f);
+        }
+        for &(v, k) in tfact.get(&b).into_iter().flatten() {
+            if !env.contains_key(&v) {
+                env.insert(v, k);
+                undo.push(v);
+            }
+        }
+        stack.push((b, fmark, umark, true));
+        for &c in &kids[head[b] as usize..head[b] as usize + deg[b] as usize] {
+            stack.push((c, 0, 0, false));
+        }
+        if !range2 && fs.is_empty() && env.is_empty() {
+            continue;
+        }
+        // Nearest-ancestor-first, as `facts_at` produced.
+        fsv.clear();
+        fsv.extend(fs.iter().rev().copied());
+        let fs = fsv.as_slice();
+        // `x == y` facts let a query on `y` be decided through `x`.
+        eqs.clear();
+        eqs.extend(
+            fs.iter()
+                .filter(|f| f.0 == IntCC::Equal)
+                .map(|f| (f.1, f.2)),
+        );
+        let alts = |scratch: &mut Vec<Value>, v: Value| {
+            scratch.clear();
+            scratch.push(v);
+            for &(x, y) in &eqs {
+                if x == v {
+                    scratch.push(y);
+                } else if y == v {
+                    scratch.push(x);
+                }
+            }
+        };
+        let decide = |q: Cmp| -> Option<bool> {
+            if let Some(r) = fs.iter().find_map(|&f| implied(f, q)) {
+                return Some(r);
+            }
+            let w = bits(func, q.1)?;
+            let (ka, kb) = (known(func, &env, q.1), known(func, &env, q.2));
+            if let (Some(a), Some(b)) = (ka, kb) {
+                return Some(icmp(q.0, a, b, w));
+            }
+            range_cmp(
+                q.0,
+                ka,
+                kb,
+                urange(func, fs, q.1, 0, range2),
+                urange(func, fs, q.2, 0, range2),
+                w,
+            )
+        };
+        for i in func.layout.block_insts(b) {
+            let Some(q) = norm_icmp(func, i) else {
+                continue;
+            };
+            alts(&mut av, q.1);
+            let r = av.iter().copied().find_map(|a| {
+                alts(&mut bv, q.2);
+                bv.iter()
+                    .copied()
+                    .map(|b| (q.0, a, b))
+                    .find_map(decide)
+            });
+            if let Some(k) = r {
+                folds.push((i, k));
+            }
+        }
+    }
+    folds
+}
+
+/// Would aliasing `p -> v` leave `v`'s def reading its own result?
+/// The dominance check in `remove_trivial_params` is block-granular: it
+/// can't see `v`'s def reading `p` (a latch `p + k` when the loop header's
+/// only surviving pred is the latch — threading can strand a loop like
+/// that). Walk `v`'s operands through aliases, and through the edge args
+/// that feed block-param defs; past the budget conservatively answers
+/// yes, which only leaves the param unremoved.
+///
+/// `v`'s operand cone — `remove_trivial_params` evaluates ~1k `(v, p)`
+/// pairs per round, some sharing `v`, so the walk runs once per distinct
+/// `v` and membership answers the rest. `Overflow` = the walk hit its
+/// budget (or a revisit) — the conservative "may read" marker, so a
+/// failed cone is never re-walked.
+enum Cone {
+    Overflow,
+    Full(FxHashSet<Value>),
+}
+
+/// Tarjan over the *pred* relation — SCC partitions are symmetric under
+/// reversal, and `remove_trivial_params` only asks "same component?".
+/// Iterative because corpus functions run to tens of thousands of blocks.
+fn scc_ids(func: &Function, cfg: &ControlFlowGraph) -> SecondaryMap<Block, u32> {
+    let mut idx_of = SecondaryMap::<Block, u32>::new();
+    let mut low = SecondaryMap::<Block, u32>::new();
+    let mut comp = SecondaryMap::<Block, u32>::new();
+    let mut on = SecondaryMap::<Block, bool>::new();
+    let mut s: Vec<Block> = Vec::new();
+    let mut call: Vec<(Block, Vec<Block>, usize)> = Vec::new();
+    let mut next = 1u32;
+    let mut ncomp = 0u32;
+    for b in func.layout.blocks() {
+        if idx_of[b] != 0 {
+            continue;
+        }
+        idx_of[b] = next;
+        low[b] = next;
+        next += 1;
+        s.push(b);
+        on[b] = true;
+        call.push((b, cfg.pred_iter(b).map(|p| p.block).collect(), 0));
+        while let Some((w, ps, i)) = call.last_mut() {
+            let w = *w;
+            if *i < ps.len() {
+                let u = ps[*i];
+                *i += 1;
+                if idx_of[u] == 0 {
+                    idx_of[u] = next;
+                    low[u] = next;
+                    next += 1;
+                    s.push(u);
+                    on[u] = true;
+                    call.push((u, cfg.pred_iter(u).map(|p| p.block).collect(), 0));
+                } else if on[u] {
+                    low[w] = low[w].min(idx_of[u]);
+                }
+            } else {
+                call.pop();
+                if let Some((p, _, _)) = call.last() {
+                    let p = *p;
+                    low[p] = low[p].min(low[w]);
+                }
+                if low[w] == idx_of[w] {
+                    ncomp += 1;
+                    while let Some(t) = s.pop() {
+                        on[t] = false;
+                        comp[t] = ncomp;
+                        if t == w {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    comp
+}
+
+fn reads_param_cone(func: &Function, cfg: &ControlFlowGraph, v: Value, cone: &mut Cone) {
+    if !matches!(cone, Cone::Overflow) {
+        return;
+    }
+    let mut seen: FxHashSet<Value> = FxHashSet::default();
+    let mut stack = vec![func.dfg.resolve_aliases(v)];
+    while let Some(w) = stack.pop() {
+        if !seen.insert(w) || seen.len() > 256 {
+            return;
+        }
+        match func.dfg.value_def(w) {
+            ValueDef::Result(i, _) => stack.extend(
+                func.dfg
+                    .inst_args(i)
+                    .iter()
+                    .map(|&a| func.dfg.resolve_aliases(a)),
+            ),
+            ValueDef::Param(b, _) => {
+                for t in cfg.pred_iter(b) {
+                    let i = t.inst;
+                    for bc in func.dfg.insts[i].branch_destination(
+                        &func.dfg.jump_tables,
+                        &func.dfg.exception_tables,
+                    ) {
+                        if bc.block(&func.dfg.value_lists) == b {
+                            stack.extend(bc.args(&func.dfg.value_lists).filter_map(|a| {
+                                match a {
+                                    BlockArg::Value(av) => Some(func.dfg.resolve_aliases(av)),
+                                    _ => None,
+                                }
+                            }));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    *cone = Cone::Full(seen);
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum In {
+    Unset,
+    One(Value),
+    /// `One` evaluated-and-rejected on the *definition* side (`v`'s def
+    /// is `b` itself, unattached, or fails to dominate `b`). `Value` is
+    /// the resolved carrier at eval time; while it still resolves to
+    /// itself the cheap `def_block`+`try_dominates` check is redone each
+    /// round — retargeted edges strengthen dominance and can enable a
+    /// removal this round's scan missed.
+    ChkD(Value),
+    /// `One` rejected because `p` is inside `v`'s operand cone
+    /// (`reads_param`). Skipped while the carrier resolves to itself —
+    /// a stale rejection is sound; at worst a shrinking cone leaves a
+    /// removable param.
+    ChkR(Value),
+    Many,
+}
+
+/// The per-block incoming-arg fold `remove_trivial_params` scans, kept
+/// across `run`'s fixpoint so a quiet round recomputes only blocks whose
+/// in-edges or param lists were rewritten (`dirty`). A stale entry is a
+/// fold over a *superset* of the real in-edges — edge losses go unmarked
+/// (`bypass`/`round` evict only the retarget's destination) — and "every
+/// in-edge passes `v`" over a superset still holds over the subset, so a
+/// stale `One(v)` stays sound; a stale `Many` merely hides a removal.
+/// Carriers are re-resolved at use: new `change_to_alias` chains (this
+/// pass, `domcond`'s iconst folds) extend chains only at their ends, so
+/// args that all resolved to `v` still all resolve to `resolve(v)`.
+#[derive(Default)]
+pub(crate) struct TrivpInc {
+    inc: FxHashMap<Block, Vec<In>>,
+    /// Blocks whose in-edges or params changed since their fold — they
+    /// refold, but unchanged slots keep their `Chk*` verdicts.
+    dirty: FxHashSet<Block>,
+}
+
+impl TrivpInc {
+    /// Mark blocks whose in-edges or params changed since the scan.
+    fn dirty(&mut self, bs: impl IntoIterator<Item = Block>) {
+        self.dirty.extend(bs);
+    }
+    /// `ifconv`/`unreach` rewrite edges too entangled for per-block
+    /// eviction — rescan everything.
+    fn clear(&mut self) {
+        self.inc.clear();
+        self.dirty.clear();
+    }
+}
+
+/// One block's `inc` fold: every in-edge's arg for each param position.
+fn trivp_fold(
+    func: &Function,
+    cfg: &ControlFlowGraph,
+    s: Block,
+    params: &[Value],
+) -> Vec<In> {
+    let mut st = vec![In::Unset; params.len()];
+    for pred in cfg.pred_iter(s) {
+        let t = pred.inst;
+        if !matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif) {
+            st.iter_mut().for_each(|x| *x = In::Many);
+            break;
+        }
+        for bc in func.dfg.insts[t]
+            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+        {
+            if bc.block(&func.dfg.value_lists) != s {
+                continue;
+            }
+            for (i, a) in bc.args(&func.dfg.value_lists).enumerate().take(st.len()) {
+                let new = match a {
+                    BlockArg::Value(v) => {
+                        let v = func.dfg.resolve_aliases(v);
+                        if v == params[i] {
+                            continue;
+                        }
+                        In::One(v)
+                    }
+                    _ => In::Many,
+                };
+                st[i] = match (st[i], new) {
+                    (In::Unset, x) => x,
+                    (In::One(a), In::One(b)) if a == b => In::One(a),
+                    _ => In::Many,
+                };
+            }
+        }
+    }
+    st
+}
+
+fn remove_trivial_params_inc(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+    inc: &mut TrivpInc,
+) -> Vec<(Value, Value)> {
+    let TrivpInc { inc, dirty } = inc;
+    let entry = func.layout.entry_block();
+    let prof = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
+    let t_scan = prof.then(std::time::Instant::now);
+    let mut n_scan = 0usize;
+    // Only a block with params can yield a removal: visit just its
+    // in-edges (from the caller's CFG) rather than folding over every
+    // edge in the function. Entries from the previous round survive;
+    // dirty blocks refold — a slot whose carrier still resolves to the
+    // checked value keeps its verdict.
+    for s in func.layout.blocks() {
+        let params = func.dfg.block_params(s);
+        if params.is_empty() {
+            inc.remove(&s);
+            dirty.remove(&s);
+            continue;
+        }
+        let is_dirty = dirty.remove(&s);
+        if Some(s) == entry || (!is_dirty && inc.contains_key(&s)) {
+            continue;
+        }
+        let st = trivp_fold(func, cfg, s, params);
+        n_scan += 1;
+        if let Some(old) = inc.get_mut(&s) {
+            // Reconcile: `Chk*` verdicts ride out the refold when the
+            // slot still records the same resolved carrier.
+            if old.len() == st.len() {
+                for (o, n) in old.iter_mut().zip(&st) {
+                    match (*o, *n) {
+                        (In::ChkD(v) | In::ChkR(v), In::One(v0))
+                            if func.dfg.try_resolve_aliases(v0) == Some(v) => {}
+                        _ => *o = *n,
+                    }
+                }
+            } else {
+                *old = st;
+            }
+        } else {
+            inc.insert(s, st);
+        }
+    }
+    let el_scan = t_scan.map_or(std::time::Duration::ZERO, |t| t.elapsed());
+    let t_cand = prof.then(std::time::Instant::now);
+    let mut n_one = 0usize;
+    let mut n_rp = 0usize;
+    let def_block = |func: &Function, v: Value| match func.dfg.try_value_def(v) {
+        Some(ValueDef::Result(i, _)) => func.layout.inst_block(i),
+        Some(ValueDef::Param(b, _)) => Some(b),
+        _ => None,
+    };
+    // `v` must dominate `b`: an edge passing the param itself (e.g. a loop
+    // latch) does not constrain `v`'s position, so without this check the
+    // alias can put `v` in scopes its def doesn't dominate.
+    let mut rm: Vec<(Block, usize, Value, Value)> = Vec::new();
+    // Carriers whose defs vanished between scans (a param `deadp`
+    // removed feeding nothing else, an inst swept since) can't alias a
+    // live param; pinning the slot `Many` keeps the entry instead of
+    // rescans re-recording the same dead carrier every round.
+    let mut kill: Vec<(Block, usize)> = Vec::new();
+    // `v`'s operand cone per distinct carrier — `Overflow` entries
+    // answer "may read" to every query.
+    let mut cones: FxHashMap<Value, Cone> = FxHashMap::default();
+    // `p ∈ cone(v)` needs `b` to reach `d = def_block(v)` through the
+    // param-feed chain; with `d` dominating `b` that's exactly "same
+    // SCC". Outside it the reads check is a free "no" — computed lazily
+    // since quiet rounds need no walk at all.
+    let mut scc: Option<SecondaryMap<Block, u32>> = None;
+    // Slots evaluated this call that stayed `One` — upgraded to `Chk*`
+    // afterwards (`true` = def/dom reject → `ChkD`, `false` = reads_param
+    // reject → `ChkR`) so quiet rounds skip or cheapen re-evaluation.
+    let mut mark: Vec<(Block, usize, Value, bool)> = Vec::new();
+    for (&b, st) in inc.iter() {
+        if Some(b) == entry {
+            continue;
+        }
+        let ps = func.dfg.block_params(b);
+        if ps.len() != st.len() {
+            // Arity changed without a `dirty` mark — defensive; drop so
+            // the next call refolds.
+            kill.push((b, usize::MAX));
+            continue;
+        }
+        for (i, s) in st.iter().enumerate() {
+            let v0 = match *s {
+                In::One(v0) => v0,
+                In::ChkR(v) => {
+                    if func.dfg.try_resolve_aliases(v) == Some(v)
+                        && func.dfg.value_is_attached(v)
+                    {
+                        continue;
+                    }
+                    v
+                }
+                In::ChkD(v) => {
+                    if func.dfg.try_resolve_aliases(v) == Some(v)
+                        && func.dfg.value_is_attached(v)
+                    {
+                        // Carrier stable — redo just the check that
+                        // rejected it; dominance may have strengthened.
+                        match def_block(func, v) {
+                            Some(d) if d != b && dt.try_dominates(d, b, &func.layout) => v,
+                            _ => continue,
+                        }
+                    } else {
+                        v
+                    }
+                }
+                _ => continue,
+            };
+            let v = func
+                .dfg
+                .try_resolve_aliases(v0)
+                .filter(|&v| func.dfg.value_is_attached(v));
+            match v {
+                Some(v) => {
+                    n_one += 1;
+                    match def_block(func, v) {
+                        Some(d) if d != b && dt.try_dominates(d, b, &func.layout) => {
+                            let sm = scc.get_or_insert_with(|| scc_ids(func, cfg));
+                            // Different SCCs: `b` can't reach `d`, so `p` is
+                            // provably outside `v`'s cone — no walk needed.
+                            let reads = if sm[b] == sm[d] {
+                                n_rp += 1;
+                                let cone = cones.entry(v).or_insert(Cone::Overflow);
+                                reads_param_cone(func, cfg, v, cone);
+                                match cone {
+                                    Cone::Full(seen) => seen.contains(&ps[i]),
+                                    Cone::Overflow => true,
+                                }
+                            } else {
+                                false
+                            };
+                            if reads {
+                                mark.push((b, i, v, false));
+                            } else {
+                                rm.push((b, i, ps[i], v));
+                            }
+                        }
+                        _ => mark.push((b, i, v, true)),
+                    }
+                }
+                None => kill.push((b, i)),
+            }
+        }
+    }
+    if prof {
+        tracing::info!(target: "pliron::jumpthread",
+            "    trivp-fill {el_scan:?}({n_scan}) cand {:?}({n_one}/{n_rp} cones={} rm={} of {})",
+            t_cand.unwrap().elapsed(), cones.len(), rm.len(), inc.len());
+    }
+    for (b, i) in kill {
+        if i == usize::MAX {
+            inc.remove(&b);
+        } else if let Some(st) = inc.get_mut(&b) {
+            st[i] = In::Many;
+        }
+    }
+    for (b, i, v, dom) in mark {
+        if let Some(st) = inc.get_mut(&b) {
+            st[i] = if dom { In::ChkD(v) } else { In::ChkR(v) };
+        }
+    }
+    // No alias chains between params removed together (avoids alias
+    // loops) — collapse them instead: a carrier `v` that is itself being
+    // removed (`v -> w` in this round's map) hands `w` onward, so
+    // `p -> v -> … -> r` becomes `p -> r` in one round. Soundness comes
+    // free: `def(r) dom b` is transitive along the chain (each link's
+    // own check passed), and each intermediate carrier lies in the
+    // previous one's operand cone (`r ∈ cone(v)`), so `cone(r) ⊆
+    // cone(v)` keeps `p ∉ cone(r)` — the `reads_param` gate — already
+    // proven. A cycle (v → … → v) drops the whole cycle, matching the
+    // old filter's reject for chainless carriers.
+    let gone: FxHashSet<Value> = rm.iter().map(|r| r.2).collect();
+    if rm.iter().any(|r| gone.contains(&r.3)) {
+        let rmap: FxHashMap<Value, Value> = rm.iter().map(|r| (r.2, r.3)).collect();
+        let mut seen = FxHashSet::default();
+        for r in &mut rm {
+            let mut v = r.3;
+            seen.clear();
+            while gone.contains(&v) {
+                if !seen.insert(v) {
+                    v = Value::reserved_value();
+                    break;
+                }
+                v = rmap[&v];
+            }
+            r.3 = v;
+        }
+        rm.retain(|r| r.3 != Value::reserved_value());
+    }
+    if rm.is_empty() {
+        return Vec::new();
+    }
+    let mut idx: FxHashMap<Block, Vec<usize>> = FxHashMap::default();
+    for r in &rm {
+        idx.entry(r.0).or_default().push(r.1);
+    }
+    for v in idx.values_mut() {
+        v.sort_unstable_by(|a, b| b.cmp(a));
+    }
+    // Strip the removed arg slots on each in-edge to a touched block —
+    // `pred_iter` reaches the same terminators a full layout scan did
+    // (dedup: a brif with two dests to `b` lists its inst twice).
+    let mut pins: FxHashSet<Inst> = FxHashSet::default();
+    for (&b, is) in &idx {
+        pins.clear();
+        for pred in cfg.pred_iter(b) {
+            let t = pred.inst;
+            if !pins.insert(t)
+                || !matches!(func.dfg.insts[t].opcode(), Opcode::Jump | Opcode::Brif)
+            {
+                continue;
+            }
+            let dfg = &mut func.dfg;
+            for bc in dfg
+                .insts[t]
+                .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+            {
+                if bc.block(&dfg.value_lists) != b {
+                    continue;
+                }
+                for &i in is {
+                    bc.remove(i, &mut dfg.value_lists);
+                }
+            }
+        }
+    }
+    let aliases: Vec<(Value, Value)> = rm.iter().map(|&(_, _, p, v)| (p, v)).collect();
+    for &(_, _, p, v) in &rm {
+        func.dfg.remove_block_param(p);
+        func.dfg.change_to_alias(p, v);
+    }
+    // Arity on `b`'s in-edges shifted — rescan it next round. Other
+    // blocks' carriers just gained a `p -> v` hop; the lazy resolve
+    // above already follows those.
+    for &b in idx.keys() {
+        inc.remove(&b);
+    }
+    aliases
+}
+
+/// Block params whose every incoming `jump`/`brif` arg is one value `v` (or
+/// the param itself) become aliases of `v`. Threading's SSA repair creates
+/// these, and Cranelift only removes them after our condition folding ran, so
+/// the same value seen through two params would not match a dominating test.
+pub fn remove_trivial_params(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    dt: &DominatorTree,
+) -> Vec<(Value, Value)> {
+    remove_trivial_params_inc(func, cfg, dt, &mut TrivpInc::default())
+}
+
+fn mark_live_param(
+    func: &Function,
+    value: Value,
+    live: &mut FxHashMap<Block, Vec<bool>>,
+    work: &mut Vec<(Block, usize)>,
+) {
+    let value = func.dfg.resolve_aliases(value);
+    let ValueDef::Param(block, index) = func.dfg.value_def(value) else {
+        return;
+    };
+    let Some(is_live) = live
+        .get_mut(&block)
+        .and_then(|params| params.get_mut(index))
+    else {
+        return;
+    };
+    if !*is_live {
+        *is_live = true;
+        work.push((block, index));
+    }
+}
+
+pub fn remove_dead_params(func: &mut Function, cfg: &ControlFlowGraph) -> usize {
+    remove_dead_params_bl(func, cfg, None)
+}
+
+/// `touched` collects the blocks that lost params — `run` rescans their
+/// `TrivpInc` entries since in-edge arg arity shifted.
+pub(crate) fn remove_dead_params_bl(
+    func: &mut Function,
+    cfg: &ControlFlowGraph,
+    mut touched: Option<&mut FxHashSet<Block>>,
+) -> usize {
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    let mut live: FxHashMap<Block, Vec<bool>> = blocks
+        .iter()
+        .map(|&block| (block, vec![false; func.dfg.num_block_params(block)]))
+        .collect();
+    let mut protected: FxHashSet<Block> = func.layout.entry_block().into_iter().collect();
+    // In-edges come from the caller's CFG (`pred_iter`) instead of a
+    // per-edge (inst, dest) map built here every round. Edge args are
+    // re-read on demand, so edges whose target never marks a live param
+    // don't pay for a Vec<BlockArg> each.
+    let mut work = Vec::new();
+
+    for &block in &blocks {
+        for inst in func.layout.block_insts(block) {
+            let data = &func.dfg.insts[inst];
+            for call in
+                data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+            {
+                let target = call.block(&func.dfg.value_lists);
+                if call
+                    .args(&func.dfg.value_lists)
+                    .any(|arg| !matches!(arg, BlockArg::Value(_)))
+                {
+                    protected.insert(target);
+                }
+            }
+            for &value in func.dfg.inst_args(inst) {
+                mark_live_param(func, value, &mut live, &mut work);
+            }
+            if let Some(table) = data.exception_table() {
+                for target in func.dfg.exception_tables[table].all_branches() {
+                    protected.insert(target.block(&func.dfg.value_lists));
+                }
+                for item in func.dfg.exception_tables[table].items() {
+                    if let ExceptionTableItem::Context(value) = item {
+                        mark_live_param(func, value, &mut live, &mut work);
+                    }
+                }
+            }
+        }
+    }
+
+    for &block in &blocks {
+        if protected.contains(&block) {
+            for (index, is_live) in live.get_mut(&block).unwrap().iter_mut().enumerate() {
+                if !*is_live {
+                    *is_live = true;
+                    work.push((block, index));
+                }
+            }
+        }
+    }
+
+    while let Some((target, index)) = work.pop() {
+        for pred in cfg.pred_iter(target) {
+            for bc in func.dfg.insts[pred.inst].branch_destination(
+                &func.dfg.jump_tables,
+                &func.dfg.exception_tables,
+            ) {
+                if bc.block(&func.dfg.value_lists) != target {
+                    continue;
+                }
+                if let Some(BlockArg::Value(value)) = bc.args(&func.dfg.value_lists).nth(index) {
+                    mark_live_param(func, value, &mut live, &mut work);
+                }
+            }
+        }
+    }
+
+    let mut dead: FxHashMap<Block, Vec<usize>> = FxHashMap::default();
+    for &block in &blocks {
+        if protected.contains(&block) {
+            continue;
+        }
+        for (index, &is_live) in live.get(&block).unwrap().iter().enumerate() {
+            if !is_live {
+                dead.entry(block).or_default().push(index);
+            }
+        }
+    }
+    if dead.is_empty() {
+        return 0;
+    }
+    for indices in dead.values_mut() {
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+    }
+
+    let terms: Vec<Inst> = blocks
+        .iter()
+        .filter_map(|&block| func.layout.last_inst(block))
+        .collect();
+    for term in terms {
+        let dfg = &mut func.dfg;
+        for call in
+            dfg.insts[term].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
+        {
+            if let Some(indices) = dead.get(&call.block(&dfg.value_lists)) {
+                for &index in indices {
+                    call.remove(index, &mut dfg.value_lists);
+                }
+            }
+        }
+    }
+
+    let removed = dead.values().map(Vec::len).sum();
+    for (&block, indices) in &dead {
+        for &index in indices {
+            let param = func.dfg.block_params(block)[index];
+            func.dfg.remove_block_param(param);
+        }
+    }
+    if let Some(t) = touched.as_deref_mut() {
+        t.extend(dead.keys().copied());
+    }
+    removed
+}
+
+fn remove_unused_notrap_loads(func: &mut Function) {
+    remove_dead_insts(func, false);
+}
+
+/// Drop blocks not reachable from the entry, unless a reachable instruction
+/// uses a value they define (then nothing is removed). Returns blocks removed.
+pub fn remove_unreachable_blocks(func: &mut Function) -> usize {
+    let Some(entry) = func.layout.entry_block() else {
+        return 0;
+    };
+    let mut seen: FxHashSet<Block> = FxHashSet::default();
+    let mut work = vec![entry];
+    while let Some(b) = work.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        if let Some(term) = func.layout.last_inst(b) {
+            let data = &func.dfg.insts[term];
+            for call in data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables) {
+                work.push(call.block(&func.dfg.value_lists));
+            }
+        }
+    }
+    let dead: Vec<Block> = func.layout.blocks().filter(|b| !seen.contains(b)).collect();
+    if dead.is_empty() {
+        return 0;
+    }
+    let defined_in_dead = |func: &Function, v: Value| match func.dfg.resolved_value_def(v) {
+        ValueDef::Result(i, _) => func
+            .layout
+            .inst_block(i)
+            .is_some_and(|b| !seen.contains(&b)),
+        ValueDef::Param(b, _) => !seen.contains(&b),
+        _ => false,
+    };
+    for &b in &seen {
+        for i in func.layout.block_insts(b) {
+            if func.dfg.inst_values(i).any(|v| defined_in_dead(func, v)) {
+                return 0;
+            }
+        }
+    }
+    for &b in &dead {
+        while let Some(i) = func.layout.last_inst(b) {
+            func.layout.remove_inst(i);
+        }
+        func.layout.remove_block(b);
+    }
+    dead.len()
+}
+
+/// `brif c, B(args), B(args)` -> `jump B(args)`. Returns branches folded.
+pub fn fold_same_target_brifs(func: &mut Function) -> usize {
+    let mut n = 0;
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    for b in blocks {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        let InstructionData::Brif { blocks: [x, y], .. } = func.dfg.insts[t] else {
+            continue;
+        };
+        let pool = &func.dfg.value_lists;
+        if x.block(pool) == y.block(pool) && x.args(pool).eq(y.args(pool)) {
+            func.dfg.insts[t] = InstructionData::Jump {
+                opcode: Opcode::Jump,
+                destination: x,
+            };
+            n += 1;
+        }
+    }
+    n
+}
+
+fn nonzero_iconst(func: &Function, v: Value) -> bool {
+    let Some(i) = func.dfg.resolved_value_def(v).inst() else {
+        return false;
+    };
+    matches!(
+        func.dfg.insts[i],
+        InstructionData::UnaryImm { opcode: Opcode::Iconst, imm } if imm.bits() != 0
+    )
+}
+
+/// Can `inst` be deleted when none of its results are used? Always true for
+/// `notrap` loads; with `pure`, also for side-effect-free, non-trapping ops
+/// (plus `udiv`/`urem` by a nonzero constant).
+pub fn removable(func: &Function, inst: Inst, pure: bool) -> bool {
+    let data = &func.dfg.insts[inst];
+    if let InstructionData::Load { flags, .. } = *data {
+        return func.dfg.mem_flags[flags].notrap();
+    }
+    let op = data.opcode();
+    pure && !(op.is_call()
+        || op.is_branch()
+        || op.is_terminator()
+        || op.can_load()
+        || op.can_store()
+        || op.other_side_effects())
+        && (!op.can_trap()
+            || matches!(
+                *data,
+                InstructionData::Binary { opcode: Opcode::Udiv | Opcode::Urem, args }
+                    if nonzero_iconst(func, args[1])
+            ))
+}
+
+/// Delete instructions whose results are all unused (see `removable`),
+/// propagating kills through operand use-counts until nothing dies.
+/// Returns the number deleted.
+pub fn remove_dead_insts(func: &mut Function, pure: bool) -> usize {
+    crate::uses::worklist_dce(func, |f, i| {
+        !f.dfg.inst_results(i).is_empty() && removable(f, i, pure)
+    })
+}
+
+/// One CFG+domtree "graph epoch" shared across a fixpoint's phases:
+/// `stale()` marks edge-adjacency edits, `get` recomputes into the same
+/// storage — the CSR/domtree backing arrays persist across epochs
+/// instead of being dropped and regrown (`with_function` per epoch was
+/// a measurable allocator leaf on 8-round giant functions). `as_ref`/
+/// `as_mut` hand out the pair only while fresh.
+pub struct Cd(Option<(ControlFlowGraph, DominatorTree)>, bool);
+
+impl Cd {
+    pub fn new() -> Self {
+        Cd(None, false)
+    }
+    /// Adopt an already-built pair (e.g. `Analysis::take_cfg_dt`) so a
+    /// pass's refreshes reuse the shared cache's storage.
+    pub fn from_parts(c: ControlFlowGraph, d: DominatorTree) -> Self {
+        Cd(Some((c, d)), false)
+    }
+    pub fn stale(&mut self) {
+        self.1 = true;
+    }
+    pub fn get<'a>(
+        &'a mut self,
+        func: &Function,
+    ) -> (&'a ControlFlowGraph, &'a DominatorTree) {
+        if self.1 || self.0.is_none() {
+            let (c, d) = self.0.get_or_insert_with(|| {
+                (ControlFlowGraph::new(), DominatorTree::new())
+            });
+            c.compute(func);
+            d.compute(func, c);
+            self.1 = false;
+        }
+        let (c, d) = self.0.as_ref().unwrap();
+        (c, d)
+    }
+    pub fn as_ref(&self) -> Option<(&ControlFlowGraph, &DominatorTree)> {
+        (!self.1)
+            .then(|| self.0.as_ref().map(|(c, d)| (&*c, &*d)))
+            .flatten()
+    }
+    pub fn as_mut(&mut self) -> Option<(&mut ControlFlowGraph, &mut DominatorTree)> {
+        (!self.1)
+            .then(|| self.0.as_mut().map(|(c, d)| (&mut *c, &mut *d)))
+            .flatten()
+    }
+}
+
+fn fnn<'a>(
+    func: &mut Function,
+    loads: &'a FxHashSet<Value>,
+    derived: &'a VMap<Value>,
+    sites: &'a SiteFacts,
+    nn: Option<NonNull<'a>>,
+    cd: &mut Cd,
+    rnn: Option<&RegionNN>,
+) -> usize {
+    if crate::pipeline::shape_of(func) & crate::pipeline::shape::TESTC == 0 {
+        return 0;
+    }
+    let nn = match nn {
+        Some(nn) => nn,
+        None => {
+            let (c, _) = cd.get(func);
+            NonNull::with_sites(func, c, loads, derived, sites)
+        }
+    };
+    fold_null_tests(func, &nn, rnn)
+}
+
+/// Late null-test folds (`PLIRON_NULLFOLD2=0` disables; from `jtround`): the
+/// lattice rebuilt on the current CFG for tests the first `jumpthread`
+/// could not decide. The zip/enumerate niche test is `icmp eq (select f,
+/// p, 0), 0` with `f` and `p` single-edge params only after edgespec and
+/// mergechain, and `p`'s stepped back-edge value carries its inbounds
+/// mark only after indvars. Decided `brif`s are folded and the blocks
+/// they strand removed.
+pub fn fold_nulls_late(
+    func: &mut Function,
+    loads: &FxHashSet<Value>,
+    derived: &VMap<Value>,
+    sites: &SiteFacts,
+) -> usize {
+    if crate::pipeline::shape_of(func) & crate::pipeline::shape::TESTC == 0 {
+        return 0;
+    }
+    let cfg = ControlFlowGraph::with_function(func);
+    let nn = NonNull::with_sites(func, &cfg, loads, derived, sites);
+    let k = fold_null_tests(func, &nn, None);
+    if k > 0 && fold_const_branches(func) > 0 {
+        remove_unreachable_blocks(func);
+    }
+    k
+}
+
+/// Thread until nothing changes (bounded); returns the edges retargeted.
+pub fn run(
+    func: &mut Function,
+    loads: &FxHashSet<Value>,
+    derived: &mut VMap<Value>,
+    sh: u32,
+) -> (usize, usize, usize, FxHashMap<Value, Value>) {
+    run_rnn(func, loads, derived, sh, None, &SiteFacts::default())
+}
+
+/// [`run`] with region-scoped non-null facts for the null-test folds.
+pub fn run_rnn(
+    func: &mut Function,
+    loads: &FxHashSet<Value>,
+    derived: &mut VMap<Value>,
+    sh: u32,
+    rnn: Option<&RegionNN>,
+    sites: &SiteFacts,
+) -> (usize, usize, usize, FxHashMap<Value, Value>) {
+    use crate::pipeline::shape;
+    let prof = pliron_cfg::tracing_on()
+        && tracing::enabled!(target: "pliron::jumpthread", tracing::Level::INFO);
+    let mut tp = prof.then(std::time::Instant::now);
+    // Sub-phase guards use the entry-time `shape` bits: no phase below
+    // can create the first edge (MULTI), block param (BPARAM), or
+    // conditional branch (CONDBR) — they only remove them — so an
+    // absent bit stays absent and a present bit merely over-admits a
+    // no-op scan. JUMP/TESTC *can* appear (domcond folds `brif`→`jump`,
+    // threading rewrites args to `iconst`), but nothing below consumes
+    // a stale-false JUMP and `fnn` checks TESTC fresh when it runs.
+    let mut cd = Cd::new();
+    // Null tests on block params first, before `merge_chains`/`trivp`/
+    // `deadp` dissolve single-source params into their incoming values: an
+    // inlined clone's entry param carries its callee's `nonnull` fact
+    // (`PLIRON_INLINENN`), which must not move to the caller's value.
+    if pliron_cfg::pass_enabled("PLIRON_INLINENN") {
+        fnn(func, loads, derived, sites, None, &mut cd, rnn);
+    }
+    if sh & shape::JUMP != 0 {
+        merge_chains(func, &mut cd);
+    }
+    if prof {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread", "  merge_chains {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
+        };
+        tp = Some(std::time::Instant::now());
+    }
+    let domcond = crate::pass_enabled("PLIRON_DOMCOND");
+    let trivp = crate::pass_enabled("PLIRON_TRIVPARAM");
+    let deadp = crate::pass_enabled("PLIRON_DEADPARAM");
+    let ifconv = crate::pass_enabled("PLIRON_IFCONV");
+    let mut total = 0;
+    let mut dead_params = 0;
+    let mut dominated_folds = 0;
+    let chk = crate::env_set("PLIRON_JT_CHECK");
+    let check = |func: &Function, tag: &str| {
+        if chk
+            && let Err(e) = cranelift_codegen::verify_function(
+                func,
+                &cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder()),
+            )
+        {
+            panic!("jt step {tag}: {e}\n{}", func.display());
+        }
+    };
+    // `change_to_alias` merges reported so the pipeline can carry the
+    // dropped params' facts (nonnull/deref/…) onto their carriers.
+    let mut pmap: FxHashMap<Value, Value> = FxHashMap::default();
+    // The `cd` epoch box above is reused through the fixpoint:
+    // param/alias/value rewrites (trivp, deadp, domcond, inst sweeps)
+    // leave adjacency intact, while ifconv/bypass/round retarget edges
+    // and mark it stale.
+    // `round` builds NonNull lazily on the first real candidate edge — a
+    // quiet round never pays for the fixpoint. `derived` mutates across
+    // iterations (ifconv), so the Option is per-iteration; when the loop
+    // converges (`n == 0`) nothing after its construction rewrote the
+    // function, so `fold_null_tests` runs on it inside the loop and the
+    // usize result crosses the boundary while `nn`'s borrow may not.
+    let mut fnn_cur: Option<usize> = None;
+    // Set after a round that changed nothing: if the next iteration's
+    // prefix phases (which are the only `func`/`derived` mutators —
+    // ifconv writes `derived` only inside real conversions) also change
+    // nothing, `round` would rescan an identical function and come back
+    // empty. Skip the rescan; `fold_null_tests` still gets a fresh nn.
+    let mut round_quiet = false;
+    let mut round_skips = 0usize;
+    // The nested `ifconv` is a full-function scan per round; its own
+    // rescan-to-fixpoint already converges, so rerunning it can only
+    // find diamonds that post-ifconv edits created — a `trivp`/`deadp`
+    // param removal changes an arm's edge-arg arity, `domcond` folds a
+    // `brif` into the `jump` that makes a block a pure forwarder, and
+    // `bypass`/`round` retarget edges. Track that: `ic_dirty` is set by
+    // any edit since the last nested ifconv, including that call's own
+    // `unreach` sweep (dead-pred removal can satisfy `edge_ok`).
+    let mut ic_dirty = true;
+    // The `NonNull` proof fixpoint persists across rounds as a bare
+    // param set — `round` re-wraps it each iteration (`from_params`),
+    // `bypass`/`round` retargets evict just the touched targets'
+    // params, `trivp`/`deadp`/`unreach` removals keep it sound (proofs
+    // only shrink), and `ifconv` conversions drop it wholesale. The
+    // `Option<NonNull>` itself can't outlive a round: `ifconv` needs
+    // `&mut *derived` while `NonNull` holds it shared.
+    let mut nn_params: Option<FxHashSet<Value>> = None;
+    // `trivp`'s in-edge fold survives rounds the same way: entries stay
+    // valid under edge loss and gain `dirty` blocks on retargets/param
+    // removals; `ifconv`+`unreach` clear it wholesale.
+    let mut trivp_inc = TrivpInc::default();
+    let mut trivp_dirty: FxHashSet<Block> = FxHashSet::default();
+    // `deadp`'s liveness scan only *shrinks* its live set — a clean
+    // scan stays clean until an edit rewrites edge args/params/inst
+    // operands (`changed` + `rn` cover every mutator in the loop).
+    // `bypass` is a pure function of the current func: a quiet call
+    // rescans identically until an edit lands.
+    let mut deadp_stale = true;
+    let mut bypass_stale = true;
+    for _ in 0..8 {
+        let mut tp = prof.then(std::time::Instant::now);
+        let mut changed = false;
+        if trivp && sh & (shape::MULTI | shape::BPARAM) == (shape::MULTI | shape::BPARAM) {
+            trivp_inc.dirty(trivp_dirty.drain());
+            let v = {
+                let (c, d) = cd.get(func);
+                remove_trivial_params_inc(func, c, d, &mut trivp_inc)
+            };
+            // Removed params become aliases — an edge arg that named
+            // one now resolves to its carrier, so kept `NonNull` proofs
+            // are stale even where edge shapes didn't change.
+            if !v.is_empty() {
+                nn_params = None;
+            }
+            changed = !v.is_empty();
+            pmap.extend(v);
+            check(func, "trivp");
+        }
+        if prof {
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::jumpthread", "  trivp {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
+            };
+            tp = Some(std::time::Instant::now());
+        }
+        if deadp && deadp_stale && sh & shape::BPARAM != 0 {
+            let removed = {
+                let (c, _) = cd.get(func);
+                remove_dead_params_bl(func, c, Some(&mut trivp_dirty))
+            };
+            dead_params += removed;
+            deadp_stale = removed != 0;
+            if removed != 0 {
+                remove_unused_notrap_loads(func);
+                changed = true;
+            }
+            check(func, "deadp");
+        }
+        if prof {
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::jumpthread", "  deadp {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
+            };
+            tp = Some(std::time::Instant::now());
+        }
+        let dc = if domcond && sh & shape::CONDBR != 0 {
+            let (c, d) = cd.get(func);
+            fold_dominated_conds_at(func, c, d)
+        } else {
+            0
+        };
+        changed |= dc > 0;
+        dominated_folds += dc;
+        if dc > 0 {
+            // `func.replace` aliases the folded compare onto an
+            // `iconst` — edge args naming it resolve differently now.
+            nn_params = None;
+        }
+        check(func, "domcond");
+        if prof {
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::jumpthread", "  domcond {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
+            };
+            tp = Some(std::time::Instant::now());
+        }
+        // Select-diamond if-conversion feeds back: folded forwarders expose
+        // new diamonds and bypass_forwarders collapses the residue. The dead
+        // side blocks keep phantom CFG edges (skewing dominance checks), so
+        // sweep them once unreachable. Skipped on rounds where nothing
+        // since the last run could have made a new arm pure — `changed`
+        // covers the prefix param/param-delete phases.
+        let ic = if ifconv && sh & shape::CONDBR != 0 && (ic_dirty || changed || dc > 0) {
+            ic_dirty = false;
+            crate::ifconv::run(
+                func,
+                derived,
+                cd.as_mut(),
+            )
+        } else {
+            0
+        };
+        check(func, "ifconv");
+        if ic > 0 {
+            changed = true;
+            cd.stale();
+            remove_unreachable_blocks(func);
+            // The sweep's dead-pred removal can satisfy `edge_ok` for a
+            // diamond ifconv's own fixpoint couldn't reach.
+            ic_dirty = true;
+            // Conversions splice selects and retarget merge edges —
+            // too entangled for per-block eviction.
+            nn_params = None;
+            trivp_inc.clear();
+            trivp_dirty.clear();
+        }
+        check(func, "unreach");
+        let bpn = if bypass_stale && sh & shape::MULTI != 0 {
+            let mut ev = FxHashSet::default();
+            let k = bypass_forwarders(
+                func,
+                cd.as_ref(),
+                Some(&mut ev),
+            );
+            bypass_stale = k != 0;
+            if let Some(ps) = &mut nn_params {
+                ps.retain(|&p| {
+                    !matches!(
+                        func.dfg.value_def(p),
+                        ValueDef::Param(b, _) if ev.contains(&b)
+                    )
+                });
+            }
+            trivp_dirty.extend(ev.iter().copied());
+            k
+        } else {
+            0
+        };
+        check(func, "bypass");
+        if bpn > 0 {
+            changed = true;
+            // Edge retargets invalidate the cached graph before `round`
+            // reads it — and can create pure forwarders ifconv wants.
+            cd.stale();
+            ic_dirty = true;
+        }
+        if prof {
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::jumpthread", "  ifconv+bypass {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
+            };
+            tp = Some(std::time::Instant::now());
+        }
+        let rn = if sh & shape::CONDBR == 0 || (round_quiet && !changed) {
+            round_skips += 1;
+            0
+        } else {
+            let (c, d) = cd.get(func);
+            let mut nn_opt = nn_params
+                .take()
+                .map(|ps| NonNull::from_params(loads, derived, ps));
+            let mut evict = FxHashSet::default();
+            let rn = round(
+                func,
+                loads,
+                derived,
+                sites,
+                &mut nn_opt,
+                domcond,
+                c,
+                d,
+                Some(&mut evict),
+            );
+            // `round`'s retargets handed each `evict` block a new or
+            // rewritten in-edge — drop those params' stale proofs.
+            nn_params = nn_opt.map(|n| n.params);
+            if let Some(ps) = &mut nn_params {
+                ps.retain(|&p| {
+                    !matches!(
+                        func.dfg.value_def(p),
+                        ValueDef::Param(b, _) if evict.contains(&b)
+                    )
+                });
+            }
+            trivp_dirty.extend(evict.iter().copied());
+            rn
+        };
+        round_quiet = rn == 0;
+        check(func, "round");
+        if prof {
+            if pliron_cfg::tracing_on() {
+                tracing::info!(target: "pliron::jumpthread", "  nn+round {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
+            };
+        }
+        if rn > 0 {
+            cd.stale();
+            ic_dirty = true;
+        }
+        let n = dc + ic + bpn + rn;
+        deadp_stale |= changed || rn > 0;
+        bypass_stale |= changed || rn > 0;
+        total += n;
+        if n == 0 {
+            // `fold_null_tests` on the converged function — a fresh
+            // `NonNull` matches the proofs a rebuild would produce.
+            fnn_cur = Some(fnn(func, loads, derived, sites, None, &mut cd, rnn));
+            break;
+        }
+        // No refresh needed: the guarded bits can only shrink inside
+        // this loop, so `sh` stays a sound over-approximation.
+    }
+    if prof {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread", "  loop-total {:?} (skips {round_skips})", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
+        };
+        tp = Some(std::time::Instant::now());
+    }
+    let fnn = match fnn_cur {
+        Some(x) => x,
+        None => fnn(func, loads, derived, sites, None, &mut cd, rnn),
+    };
+    if prof {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::jumpthread", "  fold_null_tests {:?}", tp.map_or(std::time::Duration::ZERO, |t| t.elapsed()))
+        };
+    }
+    (total + fnn, dead_params, dominated_folds, pmap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NonNull, fold_null_tests, remove_dead_params};
+    use cranelift_codegen::flowgraph::ControlFlowGraph;
+    use cranelift_codegen::ir::condcodes::IntCC;
+    use cranelift_codegen::ir::{BlockArg, Function, InstBuilder, InstructionData, Opcode, types};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use crate::vmap::VMap;
+    use rustc_hash::FxHashSet;
+
+    /// wasm32 `Chars::next`'s residual: the iter `ptr` is an i32 loop
+    /// param proven non-null by its `!nonnull` entry seed and the
+    /// inbounds-advance back edge, so `p == 0` (the `Option<&u8>` niche
+    /// test after `ptr == end` already branched) must fold to false.
+    /// The old `I64`-only param seed left it live at i32 width.
+    #[test]
+    fn nonnull_seed_admits_i32_params() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let (p, null_test, np) = {
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            let head = builder.create_block();
+            let chk = builder.create_block();
+            let body = builder.create_block();
+            let exit = builder.create_block();
+            builder.append_block_param(entry, types::I32); // ptr (nonnull)
+            builder.append_block_param(entry, types::I32); // end
+            builder.append_block_param(head, types::I32); // merged ptr
+
+            builder.switch_to_block(entry);
+            let v0 = builder.block_params(entry)[0];
+            builder.ins().jump(head, &[v0.into()]);
+
+            builder.switch_to_block(head);
+            let p = builder.block_params(head)[0];
+            let end = builder.block_params(entry)[1];
+            let endc = builder.ins().icmp(IntCC::Equal, p, end);
+            builder.ins().brif(endc, exit, &[], chk, &[]);
+
+            builder.switch_to_block(chk);
+            let z = builder.ins().iconst(types::I32, 0);
+            let null_test = builder.ins().icmp(IntCC::Equal, p, z);
+            builder.ins().brif(null_test, exit, &[], body, &[]);
+
+            builder.switch_to_block(body);
+            let np = builder.ins().iadd_imm_s(p, 1);
+            builder.ins().jump(head, &[np.into()]);
+
+            builder.switch_to_block(exit);
+            builder.ins().return_(&[]);
+            builder.seal_all_blocks();
+            (p, null_test, np)
+        };
+
+        // `v0` stands in for a `!nonnull`-marked value (`nnargs`-seeded
+        // `&str` data ptr); `np` is the inbounds `ptr + 1` advance.
+        let loads: FxHashSet<_> = [func.dfg.block_params(
+            func.layout.entry_block().unwrap(),
+        )[0]]
+        .into_iter()
+        .collect();
+        let derived: VMap<_> = [(np, p)].into_iter().collect();
+        let cfg = ControlFlowGraph::with_function(&func);
+        let nn = NonNull::new(&func, &cfg, &loads, &derived);
+        assert!(nn.is(&func, p), "i32 loop param should prove non-null");
+
+        assert_eq!(fold_null_tests(&mut func, &nn, None), 1);
+        let di = func.dfg.value_def(null_test).inst().unwrap();
+        assert!(matches!(
+            func.dfg.insts[di],
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm
+            } if imm.bits() == 0
+        ));
+    }
+
+    /// `black_box(&s)` returns its argument's bits — under `PLIRON_NNBB`
+    /// an `nnargs`-seeded `&str` data ptr stays provably non-null through
+    /// the barrier, so the `Option<&u8>` niche test on the boxed cursor
+    /// folds. With the gate off the barrier is opaque (`nn.is` false).
+    #[test]
+    fn black_box_keeps_nonnull() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let (bb, null_test) = {
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            let body = builder.create_block();
+            let exit = builder.create_block();
+            builder.append_block_param(entry, types::I64); // ptr (nonnull)
+            builder.switch_to_block(entry);
+            let p = builder.block_params(entry)[0];
+            let bb = builder.ins().black_box(p);
+            let z = builder.ins().iconst(types::I64, 0);
+            let null_test = builder.ins().icmp(IntCC::Equal, bb, z);
+            builder.ins().brif(null_test, exit, &[], body, &[]);
+            builder.switch_to_block(body);
+            builder.ins().return_(&[]);
+            builder.switch_to_block(exit);
+            builder.ins().return_(&[]);
+            builder.seal_all_blocks();
+            (bb, null_test)
+        };
+
+        let loads: FxHashSet<_> = [func.dfg.block_params(
+            func.layout.entry_block().unwrap(),
+        )[0]]
+        .into_iter()
+        .collect();
+        let derived = VMap::default();
+        let cfg = ControlFlowGraph::with_function(&func);
+        let mut nn = NonNull::new(&func, &cfg, &loads, &derived);
+        nn.set_nn_bb(false);
+        assert!(!nn.is(&func, bb), "gate off: the barrier hides the proof");
+        nn.set_nn_bb(true);
+        assert!(nn.is(&func, bb), "gate on: nonnull through the barrier");
+
+        assert_eq!(fold_null_tests(&mut func, &nn, None), 1);
+        let di = func.dfg.value_def(null_test).inst().unwrap();
+        assert!(matches!(
+            func.dfg.insts[di],
+            InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm
+            } if imm.bits() == 0
+        ));
+    }
+
+    /// The phi form of the same niche test: `p` merges `0` (None arm)
+    /// with a non-null ptr (Some arm), so `p == 0` is the guarding
+    /// `brif c` itself.
+    #[test]
+    fn param_null_test_maps_to_guard() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let (c, null_test, merge) = {
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            let none_b = builder.create_block();
+            let some_b = builder.create_block();
+            let merge = builder.create_block();
+            let cont = builder.create_block();
+            let exit = builder.create_block();
+            builder.append_block_param(entry, types::I32); // ptr (nonnull)
+            builder.append_block_param(entry, types::I32); // end
+            builder.append_block_param(merge, types::I32); // byte_ptr
+
+            builder.switch_to_block(entry);
+            let v0 = builder.block_params(entry)[0];
+            let v1 = builder.block_params(entry)[1];
+            let c = builder.ins().icmp(IntCC::Equal, v0, v1);
+            builder.ins().brif(c, none_b, &[], some_b, &[]);
+
+            builder.switch_to_block(none_b);
+            let z = builder.ins().iconst(types::I32, 0);
+            builder.ins().jump(merge, &[z.into()]);
+
+            builder.switch_to_block(some_b);
+            builder.ins().jump(merge, &[v0.into()]);
+
+            builder.switch_to_block(merge);
+            let p = builder.block_params(merge)[0];
+            let z2 = builder.ins().iconst(types::I32, 0);
+            let null_test = builder.ins().icmp(IntCC::Equal, p, z2);
+            builder.ins().brif(null_test, exit, &[], cont, &[]);
+
+            builder.switch_to_block(cont);
+            builder.ins().return_(&[]);
+            builder.switch_to_block(exit);
+            builder.ins().return_(&[]);
+            builder.seal_all_blocks();
+            (c, null_test, merge)
+        };
+        let _ = merge;
+
+        let loads: FxHashSet<_> =
+            [func.dfg.block_params(func.layout.entry_block().unwrap())[0]]
+                .into_iter()
+                .collect();
+        let derived: VMap<_> = Default::default();
+        let cfg = ControlFlowGraph::with_function(&func);
+        let nn = NonNull::new(&func, &cfg, &loads, &derived);
+        // `p == 0` ⟺ the `c`-true edge — the icmp aliases `c`.
+        assert_eq!(fold_null_tests(&mut func, &nn, None), 1);
+        assert_eq!(func.dfg.resolve_aliases(null_test), c);
+    }
+
+
+    #[test]
+    fn removes_cycle_only_param_and_keeps_exit_condition_param() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let (loop_block, exit_block) = {
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            let loop_block = builder.create_block();
+            let exit_block = builder.create_block();
+            builder.append_block_param(loop_block, types::I64);
+            builder.append_block_param(loop_block, types::I64);
+            builder.append_block_param(exit_block, types::I64);
+
+            builder.switch_to_block(entry);
+            let zero = builder.ins().iconst(types::I64, 0);
+            let entry_args = [BlockArg::Value(zero), BlockArg::Value(zero)];
+            builder.ins().jump(loop_block, &entry_args);
+
+            builder.switch_to_block(loop_block);
+            let cycle = builder.block_params(loop_block)[0];
+            let counter = builder.block_params(loop_block)[1];
+            let next = builder.ins().iadd_imm_s(counter, 1);
+            let condition = builder
+                .ins()
+                .icmp_imm_u(IntCC::UnsignedLessThan, counter, 4);
+            let loop_args = [BlockArg::Value(cycle), BlockArg::Value(next)];
+            let exit_args = [BlockArg::Value(counter)];
+            builder
+                .ins()
+                .brif(condition, loop_block, &loop_args, exit_block, &exit_args);
+
+            builder.switch_to_block(exit_block);
+            let result = builder.block_params(exit_block)[0];
+            builder.ins().return_(&[result]);
+            builder.seal_all_blocks();
+            (loop_block, exit_block)
+        };
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        assert_eq!(remove_dead_params(&mut func, &cfg), 1);
+        assert_eq!(func.dfg.num_block_params(loop_block), 1);
+        assert_eq!(func.dfg.num_block_params(exit_block), 1);
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                for call in func.dfg.insts[inst]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    if call.block(&func.dfg.value_lists) == loop_block {
+                        assert_eq!(call.len(&func.dfg.value_lists), 1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// security_framework `ItemAddOptions::to_dictionary`: threading
+    /// leaves a dead two-block loop whose header param's only incoming
+    /// value is the latch's `p + 16`. The latch dominates the header, so
+    /// the single-value check passes — but aliasing `p -> inc` makes the
+    /// `iadd` read its own result. `remove_trivial_params` must skip it.
+    #[test]
+    fn trivial_param_must_not_self_reference() {
+        let mut func = Function::new();
+        let mut builder_ctx = FunctionBuilderContext::new();
+        let (head, inc) = {
+            let mut builder = FunctionBuilder::new(&mut func, &mut builder_ctx);
+            let entry = builder.create_block();
+            let head = builder.create_block();
+            let latch = builder.create_block();
+            let exit = builder.create_block();
+            builder.append_block_param(head, types::I64); // p
+
+            builder.switch_to_block(entry);
+            builder.ins().return_(&[]);
+
+            builder.switch_to_block(head);
+            let p = builder.block_params(head)[0];
+            let eight = builder.ins().iconst(types::I64, 8);
+            let c = builder.ins().icmp(IntCC::Equal, p, eight);
+            builder.ins().brif(c, exit, &[], latch, &[]);
+
+            builder.switch_to_block(latch);
+            let sixteen = builder.ins().iconst(types::I64, 16);
+            let inc = builder.ins().iadd(p, sixteen);
+            builder.ins().jump(head, &[inc.into()]);
+
+            builder.switch_to_block(exit);
+            builder.ins().return_(&[]);
+            builder.seal_all_blocks();
+            (head, inc)
+        };
+
+        let cfg = ControlFlowGraph::with_function(&func);
+        let dt = cranelift_codegen::dominator_tree::DominatorTree::with_function(&func, &cfg);
+        let al = super::remove_trivial_params(&mut func, &cfg, &dt);
+        assert!(al.is_empty(), "self-referential param alias: {al:?}");
+        let _ = (head, inc);
+        cranelift_codegen::verify_function(
+            &func,
+            &cranelift_codegen::settings::Flags::new(
+                cranelift_codegen::settings::builder(),
+            ),
+        )
+        .expect("verifier");
+    }
+}
+
+/// Turns `brif`/`br_table` on a compile-time constant into a `jump`. Later passes (load
+/// forwarding) expose constants after threading ran, and Cranelift never folds branches,
+/// so the dead successor's block arguments would otherwise stay live.
+pub fn fold_const_branches(func: &mut Function) -> usize {
+    let mut env: FxHashMap<Value, u64> = FxHashMap::default();
+    let blocks: Vec<Block> = func.layout.blocks().collect();
+    for _ in 0..2 {
+        for &b in &blocks {
+            for i in func.layout.block_insts(b) {
+                if func.dfg.inst_results(i).len() == 1
+                    && let Some(c) = eval(func, &env, &|_| false, &|_| None, i)
+                {
+                    env.insert(func.dfg.first_result(i), c);
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    for &b in &blocks {
+        let Some(t) = func.layout.last_inst(b) else {
+            continue;
+        };
+        let dest = match func.dfg.insts[t] {
+            InstructionData::Brif { arg, blocks, .. } => {
+                let arg = func.dfg.resolve_aliases(arg);
+                known(func, &env, arg).map(|c| blocks[usize::from(c == 0)])
+            }
+            InstructionData::BranchTable { arg, table, .. } => {
+                let arg = func.dfg.resolve_aliases(arg);
+                known(func, &env, arg).map(|c| {
+                    let jt = &func.dfg.jump_tables[table];
+                    usize::try_from(c)
+                        .ok()
+                        .and_then(|c| jt.as_slice().get(c).copied())
+                        .unwrap_or(jt.default_block())
+                })
+            }
+            _ => None,
+        };
+        if let Some(d) = dest {
+            func.dfg.insts[t] = InstructionData::Jump {
+                opcode: Opcode::Jump,
+                destination: d,
+            };
+            n += 1;
+        }
+    }
+    n
+}

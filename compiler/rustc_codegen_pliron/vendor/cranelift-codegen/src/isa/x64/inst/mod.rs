@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::slice;
 use cranelift_assembler_x64 as asm;
+use regalloc2::PReg;
 use smallvec::{SmallVec, smallvec};
 
 pub mod args;
@@ -322,6 +323,12 @@ impl Inst {
                     _ if (ty.is_float() || ty.is_vector()) && ty.bits() == 128 => {
                         asm::inst::movdqu_a::new(to_reg, from_addr).into()
                     }
+                    _ if ty.is_vector() && ty.bits() == 256 => {
+                        asm::inst::vmovups_ya::new(to_reg, from_addr).into()
+                    }
+                    _ if ty.is_vector() && ty.bits() == 512 => {
+                        asm::inst::vmovups_za::new(to_reg, from_addr).into()
+                    }
                     _ => unimplemented!("unable to load type: {}", ty),
                 };
                 Inst::External { inst }
@@ -361,6 +368,12 @@ impl Inst {
                     types::F64X2 => asm::inst::movupd_b::new(to_addr, from_reg).into(),
                     _ if (ty.is_float() || ty.is_vector()) && ty.bits() == 128 => {
                         asm::inst::movdqu_b::new(to_addr, from_reg).into()
+                    }
+                    _ if ty.is_vector() && ty.bits() == 256 => {
+                        asm::inst::vmovups_yb::new(to_addr, from_reg).into()
+                    }
+                    _ if ty.is_vector() && ty.bits() == 512 => {
+                        asm::inst::vmovups_zb::new(to_addr, from_reg).into()
                     }
                     _ => unimplemented!("unable to store type: {}", ty),
                 }
@@ -868,7 +881,53 @@ impl fmt::Debug for Inst {
     }
 }
 
+/// With zmm16-31 allocatable (512-bit wide mode), every xmm operand of a
+/// non-EVEX instruction is limited to xmm0-15.
+struct XmmLimit<'a, V: OperandVisitor>(&'a mut V);
+
+impl<V: OperandVisitor> OperandVisitor for XmmLimit<'_, V> {
+    fn add_operand(
+        &mut self,
+        reg: &mut Reg,
+        constraint: regalloc2::OperandConstraint,
+        kind: regalloc2::OperandKind,
+        pos: regalloc2::OperandPos,
+    ) {
+        use regalloc2::OperandConstraint::{Any, Limit, Reg as R};
+        let c = match constraint {
+            Any | R if reg.class() == RegClass::Float => Limit(16),
+            c => c,
+        };
+        self.0.add_operand(reg, c, kind, pos);
+    }
+
+    fn debug_assert_is_allocatable_preg(&self, reg: regalloc2::PReg, expected: bool) {
+        self.0.debug_assert_is_allocatable_preg(reg, expected);
+    }
+
+    fn reg_clobbers(&mut self, regs: regalloc2::PRegSet) {
+        self.0.reg_clobbers(regs);
+    }
+}
+
+/// Whether zmm16-31 are allocatable: 512-bit wide mode, unless
+/// `PLIRON_NO_HIGH_XMM` is set.
+pub fn high_xmm_regs() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    wide_vector_bits() >= 512 && !*OFF.get_or_init(|| std::env::var_os("PLIRON_NO_HIGH_XMM").is_some())
+}
+
 fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
+    let limit = high_xmm_regs()
+        && !matches!(inst, Inst::External { inst } if inst.num_registers_available() > 16);
+    if limit {
+        x64_get_operands_inner(inst, &mut XmmLimit(collector));
+    } else {
+        x64_get_operands_inner(inst, collector);
+    }
+}
+
+fn x64_get_operands_inner(inst: &mut Inst, collector: &mut impl OperandVisitor) {
     // Note: because we need to statically know the indices of each
     // reg in the operands list in order to fetch its allocation
     // later, we put the variable-operand-count bits (the RegMem,
@@ -1232,6 +1291,192 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
 //=============================================================================
 // Instructions: misc functions and external interface
 
+/// pliron: widest vector (bits) held in float-class registers: 128, or
+/// 256/512 when a JIT host emits ymm/zmm values. Register moves and spills of
+/// the float class use this width, so set it before compiling and only on
+/// CPUs with AVX (256) / AVX-512F (512).
+/// Host-detected AVX512-FP16 (+VL); no isa flag exists for it upstream.
+pub static NATIVE_FP16: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Host has AVX512-BF16 (+BW/VL): `vcvtneps2bf16` is available.
+pub static NATIVE_BF16: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Widest vector register class pliron may use (128 / 256 / 512 bits).
+pub static WIDE_VECTOR_BITS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(128);
+
+/// See [`WIDE_VECTOR_BITS`].
+pub fn wide_vector_bits() -> u32 {
+    WIDE_VECTOR_BITS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// PLIRON FLAGDUP: mnemonics that provably leave x86 condition flags
+// untouched, used to keep the flag-recompute state alive across them.
+// This is a whitelist: anything not listed drops the tracked state —
+// a missed optimization, never a wrong flag reuse. (`popcnt`/`popf`
+// look "pop"-adjacent but write flags — no prefix matches them.)
+// PLIRON FLAGDUP: does an instruction with this mnemonic preserve the
+// x64 condition flags? Only forms that also carry their register defs
+// as ordinary `get_operands` operands may be listed — the emitter
+// invalidates tracked flag state when a flagged-preserved inst rewrites
+// a compare operand, and it can only see real operand defs. Excluded
+// despite preserving flags:
+//   - `cbw`/`cwde`/`cdqe`/`cwd`/`cdq`/`cqo`: sign-extends that write
+//     rax/rdx *implicitly* — invisible to operand tracking.
+//   - `push`/`pop`/`leave`/`call`/`ret`: write rsp/rbp implicitly
+//     (nonallocatable today, but a pinned-reg compare could track them).
+//   - `sahf`/`stc`/`clc`/`cmc`/`popf`/`cmps`/`scas`: flag *writers*.
+//   - `movs`/`stos`/`lods`/`ins`/`outs`/`rep`: implicit rsi/rdi updates.
+// A miss only costs a re-emitted compare; a false positive miscompiles.
+fn flag_preserving_mnemonic(mn: &str) -> bool {
+    mn.starts_with("mov")
+        || mn.starts_with("cmov")
+        || mn.starts_with("set")
+        || mn.starts_with("lea")
+        || mn.starts_with("nop")
+        || mn.starts_with('j')
+        || mn.starts_with("prefetch")
+        || mn.starts_with("vzero")
+        || matches!(mn, "xchg" | "bswap" | "pause" | "mfence" | "lfence" | "sfence")
+}
+
+// PLIRON FLAGX: EFLAGS bit numbering for the emit-time known-flag
+// tracking (`flag_branch` / `flag_cc_eval`).
+const XF_CF: u8 = 1;
+const XF_ZF: u8 = 2;
+const XF_SF: u8 = 4;
+const XF_OF: u8 = 8;
+const XF_PF: u8 = 16;
+
+/// The cc suffix used by `cmov*`/`set*`/xed mnemonics.
+fn cc_by_name(s: &str) -> Option<CC> {
+    Some(match s {
+        "o" => CC::O,
+        "no" => CC::NO,
+        "b" | "c" | "nae" => CC::B,
+        "ae" | "nb" | "nc" => CC::NB,
+        "e" | "z" => CC::Z,
+        "ne" | "nz" => CC::NZ,
+        "be" | "na" => CC::BE,
+        "a" | "nbe" => CC::NBE,
+        "s" => CC::S,
+        "ns" => CC::NS,
+        "p" | "pe" => CC::P,
+        "np" | "po" => CC::NP,
+        "l" | "nge" => CC::L,
+        "ge" | "nl" => CC::NL,
+        "le" | "ng" => CC::LE,
+        "g" | "nle" => CC::NLE,
+        _ => return None,
+    })
+}
+
+/// The flag bits a condition needs to be decidable.
+fn cc_flag_need(cc: CC) -> u8 {
+    match cc {
+        CC::O | CC::NO => XF_OF,
+        CC::B | CC::NB => XF_CF,
+        CC::Z | CC::NZ => XF_ZF,
+        CC::BE | CC::NBE => XF_CF | XF_ZF,
+        CC::S | CC::NS => XF_SF,
+        CC::P | CC::NP => XF_PF,
+        CC::L | CC::NL => XF_SF | XF_OF,
+        CC::LE | CC::NLE => XF_ZF | XF_SF | XF_OF,
+    }
+}
+
+/// Evaluate a condition under the known flag bits `(mask, vals)`;
+/// `None` when the mask doesn't cover every bit the condition reads.
+fn cc_eval_flag(cc: CC, mask: u8, vals: u8) -> Option<bool> {
+    let need = cc_flag_need(cc);
+    if mask & need != need {
+        return None;
+    }
+    let cf = vals & XF_CF != 0;
+    let zf = vals & XF_ZF != 0;
+    let sf = vals & XF_SF != 0;
+    let of = vals & XF_OF != 0;
+    let pf = vals & XF_PF != 0;
+    Some(match cc {
+        CC::O => of,
+        CC::NO => !of,
+        CC::B => cf,
+        CC::NB => !cf,
+        CC::Z => zf,
+        CC::NZ => !zf,
+        CC::BE => cf || zf,
+        CC::NBE => !cf && !zf,
+        CC::S => sf,
+        CC::NS => !sf,
+        CC::P => pf,
+        CC::NP => !pf,
+        CC::L => sf != of,
+        CC::NL => sf == of,
+        CC::LE => zf || sf != of,
+        CC::NLE => !zf && sf == of,
+    })
+}
+
+/// The `(mask, value)` bits an edge proves when `cc` is known to be
+/// `on` along it. Compound conditions (`be` = CF|ZF, the signed
+/// relations) pin a bit on only one side, or not at all.
+fn cc_proven_bits(cc: CC, on: bool) -> (u8, u8) {
+    match (cc, on) {
+        (CC::O, true) => (XF_OF, XF_OF),
+        (CC::O, false) => (XF_OF, 0),
+        (CC::NO, true) => (XF_OF, 0),
+        (CC::NO, false) => (XF_OF, XF_OF),
+        (CC::B, true) => (XF_CF, XF_CF),
+        (CC::B, false) => (XF_CF, 0),
+        (CC::NB, true) => (XF_CF, 0),
+        (CC::NB, false) => (XF_CF, XF_CF),
+        (CC::Z, true) => (XF_ZF, XF_ZF),
+        (CC::Z, false) => (XF_ZF, 0),
+        (CC::NZ, true) => (XF_ZF, 0),
+        (CC::NZ, false) => (XF_ZF, XF_ZF),
+        (CC::S, true) => (XF_SF, XF_SF),
+        (CC::S, false) => (XF_SF, 0),
+        (CC::NS, true) => (XF_SF, 0),
+        (CC::NS, false) => (XF_SF, XF_SF),
+        (CC::P, true) => (XF_PF, XF_PF),
+        (CC::P, false) => (XF_PF, 0),
+        (CC::NP, true) => (XF_PF, 0),
+        (CC::NP, false) => (XF_PF, XF_PF),
+        // `!be` and `a` both mean "above" (CF=0, ZF=0).
+        (CC::BE, false) | (CC::NBE, true) => (XF_CF | XF_ZF, 0),
+        _ => (0, 0),
+    }
+}
+
+// `emit_lea` shrinks `lea` into `add` when `dst` is also the (only)
+// source register — `add` writes flags, so those `lea`s are not
+// flag-preserving even though the mnemonic says otherwise. Mirror the
+// exact `emit_lea` conditions: `dst == base` for `disp(base)`, and
+// `dst == base || dst == index` for `0(base, index, 1)`.
+fn lea_encodes_as_add(dst: Gpr, addr: &asm::Amode<Gpr>) -> bool {
+    match addr {
+        asm::Amode::ImmReg {
+            base,
+            simm32:
+                asm::AmodeOffsetPlusKnownOffset {
+                    simm32: _,
+                    offset: None,
+                },
+            trap: None,
+        } => dst == *base,
+        asm::Amode::ImmRegRegShift {
+            base,
+            index,
+            scale: asm::Scale::One,
+            simm32,
+            trap: None,
+        } => {
+            simm32.value() == 0 && (dst == *base || dst == *index.as_ref())
+        }
+        _ => false,
+    }
+}
+
 impl MachInst for Inst {
     type ABIMachineSpec = X64ABIMachineSpec;
 
@@ -1257,6 +1502,23 @@ impl MachInst for Inst {
             } => match rm64 {
                 asm::GprMem::Gpr(reg) => Some((r64.as_ref().map(|r| r.to_reg()), reg.to_reg())),
                 asm::GprMem::Mem(_) => None,
+            },
+
+            // PLIRON: `movl %r, %r` self-moves from `gen_move` (a <=32-bit
+            // vreg copy coalesced to one preg) are dead — the low 32 bits
+            // are unchanged and upper bits of narrow vregs are undefined,
+            // so keeping the dirty upper bits breaches no contract. Match
+            // ONLY `movl_mr` with equal pregs: `movl_rm` is a real
+            // zero-extend (its `movl %r,%r` is load-bearing), and
+            // non-self `movl` must not join MCP's 64-bit value-class
+            // tracking, which tracks full-width equality.
+            Self::External {
+                inst: I::movl_mr(asm::inst::movl_mr { rm32, r32 }),
+            } => match rm32 {
+                asm::GprMem::Gpr(reg) if reg.to_reg() == r32.as_ref().to_reg() => {
+                    Some((reg.map(|r| r.to_reg()), r32.as_ref().to_reg()))
+                }
+                _ => None,
             },
 
             // Note that `movss_a_r` and `movsd_a_r` are specifically omitted
@@ -1298,6 +1560,122 @@ impl MachInst for Inst {
         }
     }
 
+    // PLIRON FLAGDUP: classify flag effects for the emit-time
+    // flag-recompute elision. `Cmp` covers the reg-reg and reg-imm
+    // cmp/test forms the lowering actually emits; `Neutral` is the
+    // provably flag-preserving set (the pseudo-insts below plus the
+    // assembler insts whose mnemonic is in `flag_preserving_mnemonic`).
+    // Everything else is `Other` and conservatively drops the tracked
+    // state — a missed dedup, never a wrong flag reuse.
+    fn flag_kind(&self) -> FlagKind {
+        use asm::inst::Inst as I;
+        let preg = |r: Reg| -> PReg { PReg::from(r.to_real_reg().unwrap()) };
+        macro_rules! regreg {
+            ($i:expr, $rm:ident, $r:ident, $tag:expr) => {
+                match &$i.$rm {
+                    asm::GprMem::Gpr(b) => FlagKind::Cmp {
+                        key: $tag,
+                        a: preg($i.$r.as_ref().to_reg()),
+                        b: preg(b.to_reg()),
+                    },
+                    _ => FlagKind::Other,
+                }
+            };
+        }
+        // For test-forms also normalize operand order: `test a,b` and
+        // `test b,a` produce identical flags.
+        macro_rules! regreg_test {
+            ($i:expr, $rm:ident, $r:ident, $tag:expr) => {
+                match &$i.$rm {
+                    asm::GprMem::Gpr(b) => {
+                        let (x, y) = (preg($i.$r.as_ref().to_reg()), preg(b.to_reg()));
+                        let (x, y) = if x < y { (x, y) } else { (y, x) };
+                        FlagKind::Cmp { key: $tag, a: x, b: y }
+                    }
+                    _ => FlagKind::Other,
+                }
+            };
+        }
+        macro_rules! regimm {
+            ($i:expr, $rm:ident, $imm:ident, $tag:expr) => {
+                match &$i.$rm {
+                    asm::GprMem::Gpr(b) => {
+                        let p = preg(b.to_reg());
+                        FlagKind::Cmp {
+                            key: $tag | (($i.$imm.value() as i64 as u64) << 8),
+                            a: p,
+                            b: p,
+                        }
+                    }
+                    _ => FlagKind::Other,
+                }
+            };
+        }
+        match self {
+            // Pseudo-insts that emit only flag-preserving code and whose
+            // operand defs are real `get_operands` defs (so the emitter's
+            // operand-rewrite check can see them): xmm cmovs, address
+            // materialization, no-code markers. `MovFromPReg`/
+            // `MovToPReg` (fixed/nonallocatable preg operands, unusual
+            // operand bookkeeping) and `*UninitializedValue` (declare
+            // a def but emit nothing) stay `Other` as cheap insurance —
+            // they are rare and clearing state around them costs a
+            // re-emit at worst. Everything else (`Args`/`Rets` block
+            // markers, terminators, calls, probes, traps, TLS sequences,
+            // atomic and conversion sequences) also stays `Other` —
+            // flag state must not be assumed to cross them.
+            Self::XmmCmove { .. }
+            | Self::DummyUse { .. }
+            | Self::Unwind { .. }
+            | Self::SequencePoint
+            | Self::LabelAddress { .. }
+            | Self::LoadExtName { .. } => FlagKind::Neutral,
+            Self::External { inst } => match inst {
+                I::cmpq_rm(i) => regreg!(i, rm64, r64, 0x01),
+                I::cmpl_rm(i) => regreg!(i, rm32, r32, 0x02),
+                I::cmpw_rm(i) => regreg!(i, rm16, r16, 0x03),
+                I::cmpb_rm(i) => regreg!(i, rm8, r8, 0x04),
+                I::cmpq_mr(i) => regreg!(i, rm64, r64, 0x05),
+                I::cmpl_mr(i) => regreg!(i, rm32, r32, 0x06),
+                I::cmpw_mr(i) => regreg!(i, rm16, r16, 0x07),
+                I::cmpb_mr(i) => regreg!(i, rm8, r8, 0x08),
+                I::testq_mr(i) => regreg_test!(i, rm64, r64, 0x09),
+                I::testl_mr(i) => regreg_test!(i, rm32, r32, 0x0a),
+                I::testw_mr(i) => regreg_test!(i, rm16, r16, 0x0b),
+                I::testb_mr(i) => regreg_test!(i, rm8, r8, 0x0c),
+                I::cmpq_mi(i) => regimm!(i, rm64, imm32, 0x11),
+                I::cmpl_mi(i) => regimm!(i, rm32, imm32, 0x12),
+                I::cmpw_mi(i) => regimm!(i, rm16, imm16, 0x13),
+                I::cmpb_mi(i) => regimm!(i, rm8, imm8, 0x14),
+                I::cmpq_mi_sxb(i) => regimm!(i, rm64, imm8, 0x15),
+                I::cmpl_mi_sxb(i) => regimm!(i, rm32, imm8, 0x16),
+                I::cmpw_mi_sxb(i) => regimm!(i, rm16, imm8, 0x17),
+                I::testq_mi(i) => regimm!(i, rm64, imm32, 0x19),
+                I::testl_mi(i) => regimm!(i, rm32, imm32, 0x1a),
+                I::testw_mi(i) => regimm!(i, rm16, imm16, 0x1b),
+                I::testb_mi(i) => regimm!(i, rm8, imm8, 0x1c),
+                // A `lea` that `emit_lea` shrinks to `add` writes
+                // flags (the cmp3 miscompile: `leal 2(%rdx),%edx` emits
+                // `addl $2,%edx` between the two `cmpb`s of an
+                // equal-key dedup candidate).
+                I::leal_rm(i) if lea_encodes_as_add(i.r32.as_ref().to_reg(), &i.m32) => {
+                    FlagKind::Other
+                }
+                I::leaq_rm(i) if lea_encodes_as_add(i.r64.as_ref().to_reg(), &i.m64) => {
+                    FlagKind::Other
+                }
+                _ => {
+                    if flag_preserving_mnemonic(&inst.mnemonic()) {
+                        FlagKind::Neutral
+                    } else {
+                        FlagKind::Other
+                    }
+                }
+            },
+            _ => FlagKind::Other,
+        }
+    }
+
     fn is_included_in_clobbers(&self) -> bool {
         match self {
             &Inst::Args { .. } => false,
@@ -1321,6 +1699,40 @@ impl MachInst for Inst {
         }
     }
 
+    fn trap_code(&self) -> Option<crate::ir::TrapCode> {
+        match self {
+            Self::External {
+                inst: asm::inst::Inst::ud2_zo(u),
+            } => Some(u.trap.into()),
+            _ => None,
+        }
+    }
+
+    fn noreturn_continuation(&self) -> Option<MachLabel> {
+        let tci = match self {
+            Inst::CallKnown { info } => info.try_call_info.as_ref(),
+            Inst::CallUnknown { info } => info.try_call_info.as_ref(),
+            _ => None,
+        }?;
+        (tci.continuation_trap == Some(crate::ir::TrapCode::NORETURN_CALL))
+            .then_some(tci.continuation)
+    }
+
+    fn elide_noreturn_continuation(&mut self) -> bool {
+        let tci = match self {
+            Inst::CallKnown { info } => info.try_call_info.as_mut(),
+            Inst::CallUnknown { info } => info.try_call_info.as_mut(),
+            _ => None,
+        };
+        match tci {
+            Some(t) if t.continuation_trap == Some(crate::ir::TrapCode::NORETURN_CALL) => {
+                t.continuation_elide = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn call_type(&self) -> CallType {
         match self {
             Inst::CallKnown { .. }
@@ -1331,6 +1743,100 @@ impl MachInst for Inst {
             Inst::ReturnCallKnown { .. } | Inst::ReturnCallUnknown { .. } => CallType::TailCall,
 
             _ => CallType::None,
+        }
+    }
+
+    fn cond_br_targets(&self) -> Option<(MachLabel, MachLabel)> {
+        match self {
+            Inst::JmpCond {
+                taken, not_taken, ..
+            } => Some((*taken, *not_taken)),
+            _ => None,
+        }
+    }
+
+    fn set_cond_br_taken(&mut self, l: MachLabel) {
+        if let Inst::JmpCond { taken, .. } = self {
+            *taken = l;
+        }
+    }
+
+    fn flag_branch(&self) -> Option<FlagBranch> {
+        match self {
+            Inst::JmpCond {
+                cc,
+                taken,
+                not_taken,
+            } => Some(FlagBranch {
+                taken: *taken,
+                not_taken: *not_taken,
+                taken_bits: cc_proven_bits(*cc, true),
+                fall_bits: cc_proven_bits(*cc, false),
+            }),
+            _ => None,
+        }
+    }
+
+    fn flag_cc_eval(&self, mask: u8, vals: u8) -> Option<bool> {
+        use asm::inst::Inst as I;
+        let Inst::External { inst } = self else {
+            return None;
+        };
+        let mn = inst.mnemonic();
+        let s = mn.strip_prefix("cmov")?;
+        let (cc, sz) = s.split_at(s.len().checked_sub(1)?);
+        if !"wlq".contains(sz) {
+            return None;
+        }
+        // A `cmov` with a memory source performs the load even when its
+        // condition is false; eliding it would drop a mandatory (and
+        // possibly faulting) read. Only register-source forms fold.
+        macro_rules! cmov_mem_src {
+            ($($rm:ident : $($v:ident),+ ;)+) => {
+                match inst {
+                    $($(I::$v(i) => i.$rm.is_memory(),)+)+
+                    // Any `cmov*` form not listed (or a non-cmov that
+                    // somehow passed the mnemonic check): not provably
+                    // register-sourced, so refuse to fold.
+                    _ => true,
+                }
+            };
+        }
+        if cmov_mem_src! {
+            rm16: cmovaw_rm, cmovaew_rm, cmovbw_rm, cmovbew_rm, cmovew_rm,
+                  cmovgw_rm, cmovgew_rm, cmovlw_rm, cmovlew_rm, cmovnew_rm,
+                  cmovnow_rm, cmovnpw_rm, cmovnsw_rm, cmovow_rm, cmovpw_rm,
+                  cmovsw_rm;
+            rm32: cmoval_rm, cmovael_rm, cmovbl_rm, cmovbel_rm, cmovel_rm,
+                  cmovgl_rm, cmovgel_rm, cmovll_rm, cmovlel_rm, cmovnel_rm,
+                  cmovnol_rm, cmovnpl_rm, cmovnsl_rm, cmovol_rm, cmovpl_rm,
+                  cmovsl_rm;
+            rm64: cmovaq_rm, cmovaeq_rm, cmovbq_rm, cmovbeq_rm, cmoveq_rm,
+                  cmovgq_rm, cmovgeq_rm, cmovlq_rm, cmovleq_rm, cmovneq_rm,
+                  cmovnoq_rm, cmovnpq_rm, cmovnsq_rm, cmovoq_rm, cmovpq_rm,
+                  cmovsq_rm;
+        } {
+            return None;
+        }
+        cc_eval_flag(cc_by_name(cc)?, mask, vals)
+    }
+
+    fn invert_cond_br(&mut self) {
+        if let Inst::JmpCond {
+            cc,
+            taken,
+            not_taken,
+        } = self
+        {
+            *cc = cc.invert();
+            core::mem::swap(taken, not_taken);
+        }
+    }
+
+    fn uncond_br_target(&self) -> Option<MachLabel> {
+        match self {
+            Inst::JmpKnown { dst } => Some(*dst),
+            _ => None,
         }
     }
 
@@ -1376,10 +1882,34 @@ impl MachInst for Inst {
         let rc_src = src_reg.class();
         // If this isn't true, we have gone way off the rails.
         debug_assert!(rc_dst == rc_src);
+        let hi = |r: Reg| r.to_real_reg().is_some_and(|r| r.hw_enc() >= 16);
+        if rc_dst == RegClass::Float && (hi(dst_reg.to_reg()) || hi(src_reg)) {
+            // xmm16-31 need EVEX; a full zmm move covers every type.
+            let dst = dst_reg.map(|r| Xmm::new(r).unwrap());
+            let src = Xmm::new(src_reg).unwrap();
+            return Inst::External {
+                inst: asm::inst::vmovups_za::new(dst, src).into(),
+            };
+        }
         let inst = match rc_dst {
             RegClass::Int => {
-                asm::inst::movq_mr::new(dst_reg.map(Gpr::unwrap_new), Gpr::unwrap_new(src_reg))
+                // pliron: a `movl` is a byte shorter than `movq` and exact for
+                // <=32-bit vregs (upper bits are undefined in CLIF), which is
+                // common in i8/i16/i32-heavy loops where phi copies are
+                // frequent.
+                if ty.bits() <= 32 {
+                    asm::inst::movl_mr::new(
+                        dst_reg.map(Gpr::unwrap_new),
+                        Gpr::unwrap_new(src_reg),
+                    )
                     .into()
+                } else {
+                    asm::inst::movq_mr::new(
+                        dst_reg.map(Gpr::unwrap_new),
+                        Gpr::unwrap_new(src_reg),
+                    )
+                    .into()
+                }
             }
             RegClass::Float => {
                 // The Intel optimization manual, in "3.5.1.13 Zero-Latency MOV Instructions",
@@ -1395,6 +1925,12 @@ impl MachInst for Inst {
                     types::F64X2 => asm::inst::movapd_a::new(dst_reg, src_reg).into(),
                     _ if (ty.is_float() || ty.is_vector()) && ty.bits() <= 128 => {
                         asm::inst::movdqa_a::new(dst_reg, src_reg).into()
+                    }
+                    _ if ty.is_vector() && ty.bits() == 256 => {
+                        asm::inst::vmovups_ya::new(dst_reg, src_reg).into()
+                    }
+                    _ if ty.is_vector() && ty.bits() == 512 => {
+                        asm::inst::vmovups_za::new(dst_reg, src_reg).into()
                     }
                     _ => unimplemented!("unable to move type: {}", ty),
                 }
@@ -1428,8 +1964,29 @@ impl MachInst for Inst {
             types::F64 => Ok((&[RegClass::Float], &[types::F64])),
             types::F128 => Ok((&[RegClass::Float], &[types::F128])),
             types::I128 => Ok((&[RegClass::Int, RegClass::Int], &[types::I64, types::I64])),
-            _ if ty.is_vector() && ty.bits() <= 128 => {
-                let types = &[types::I8X2, types::I8X4, types::I8X8, types::I8X16];
+            // PLIRON: a vector wider than `WIDE_VECTOR_BITS` has no usable
+            // register class — the ISLE lowerings emit ymm/zmm ops at the
+            // operand's full width while regalloc would treat the vreg as
+            // xmm-width, so class moves and spill slots would keep only the
+            // low 128 bits and leave the upper lanes garbage. Reject loudly
+            // instead of silently miscompiling; `src/lib.rs` raises the
+            // ceiling to 256/512 when AVX2/AVX512F is enabled.
+            _ if ty.is_vector() && ty.bits() <= 512 => {
+                if ty.bits() > wide_vector_bits() {
+                    return Err(CodegenError::Unsupported(format!(
+                        "SSA-value type {ty} exceeds the x64 wide-vector ceiling \
+                         ({} bits)",
+                        wide_vector_bits()
+                    )));
+                }
+                let types = &[
+                    types::I8X2,
+                    types::I8X4,
+                    types::I8X8,
+                    types::I8X16,
+                    types::I8X32,
+                    types::I8X64,
+                ];
                 Ok((
                     &[RegClass::Float],
                     slice::from_ref(&types[ty.bytes().ilog2() as usize - 1]),
@@ -1443,7 +2000,11 @@ impl MachInst for Inst {
 
     fn canonical_type_for_rc(rc: RegClass) -> Type {
         match rc {
-            RegClass::Float => types::I8X16,
+            RegClass::Float => match wide_vector_bits() {
+                512 => types::I8X64,
+                256 => types::I8X32,
+                _ => types::I8X16,
+            },
             RegClass::Int => types::I64,
             RegClass::Vector => unreachable!(),
         }
@@ -1577,6 +2138,14 @@ impl asm::AvailableFeatures for &EmitInfo {
         self.isa_flags.has_avx512f()
     }
 
+    fn avx512fp16(&self) -> bool {
+        NATIVE_FP16.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn avx512bf16(&self) -> bool {
+        NATIVE_BF16.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
     fn avx512vl(&self) -> bool {
         self.isa_flags.has_avx512vl()
     }
@@ -1590,6 +2159,10 @@ impl asm::AvailableFeatures for &EmitInfo {
     }
     fn avx_vnni(&self) -> bool {
         self.isa_flags.has_avx_vnni()
+    }
+
+    fn avx512bw(&self) -> bool {
+        self.isa_flags.has_avx512bw()
     }
 
     fn avx512dq(&self) -> bool {

@@ -1,86 +1,431 @@
 #!/usr/bin/env python3
-"""Run rustc's directive-free `//@ run-pass` UI tests through the backend.
+"""Run rustc's UI tests through the backend, differentially against stock rustc.
 
 Usage: tests/ui_run_pass.py [RUST_CHECKOUT] [FILTER]
-UI_FLAGS adds rustc flags to the backend runs (e.g. UI_FLAGS=-O).
-Writes target/ui/results.json and prints a failure summary. Tests with
-directives (aux-build, compile-flags, revisions, ignore/only/needs, ...) are
-skipped; edition defaults to 2015 like compiletest.
+UI_FLAGS adds rustc flags to both runs (e.g. UI_FLAGS=-O).
+
+`run-pass`/`run-fail` tests are built and executed under both compilers; the
+results must produce the same exit code, stdout and stderr (the invoked exe
+path is normalized to `EXE`, panic thread ids are stripped).
+
+`check-pass`/`build-pass`/`check-fail`/`compile-fail` tests — and every other
+file without a run directive — are compile-only: built with `--emit=obj` (or
+fully linked for `build-pass`). Both compilers must agree on whether the
+compile succeeds; a backend ICE is a bug even when stock rustc also fails,
+and `accepted` (pliron compiles what stock rejects) is a real divergence.
+
+The stock compile+run result is cached in target/ui/stock/<hash>.json keyed
+by the source plus everything that affects it. Tests whose directives we
+can't honor (aux-build, revisions, only/ignore/needs, incremental, ...) are
+skipped with a reason; edition defaults to 2015 like compiletest.
+
+Writes target/ui/results.json and prints a failure summary.
 """
-import collections, concurrent.futures as cf, json, os, re, subprocess, sys
+import collections, concurrent.futures as cf, hashlib, json, os, re, shlex, subprocess, sys, tempfile, threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUST = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/work/rust")
+_sibling = os.path.join(ROOT, "..", "rust")
+_default = _sibling if os.path.isdir(os.path.join(_sibling, "tests/ui")) else os.path.expanduser("~/work/rust")
+RUST = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("RUST_CHECKOUT", _default)
 FILTER = sys.argv[2] if len(sys.argv) > 2 else ""
-OUT = os.path.join(ROOT, "target/ui")
-SKIP = re.compile(r"^//@\s*(aux-|compile-flags|revisions|ignore-|only-|needs-|edition|check-run-results|exec-env|run-flags|run-fail|should-fail|force-host|no-prefer-dynamic|unset-exec-env|known-bug|proc-macro|build-aux|incremental)", re.M)
+# Cross target mode (UI_TARGET=wasm32-wasip1): pliron side needs a pliron-built
+# sysroot (UI_WSYS, provisioned by harness/run.py) because our objects only
+# link with pliron-wasm-ld; stock side just adds --target. Runs go through
+# node+wasi instead of execve.
+TGT = os.environ.get("UI_TARGET")
+WSYS = os.environ.get("UI_WSYS")
+WLD = os.path.join(ROOT, "tools/pliron-wasm-ld/target/release/pliron-wasm-ld")
+if sys.platform == "win32":
+    WLD += ".exe"
+WSRUN = os.path.join(ROOT, "tests/wasm/run_wasi_cfg.mjs")
+OUT = os.path.join(ROOT, "target/ui" + (f"-{TGT}" if TGT else ""))
+# Directives that change what a test needs in ways we don't emulate.
+SKIP = re.compile(r"^//@\s*(aux-|revisions|ignore-|only-|needs-|known-bug|proc-macro|build-aux|incremental|min-|should-fail|run-rustfix|ferrocene-|check-cfg)", re.M)
 # Tests run with cwd = their own dir, so pin the toolchain explicitly.
 os.environ["RUSTUP_TOOLCHAIN"] = re.search(r'channel = "([^"]+)"', open(os.path.join(ROOT, "rust-toolchain.toml")).read()).group(1)
-BE = f"-Zcodegen-backend={ROOT}/target/debug/librustc_codegen_pliron.so"
+os.environ.setdefault("RUSTC_ICE", os.path.join(ROOT, "target/harness/ices"))
+os.makedirs(os.environ["RUSTC_ICE"], exist_ok=True)
+SO = {"darwin": "dylib", "win32": "dll"}.get(sys.platform, "so")
+LIB = "" if sys.platform == "win32" else "lib"
+BE = f"-Zcodegen-backend={ROOT}/target/debug/{LIB}rustc_codegen_pliron.{SO}"
 EXTRA = os.environ.get("UI_FLAGS", "").split()  # e.g. UI_FLAGS=-O
-WILD = ["-Clinker-features=-lld", "-Clink-self-contained=-linker", "-Zunstable-options", f"-Clink-arg=-B{ROOT}/target/wild-ld"]
+WILD = (["-Clinker-features=-lld", "-Clink-self-contained=-linker", "-Zunstable-options",
+         f"-Clink-arg=-B{ROOT}/target/wild-ld"]
+        if os.path.exists(f"{ROOT}/target/wild-ld/ld") else [])
+# compile-flags we can't honor: anything that changes what/where rustc emits
+# or pulls in aux artifacts.
+BAD_FLAG = re.compile(r"^(--emit|-o|--out-dir|--target|--extern|-L|-l|--sysroot|--print|-Zunpretty|--pretty|--crate-type|error-format|--error-format|--json|aux|-Zdump|-Zemit|-Zno-codegen|-Zno-analysis)")
+DIRECTIVE = re.compile(r"^//@\s*([a-zA-Z0-9_-]+)\s*(?::\s*(.*?))?\s*$", re.M)
+TID = re.compile(r"thread '([^']+)' \(\d+\) panicked")
+# Raw pointers printed with {:p} or as bare usize: macOS addresses are 9-12
+# hex digits; longer hex runs are more likely real data than addresses.
+ADDR = re.compile(r"0x[0-9a-fA-F]+|(?<![0-9a-zA-Z_.])[0-9a-f]{9,12}(?![0-9a-zA-Z_.])")
+LIBTEST = re.compile(r"^running \d+ tests$|^test result:", re.M)
+# JS-side noise on wasm run failures: module hashes, function indices and
+# runtime internals differ across backends and aren't part of the program's
+# behavior. wasmtime's trap reports carry the same kind of noise.
+WASM_NOISE = re.compile(
+    r"^.*(wasm://wasm/|RuntimeError|node:internal|Node\.js v|ExperimentalWarning"
+    r"|trace-warnings|panic at wasm|\(Use `node|wasm backtrace|error while "
+    r"executing|failed to run|Caused by:|<unknown>!|wasmtime).*$", re.M)
+
+# Preferred wasm runner: wasmtime if installed (node's WASI on Windows lacks
+# fd_readdir, and wasmtime is a closer match to a real WASI host), else node.
+def _find_wasmtime():
+    import glob, shutil
+    w = shutil.which("wasmtime")
+    if w:
+        return w
+    # Prefer the full `wasmtime` binary: `wasmtime-min` in the same install
+    # has no compiler ("support for compiling modules was disabled") and can
+    # only run precompiled .cwasm artifacts.
+    cands = []
+    for d in glob.glob(os.path.expanduser("~/bin/wasmtime/*")):
+        cands += [os.path.join(d, n) for n in ("wasmtime", "wasmtime.exe")]
+    cands += glob.glob(os.path.expanduser("~/bin/wasmtime/*/wasmtime*"))
+    cands.append(os.path.expanduser("~/bin/wasmtime/wasmtime"))
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+WASMTIME = _find_wasmtime() if TGT else None
+
+
+def wasm_norm(s):
+    return "\n".join(l for l in WASM_NOISE.sub("", s).splitlines() if l.strip())
+
+
+def norm_out(s):
+    """Applied to both sides at compare time so the stock cache stays valid."""
+    s = ADDR.sub("PTR", s)
+    if TGT:
+        s = wasm_norm(s)
+    if LIBTEST.search(s):
+        # libtest runs tests in arbitrary order.
+        s = "\n".join(sorted(s.splitlines()))
+    return s
+
+
+KINDS = re.compile(rb"^//@\s*(run-pass|run-fail|check-pass|build-pass|check-fail|compile-fail)", re.M)
+
+
+def spec(path):
+    """Parses a test's directives into (kind, edition, cflags, rflags, env, unset, skip_reason).
+    Files without a recognized directive default to `compile` (compile-agreement)."""
+    src = open(path, "rb").read()
+    m = KINDS.search(src)
+    kind = m.group(1).decode() if m else "compile"
+    text = src.decode(errors="replace")
+    m = SKIP.search(text)
+    if m:
+        return (kind, "2015", [], [], {}, [], {}, [], m.group(0).strip())
+    edition, cflags, rflags, env, unset, cenv, cunset = "2015", [], [], {}, [], {}, []
+    for m in DIRECTIVE.finditer(text):
+        d, v = m.group(1), (m.group(2) or "")
+        if "{{" in v or "}}" in v:  # compiletest substitutions we don't do
+            return (kind, edition, cflags, rflags, env, unset, cenv, cunset, f"{d}: {v}")
+        try:
+            if d == "edition":
+                edition = v
+            elif d == "compile-flags":
+                cflags += shlex.split(v)
+            elif d == "run-flags":
+                rflags += shlex.split(v)
+            elif d == "exec-env":
+                k, _, val = v.partition("=")
+                env[k] = val
+            elif d == "unset-exec-env":
+                unset.append(v.split("=")[0])
+            elif d == "rustc-env":
+                k, _, val = v.partition("=")
+                cenv[k] = val
+            elif d == "unset-rustc-env":
+                cunset.append(v.split("=")[0])
+        except ValueError:
+            return (kind, edition, cflags, rflags, env, unset, cenv, cunset, f"bad {d}: {v}")
+    bad = next((f for f in cflags if BAD_FLAG.match(f)), None)
+    if bad or any(f == "-o" for f in cflags):
+        return (kind, edition, cflags, rflags, env, unset, cenv, cunset, f"compile-flags {bad or '-o'}")
+    return (kind, edition, cflags, rflags, env, unset, cenv, cunset, None)
+
 
 def tests():
     for d, _, fs in os.walk(os.path.join(RUST, "tests/ui")):
         for f in fs:
             p = os.path.join(d, f)
-            if not f.endswith(".rs") or FILTER not in p:
-                continue
-            src = open(p, errors="replace").read()
-            if re.search(r"^//@\s*run-pass", src, re.M) and not SKIP.search(src):
+            if f.endswith(".rs") and FILTER in p:
                 yield p
 
-def run(path, backend=True):
-    rel = os.path.relpath(path, os.path.join(RUST, "tests/ui"))
-    exe = os.path.join(OUT, "bin", rel.replace("/", "__")[:-3] + ("" if backend else ".llvm"))
-    cmd = ["rustc", path, "-o", exe, "-Awarnings", "-Ccodegen-units=1"] + ([BE] + WILD + EXTRA if backend else [])
+
+def classify_compile(err):
+    err = err or ""
+    m = re.search(r"panicked at ([^\n]+)\n([^\n]*)", err)
+    if m:
+        return "ice", f"{m.group(1)} {m.group(2)}"[:300]
+    m = re.search(r"error: linking with .*?\n|undefined reference to `([^']+)'|undefined symbol: (\S+)", err)
+    if m and "link" in err:
+        return "link", (m.group(1) or m.group(2) or "linker error")[:300]
+    m = re.search(r"error(\[E\d+\])?: [^\n]+", err)
+    return "compile-error", (m.group(0) if m else err[-300:])[:300]
+
+
+def run_env(sp):
+    e = dict(os.environ)
+    e.update(sp["env"])
+    for k in sp["unset"]:
+        e.pop(k, None)
+    return e
+
+
+def build_and_run(path, sp, exe, backend):
+    """Returns (status, msg, run) where run is (rc, stdout, stderr) or None.
+    Compile-only kinds emit an object (`--emit=obj`) and don't run it."""
+    cmd = ["rustc", os.path.abspath(path), "-Awarnings", "-Ccodegen-units=1"]
+    # A `--edition` in compile-flags wins; rustc rejects duplicates.
+    if not any(f == "--edition" or f.startswith("--edition=") for f in sp["cflags"]):
+        cmd += ["--edition", sp["edition"]]
+    if backend:
+        cmd += [BE] + (WILD if not TGT else []) + EXTRA
+        if TGT:
+            cmd += ["--target", TGT, f"--sysroot={WSYS}",
+                    f"-Clinker={WLD}", "-Clink-self-contained=no",
+                    f"-Lnative={os.path.join(WSYS, 'lib/rustlib', TGT, 'lib')}"]
+    else:
+        cmd += EXTRA
+        if TGT:
+            cmd += ["--target", TGT]
+    # check-fail/-pass and undirected files stop at codegen; build-pass links
+    # but like compiletest does not run the artifact.
+    emit = ["-o", exe] if sp["kind"] in ("run-pass", "run-fail", "build-pass") else ["--emit=obj", "-o", exe]
+    cmd += sp["cflags"] + emit
+    cenv = dict(os.environ)
+    cenv.update(sp["cenv"])
+    for k in sp["cunset"]:
+        cenv.pop(k, None)
     try:
-        c = subprocess.run(cmd, capture_output=True, text=True, timeout=180, cwd=os.path.dirname(path))
+        c = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=180,
+                           cwd=os.path.dirname(path), env=cenv)
     except subprocess.TimeoutExpired:
-        return rel, "compile-timeout", ""
+        return "compile-timeout", "", None
     if c.returncode != 0:
-        err = c.stderr
-        m = re.search(r"panicked at ([^\n]+)\n([^\n]*)", err)
-        if m:
-            return rel, "ice", f"{m.group(1)} {m.group(2)}"[:300]
-        m = re.search(r"error: linking with .*?\n|undefined reference to `([^']+)'|undefined symbol: (\S+)", err)
-        if m and "link" in err:
-            return rel, "link", (m.group(1) or m.group(2) or "linker error")[:300]
-        m = re.search(r"error(\[E\d+\])?: [^\n]+", err)
-        return rel, "compile-error", (m.group(0) if m else err[-300:])[:300]
+        return (*classify_compile(c.stderr), None)
+    if not os.path.exists(exe):
+        return "skipped", "no output produced", None
+    if sp["kind"] not in ("run-pass", "run-fail"):
+        return "compiled", "", (0, "", "")
+    return exec_bin(path, sp, exe)
+
+
+def exec_bin(path, sp, exe):
+    if TGT:
+        d = os.path.dirname(path)
+        if WASMTIME:
+            # wasmtime: argv0 + args positionally, env via --env, preopens via
+            # --dir HOST::GUEST (guest "." is skipped — WASI has no cwd; tests
+            # behave identically on both backends since the same runner is
+            # used for both sides of the diff).
+            wcmd = [WASMTIME, "run", f"--argv0={exe}"]
+            for k, v in sp["env"].items():
+                wcmd += ["--env", f"{k}={v}"]
+            # The preopen host dir must exist: Windows has no TMPDIR and no
+            # /tmp, so fall back to the platform temp dir.
+            tmpdir = os.environ.get("TMPDIR") or tempfile.gettempdir()
+            for guest, host in ((d, d), ("/tmp", tmpdir)):
+                wcmd += ["--dir", f"{host}::{guest}"]
+            wcmd += [exe] + sp["rflags"]
+            try:
+                r = subprocess.run(wcmd, capture_output=True, text=True, errors="replace",
+                                   timeout=60, env=dict(os.environ))
+            except subprocess.TimeoutExpired:
+                return "run-timeout", "", None
+            except OSError as ex:
+                return "run-error", str(ex), None
+            out = TID.sub(r"thread '\1' panicked", r.stdout.replace(exe, "EXE"))
+            err = TID.sub(r"thread '\1' panicked", r.stderr.replace(exe, "EXE"))
+            return "ran", "", (r.returncode, out, err)
+        cfg = {"args": [exe] + sp["rflags"],
+               "env": dict(sp["env"]),
+               "preopens": {d: d, ".": d,
+                            "/tmp": os.environ.get("TMPDIR") or tempfile.gettempdir()}}
+        e = dict(os.environ, WASI_RUN_CFG=json.dumps(cfg))
+        try:
+            r = subprocess.run(["node", "--no-warnings", WSRUN, exe],
+                               capture_output=True, text=True, errors="replace", timeout=60, env=e)
+        except subprocess.TimeoutExpired:
+            return "run-timeout", "", None
+        except OSError as ex:
+            return "run-error", str(ex), None
+        out = TID.sub(r"thread '\1' panicked", r.stdout.replace(exe, "EXE"))
+        err = TID.sub(r"thread '\1' panicked", r.stderr.replace(exe, "EXE"))
+        return "ran", "", (r.returncode, out, err)
     try:
-        r = subprocess.run([exe], capture_output=True, text=True, timeout=60, cwd=os.path.dirname(path))
+        r = subprocess.run([exe] + sp["rflags"], capture_output=True, text=True, errors="replace",
+                           timeout=60, cwd=os.path.dirname(path), env=run_env(sp))
     except subprocess.TimeoutExpired:
-        return rel, "run-timeout", ""
-    finally:
-        pass
-    if r.returncode != 0:
-        tail = (r.stderr.strip().splitlines() or [""])[-1][:200]
-        return rel, "run-fail", f"rc={r.returncode} {tail}"
-    os.remove(exe)
-    return rel, "pass", ""
+        return "run-timeout", "", None
+    except OSError as e:
+        return "run-error", str(e), None
+    # Normalize the invoked path and panic thread ids so argv[0]/current_exe
+    # prints and panic lines compare equal.
+    out = TID.sub(r"thread '\1' panicked", r.stdout.replace(exe, "EXE"))
+    err = TID.sub(r"thread '\1' panicked", r.stderr.replace(exe, "EXE"))
+    return "ran", "", (r.returncode, out, err)
+
+
+STOCK_CACHE_VERSION = 6  # bump when normalization or comparison semantics change
+_STOCK_LOCKS = collections.defaultdict(threading.Lock)
+
+
+def stock_result(path, sp):
+    """Compile+run with stock rustc, cached by source+flags hash."""
+    key = hashlib.sha256(
+        open(path, "rb").read()
+        + json.dumps([STOCK_CACHE_VERSION, sp["kind"], sp["edition"], sp["cflags"], sp["rflags"],
+                      sp["env"], sp["unset"], EXTRA, TGT, WASMTIME]
+                     + ([sp["cenv"], sp["cunset"]] if sp["cenv"] or sp["cunset"] else []),
+                     sort_keys=True).encode()
+    ).hexdigest()[:32]
+    cache = os.path.join(OUT, "stock", key + ".json")
+    # Different test files can hash to the same key; serialize the stock build
+    # per key so one thread's artifact removal can't race another's check.
+    with _STOCK_LOCKS[key]:
+        if os.path.exists(cache):
+            res = json.load(open(cache))
+            # Tuples serialize as lists; comparisons below index but the outer
+            # `got != want` check needs the same shape.
+            if res[2] is not None:
+                res[2] = tuple(res[2])
+            return res
+        # Pid-unique artifact names: a concurrent runner (e.g. a leftover
+        # invocation) shares this cache dir, and identical source+flags hash
+        # to the same key — per-key locks only serialize within a process.
+        exe = os.path.join(OUT, "stock", f"{key}.{os.getpid()}")
+        res = build_and_run(path, sp, exe, False)
+        if os.path.exists(exe):
+            os.remove(exe)
+        tmp = f"{cache}.{os.getpid()}.tmp"
+        json.dump(res, open(tmp, "w"))
+        os.replace(tmp, cache)
+        return res
+
+
+def first_diff(want, got):
+    for i, (a, b) in enumerate(zip(want.splitlines(), got.splitlines())):
+        if a != b:
+            return f"line {i + 1}: stock {a!r} vs pliron {b!r}"[:300]
+    return f"stock {len(want.splitlines())} lines vs pliron {len(got.splitlines())} lines"
+
+
+def run(path):
+    rel = os.path.relpath(path, os.path.join(RUST, "tests/ui"))
+    s = spec(path)
+    kind, edition, cflags, rflags, env, unset, cenv, cunset, why = s
+    sp = {"kind": kind, "edition": edition, "cflags": cflags, "rflags": rflags, "env": env,
+          "unset": unset, "cenv": cenv, "cunset": cunset}
+    if why:
+        return rel, "skipped", why
+    ref_st, ref_msg, want = stock_result(path, sp)
+    exe = os.path.join(OUT, "bin", rel.replace("/", "__").replace("\\", "__")[:-3])
+    st, msg, got = build_and_run(path, sp, exe, True)
+    if kind not in ("run-pass", "run-fail"):
+        # Compile-only kinds: agreement on compile outcome is the whole
+        # contract. A backend ICE is a bug even where stock also fails.
+        for p in (exe, exe + ".o"):
+            if os.path.exists(p):
+                os.remove(p)
+        if st == "ice":
+            # The frontend is shared: when stock rustc panics too, pliron
+            # never diverged — record it as environmental.
+            if ref_st == "ice":
+                return rel, "env-ice", f"both panic: {msg} (stock: {ref_msg})"
+            return rel, "ice", msg
+        if st == "compile-timeout" and ref_st != "compile-timeout":
+            # A pliron hang where stock finished is a divergence even if
+            # stock's finish was an error (possibly pre-codegen).
+            return rel, "compile-timeout", f"(stock: {ref_st} {ref_msg})"
+        if (st == "compiled") == (ref_st == "compiled"):
+            return rel, "pass", ""
+        if ref_st == "compiled":
+            return rel, "no-output" if st == "skipped" else st, msg
+        if st == "skipped":
+            return rel, "skipped", f"{msg} (stock: {ref_st})"
+        return rel, "accepted", f"compiles under pliron, stock {ref_st}: {ref_msg}"
+    if got is None:
+        if os.path.exists(exe):
+            os.remove(exe)
+        if st == "skipped":
+            return rel, "skipped", msg
+        if want is None and ref_st != "run-timeout":
+            return rel, "env-" + st, f"{msg} (stock: {ref_st} {ref_msg})"
+        return rel, st, msg
+    if want is None:
+        if os.path.exists(exe):
+            os.remove(exe)
+        # No stock run to diff against; exit code against the directive alone.
+        if (got[0] == 0) == (kind == "run-pass"):
+            return rel, "noref", f"stock: {ref_st} {ref_msg}"
+        return rel, "run-fail", f"rc={got[0]} on a {kind} test (stock: {ref_st} {ref_msg})"
+    res = None
+    if got != want:
+        if got[0] != want[0]:
+            tail = (got[2].strip().splitlines() or [""])[-1][:200]
+            res = ("run-fail", f"rc={got[0]}, stock rc={want[0]} {tail}")
+        else:
+            gw, gg = norm_out(want[1]), norm_out(got[1])
+            if gw != gg:
+                res = ("output-mismatch", "stdout " + first_diff(gw, gg))
+            else:
+                ew, eg = norm_out(want[2]), norm_out(got[2])
+                if ew != eg:
+                    res = ("stderr-mismatch", "stderr " + first_diff(ew, eg))
+        if res:
+            # A test whose output varies run-to-run under *either* backend
+            # (HashMap RandomState order, timing, ...) is flaky, not a backend
+            # mismatch. Re-run pliron: flaky if its own output varies, or if
+            # it can still reproduce stock's output.
+            for _ in range(4):
+                _, _, got2 = exec_bin(path, sp, exe)
+                if got2 is None:
+                    continue
+                if got2 != got or got2 == want:
+                    return rel, "skipped", "nondeterministic output"
+    if os.path.exists(exe):
+        os.remove(exe)
+    if res:
+        return rel, res[0], res[1]
+    # Identical behavior; flag it only if the directive itself wasn't met.
+    if (want[0] == 0) == (kind == "run-pass"):
+        return rel, "pass", ""
+    return rel, "env-run-fail", f"rc={want[0]} under both backends on a {kind} test"
+
 
 def main():
     os.makedirs(os.path.join(OUT, "bin"), exist_ok=True)
+    os.makedirs(os.path.join(OUT, "stock"), exist_ok=True)
     ts = sorted(tests())
-    print(f"{len(ts)} tests", flush=True)
+    print(f"{len(ts)} files", flush=True)
     res = {}
     with cf.ThreadPoolExecutor(os.cpu_count()) as ex:
         for i, (rel, st, msg) in enumerate(ex.map(run, ts)):
-            res[rel] = [st, msg]
+            if st != "filtered":
+                res[rel] = [st, msg]
             if i % 200 == 0:
                 print(i, collections.Counter(v[0] for v in res.values()), flush=True)
-    # Failures that also fail with the stock LLVM backend aren't ours.
-    bad = [p for p in ts if res[os.path.relpath(p, os.path.join(RUST, "tests/ui"))][0] != "pass"]
-    with cf.ThreadPoolExecutor(os.cpu_count()) as ex:
-        for rel, st, _ in ex.map(lambda p: run(p, backend=False), bad):
-            if st != "pass":
-                res[rel][0] = "env-" + res[rel][0]
-    json.dump(res, open(os.path.join(OUT, "results.json"), "w"), indent=1, sort_keys=True)
+    # A filtered run must not clobber the full results file; merge into it.
+    rpath = os.path.join(OUT, "results.json")
+    if FILTER and os.path.exists(rpath):
+        prev = json.load(open(rpath))
+        prev.update(res)
+        res = prev
+    json.dump(res, open(rpath, "w"), indent=1, sort_keys=True)
     c = collections.Counter(v[0] for v in res.values())
     print("SUMMARY", dict(c))
-    groups = collections.Counter((v[0], re.sub(r"\d+", "N", v[1])[:160]) for v in res.values() if v[0] in ("ice", "link", "compile-error", "run-fail"))
-    for (st, msg), n in groups.most_common(40):
-        print(f"{n:5} {st:13} {msg}")
+    groups = collections.Counter((v[0], re.sub(r"\d+", "N", v[1])[:160]) for v in res.values()
+                                 if v[0] not in ("pass", "noref", "skipped"))
+    for (st, msg), n in groups.most_common(60):
+        print(f"{n:5} {st:16} {msg}")
+
 
 main()

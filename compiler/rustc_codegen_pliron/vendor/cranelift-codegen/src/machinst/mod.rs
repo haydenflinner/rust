@@ -60,7 +60,7 @@ use core::fmt::Debug;
 use core::num::NonZeroU8;
 use cranelift_control::ControlPlane;
 use cranelift_entity::PrimaryMap;
-use regalloc2::VReg;
+use regalloc2::{PReg, VReg};
 use smallvec::{SmallVec, smallvec};
 
 #[cfg(feature = "enable-serde")]
@@ -256,6 +256,8 @@ pub use vcode::*;
 pub mod compile;
 pub use compile::*;
 pub mod blockorder;
+/// PLIRON: chain-based block placement (`PLIRON_PLACE=1`).
+pub mod placement;
 pub use blockorder::*;
 pub mod abi;
 pub use abi::*;
@@ -280,6 +282,55 @@ pub trait MachInst: Clone + Debug {
     /// If this is a simple move, return the (source, destination) tuple of registers.
     fn is_move(&self) -> Option<(Writable<Reg>, Reg)>;
 
+    /// PLIRON FLAGDUP: how this instruction interacts with the target's
+    /// condition flags at emit time; see `FlagKind`. The default is
+    /// `Other` (unknown flag effects), which makes the emit-time
+    /// flag-recompute elision a no-op for targets that do not implement
+    /// the query.
+    fn flag_kind(&self) -> FlagKind {
+        FlagKind::Other
+    }
+
+    /// PLIRON EDGEHOIST: the `(taken, not_taken)` labels of a
+    /// two-target conditional branch, if this is one. Both edges carry
+    /// their successor's blockparams; the emitter may hoist a pure
+    /// edit block off the taken edge and retarget it.
+    fn cond_br_targets(&self) -> Option<(MachLabel, MachLabel)> {
+        None
+    }
+
+    /// PLIRON EDGEHOIST: retarget the taken label of a two-target
+    /// conditional branch. Only called when `cond_br_targets` matched.
+    fn set_cond_br_taken(&mut self, _taken: MachLabel) {}
+
+    /// PLIRON EDGEHOIST: invert a conditional branch's sense and swap
+    /// its targets (`b.cc T, F` becomes `b.!cc F, T`).
+    fn invert_cond_br(&mut self) {}
+
+    /// PLIRON EDGEHOIST: the target of an unconditional direct branch,
+    /// if this is one.
+    fn uncond_br_target(&self) -> Option<MachLabel> {
+        None
+    }
+
+    /// PLIRON FLAGX: if this is a conditional branch on the target's
+    /// flag register, the `(taken, not_taken)` labels plus the flag
+    /// bits each edge proves, as `(mask, value)` pairs over the
+    /// target's flag-bit numbering (x64: CF=1, ZF=2, SF=4, OF=8,
+    /// PF=16). Used to propagate known flag state across a
+    /// single-predecessor edge.
+    fn flag_branch(&self) -> Option<FlagBranch> {
+        None
+    }
+
+    /// PLIRON FLAGX: for a flag-reading conditional inst (cmov-class),
+    /// evaluate its condition under the known flag bits `(mask, vals)`:
+    /// `Some(outcome)` when the mask covers every flag the condition
+    /// needs, `None` otherwise (or when this inst has no flag cc).
+    fn flag_cc_eval(&self, _mask: u8, _vals: u8) -> Option<bool> {
+        None
+    }
+
     /// Is this a terminator (branch or ret)? If so, return its type
     /// (ret/uncond/cond) and target if applicable.
     fn is_term(&self) -> MachTerminator;
@@ -297,6 +348,28 @@ pub trait MachInst: Clone + Debug {
     /// for normal calls that return to the caller, and `CallType::TailCall`
     /// for tail calls that don't return to the caller.
     fn call_type(&self) -> CallType;
+
+    /// PLIRON: the trap code of an unconditional trap (`is_trap`), if the
+    /// backend records one. Used to find `TrapCode::NORETURN_CALL` traps
+    /// that emission may drop.
+    fn trap_code(&self) -> Option<crate::ir::TrapCode> {
+        None
+    }
+
+    /// PLIRON: if this is a `try_call` whose normal-return continuation is
+    /// a lone `TrapCode::NORETURN_CALL` trap emitted inline after the call,
+    /// mark it to emit nothing there instead and return true.
+    fn elide_noreturn_continuation(&mut self) -> bool {
+        false
+    }
+
+    /// PLIRON: the continuation label of a `try_call` whose normal-return
+    /// destination is a lone `TrapCode::NORETURN_CALL` trap. That trap is
+    /// emitted inline after the call (or elided), so the call never
+    /// branches to the label: the edge is dead.
+    fn noreturn_continuation(&self) -> Option<MachLabel> {
+        None
+    }
 
     /// Should this instruction's clobber-list be included in the
     /// clobber-set?
@@ -366,6 +439,29 @@ pub trait MachInst: Clone + Debug {
     /// alignment occurs.
     fn align_basic_block(offset: CodeOffset) -> CodeOffset {
         offset
+    }
+
+    /// PLIRON: a copy of this instruction writing `dst` instead, if it is
+    /// a cheap, side-effect-free, single-instruction definition with no
+    /// register inputs (a constant or a symbol address). Emission uses it
+    /// to rematerialize a spilled value at a reload instead of loading it
+    /// from its spill slot (regalloc2 cannot rematerialize).
+    fn rematerialize(&self, _dst: Writable<Reg>) -> Option<Self> {
+        None
+    }
+
+    /// PLIRON: whether this instruction can run before the callee saves
+    /// and frame allocation (shrink-wrapping): it touches no stack slot,
+    /// `sp`, `fp` or `lr`, and is not a call. Conservative default.
+    fn pliron_frame_free(&self) -> bool {
+        false
+    }
+
+    /// PLIRON: the size of every instruction when the encoding is fixed
+    /// (aarch64: 4), so emission can estimate a loop's byte size from its
+    /// instruction count. `None` for variable-length encodings.
+    fn fixed_inst_size() -> Option<CodeOffset> {
+        None
     }
 
     /// What is the worst-case instruction size emitted by this instruction type?
@@ -467,6 +563,45 @@ pub trait MachInstLabelUse: Clone + Copy + Debug + Eq {
     fn from_reloc(reloc: Reloc, addend: Addend) -> Option<Self>;
 }
 
+/// PLIRON FLAGDUP: how an instruction interacts with the target's
+/// condition flags at emit time. `VCode::emit` uses this to elide a
+/// compare/test whose identical flag state is still live: the compare
+/// was emitted earlier in the block, only flag-preserving insts
+/// intervened, and none of its operand pregs were rewritten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlagKind {
+    /// Establishes the condition flags by comparing operands identified
+    /// by `key` (which encodes the operation's form and any immediates)
+    /// over the operand pregs `a` and `b` (`a == b` for one-operand
+    /// forms). A later `Cmp` with the same `key` and unchanged `a`/`b`
+    /// recomputes these exact flags and may be elided.
+    Cmp { key: u64, a: PReg, b: PReg },
+    /// Provably does not write condition flags (moves, loads, lea,
+    /// cmov, setcc, nops, ...). It may still rewrite a compare's
+    /// operand pregs, which the emitter checks separately.
+    Neutral,
+    /// May write flags (arithmetic, unmodelled cmp/test forms) or makes
+    /// flag state unknowable (calls, block boundaries, terminators).
+    /// Conservatively the default for every target and inst.
+    Other,
+}
+
+/// PLIRON FLAGX: a flag-register conditional branch and the flag bits
+/// each of its outgoing edges proves, as `(mask, value)` pairs (x64
+/// bits: CF=1, ZF=2, SF=4, OF=8, PF=16). A successor entered through
+/// `taken` has `taken_bits` proven; through `not_taken`, `fall_bits`.
+#[derive(Clone, Copy, Debug)]
+pub struct FlagBranch {
+    /// The branch-taken target.
+    pub taken: MachLabel,
+    /// The fallthrough/not-taken target.
+    pub not_taken: MachLabel,
+    /// `(mask, value)` flag bits proven on the taken edge.
+    pub taken_bits: (u8, u8),
+    /// `(mask, value)` flag bits proven on the not-taken edge.
+    pub fall_bits: (u8, u8),
+}
+
 /// Classification of call instruction types for granular analysis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CallType {
@@ -546,6 +681,83 @@ pub trait MachInstEmit: MachInst {
 
     /// Pretty-print the instruction.
     fn pretty_print_inst(&self, state: &mut Self::State) -> String;
+
+    /// Attempt to fuse this instruction with a following instruction
+    /// into a single instruction (e.g., an `ldp`/`stp` register pair).
+    /// Called during emission with lookahead; both instructions carry
+    /// allocated registers at that point. On `Some`, the caller replaces
+    /// this instruction with the result and squashes the partner to a
+    /// zero-size nop. `state` gives access to the finalized frame
+    /// layout so virtual stack addressing modes can be resolved to
+    /// concrete `[sp/fp + imm]` offsets.
+    fn fuse_with_next(&self, _next: &Self, _state: &Self::State) -> Option<Self> {
+        None
+    }
+
+    /// Whether a pair-fused load/store may be emitted before this
+    /// instruction — pure register dataflow with no memory access,
+    /// control flow, trap, call or other hidden state. Register
+    /// read/write hazards are checked separately by the caller.
+    fn pair_fusion_crossable(&self) -> bool {
+        false
+    }
+
+    /// If this is a load/store on a signed-offset register base,
+    /// return `(base, byte_offset, access_ty)` describing the memory
+    /// access a post-indexed rewrite would replace.
+    fn mem_signed_offset(&self) -> Option<(Reg, i64, Type)> {
+        None
+    }
+
+    /// Whether `wb` bytes is encodable as this instruction's post-index
+    /// writeback immediate.
+    fn post_index_imm_ok(&self, _wb: i64) -> bool {
+        false
+    }
+
+    /// Rewrite this instruction to access `[base]` and write back
+    /// `base + wb` bytes (post-indexed addressing). `wb` must have been
+    /// validated by the caller.
+    fn set_post_index(&mut self, _wb: i64) {}
+
+    /// PLIRON: whether this load/store (a `mem_signed_offset` access)
+    /// can be re-addressed to `[base + off]` with no helper
+    /// instructions — the post-index sweep runs after register
+    /// allocation, so an offset that would need a scratch register is
+    /// refused.
+    fn mem_offset_ok(&self, _off: i64) -> bool {
+        false
+    }
+
+    /// PLIRON: re-address this load/store to `[base + off]`. `off` must
+    /// have passed `mem_offset_ok`.
+    fn set_mem_offset(&mut self, _off: i64) {}
+
+    /// If this instruction is `add rd, rn, #imm` with `rd == rn`,
+    /// return `(rn, imm)`.
+    fn self_add_imm(&self) -> Option<(Reg, i64)> {
+        None
+    }
+
+    /// PLIRON: this instruction computes a value whose flags a later
+    /// instruction might recompute (see `flag_twin`).
+    fn flag_twin_candidate(&self) -> bool {
+        false
+    }
+
+    /// PLIRON: if `later` sets exactly the flags this instruction's
+    /// operation would set, on the same operands, and writes no
+    /// register, the flag-setting form of this instruction (which then
+    /// replaces both). Register hazards are checked by the caller.
+    fn flag_twin(&self, _later: &Self) -> Option<Self> {
+        None
+    }
+
+    /// PLIRON: this instruction neither reads nor writes the condition
+    /// flags, and has no control flow (conservative: `false`).
+    fn nzcv_free(&self) -> bool {
+        false
+    }
 }
 
 /// A trait describing the emission state carried between MachInsts when

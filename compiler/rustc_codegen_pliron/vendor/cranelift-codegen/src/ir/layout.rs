@@ -36,8 +36,16 @@ pub struct Layout {
     /// First block in the layout order, or `None` when no blocks have been laid out.
     first_block: Option<Block>,
 
+    /// PLIRON: static branch hint per block: `k + 1` when arm `k` of the
+    /// block's `brif` is unlikely (0: no hint). Read by block placement.
+    unlikely: SecondaryMap<Block, u8>,
+
     /// Last block in the layout order, or `None` when no blocks have been laid out.
     last_block: Option<Block>,
+
+    /// PLIRON: number of blocks currently in the layout order — gives the
+    /// `blocks()` iterator an exact `size_hint` for `Vec::from_iter`.
+    num_blocks: u32,
 }
 
 impl Layout {
@@ -45,9 +53,11 @@ impl Layout {
     pub fn new() -> Self {
         Self {
             blocks: SecondaryMap::new(),
+            unlikely: SecondaryMap::new(),
             insts: SecondaryMap::new(),
             first_block: None,
             last_block: None,
+            num_blocks: 0,
         }
     }
 
@@ -57,6 +67,8 @@ impl Layout {
         self.insts.clear();
         self.first_block = None;
         self.last_block = None;
+        self.num_blocks = 0;
+        self.unlikely.clear();
     }
 
     /// Returns the capacity of the `BlockData` map.
@@ -218,6 +230,7 @@ impl Layout {
 ///
 impl Layout {
     /// Is `block` currently part of the layout?
+#[inline]
     pub fn is_block_inserted(&self, block: Block) -> bool {
         Some(block) == self.first_block || self.blocks[block].prev.is_some()
     }
@@ -240,6 +253,7 @@ impl Layout {
             self.first_block = Some(block);
         }
         self.last_block = Some(block);
+        self.num_blocks += 1; // PLIRON
     }
 
     /// Insert `block` in the layout before the existing block `before`.
@@ -263,6 +277,7 @@ impl Layout {
             None => self.first_block = Some(block),
             Some(a) => self.blocks[a].next = block.into(),
         }
+        self.num_blocks += 1; // PLIRON
     }
 
     /// Insert `block` in the layout *after* the existing block `after`.
@@ -286,6 +301,7 @@ impl Layout {
             None => self.last_block = Some(block),
             Some(b) => self.blocks[b].prev = block.into(),
         }
+        self.num_blocks += 1; // PLIRON
     }
 
     /// Remove all instructions from `block` and then remove it from
@@ -321,6 +337,12 @@ impl Layout {
             None => self.last_block = prev.expand(),
             Some(n) => self.blocks[n].prev = prev,
         }
+        self.num_blocks -= 1; // PLIRON
+    }
+
+    /// PLIRON: number of blocks in the layout order.
+    pub fn num_blocks(&self) -> usize {
+        self.num_blocks as usize
     }
 
     /// Return an iterator over all blocks in layout order.
@@ -328,6 +350,7 @@ impl Layout {
         Blocks {
             layout: self,
             next: self.first_block,
+            remaining: self.num_blocks, // PLIRON
         }
     }
 
@@ -348,6 +371,7 @@ impl Layout {
     }
 
     /// Get the block following `block` in the layout order.
+#[inline]
     pub fn next_block(&self, block: Block) -> Option<Block> {
         self.blocks[block].next.expand()
     }
@@ -364,6 +388,24 @@ impl Layout {
     pub fn is_cold(&self, block: Block) -> bool {
         self.blocks[block].cold
     }
+
+    /// PLIRON: mark arm `arm` (0 or 1) of `block`'s `brif` as unlikely.
+    pub fn set_unlikely_arm(&mut self, block: Block, arm: u8) {
+        self.unlikely[block] = arm + 1;
+    }
+
+    /// PLIRON: clear the branch hint of `block`.
+    pub fn clear_unlikely_arm(&mut self, block: Block) {
+        self.unlikely[block] = 0;
+    }
+
+    /// PLIRON: the unlikely arm of `block`'s `brif`, if hinted.
+    pub fn unlikely_arm(&self, block: Block) -> Option<u8> {
+        match self.unlikely[block] {
+            0 => None,
+            k => Some(k - 1),
+        }
+    }
 }
 
 /// A single node in the linked-list of blocks.
@@ -374,6 +416,9 @@ struct BlockNode {
     next: PackedOption<Block>,
     first_inst: PackedOption<Inst>,
     last_inst: PackedOption<Inst>,
+    /// PLIRON: number of instructions currently in this block — gives
+    /// `block_insts()` an exact `size_hint` for `Vec::from_iter`.
+    count: u32,
     cold: bool,
 }
 
@@ -381,21 +426,35 @@ struct BlockNode {
 pub struct Blocks<'f> {
     layout: &'f Layout,
     next: Option<Block>,
+    /// PLIRON: blocks left to yield — feeds an exact `size_hint`.
+    remaining: u32,
 }
 
 impl<'f> Iterator for Blocks<'f> {
     type Item = Block;
 
+#[inline]
     fn next(&mut self) -> Option<Block> {
         match self.next {
             Some(block) => {
                 self.next = self.layout.next_block(block);
+                self.remaining -= 1; // PLIRON
                 Some(block)
             }
             None => None,
         }
     }
+
+    // PLIRON: exact hint lets `Vec::from_iter(blocks())` preallocate.
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.remaining as usize;
+        (n, Some(n))
+    }
 }
+
+// PLIRON
+impl ExactSizeIterator for Blocks<'_> {}
 
 /// Use a layout reference in a for loop.
 impl<'f> IntoIterator for &'f Layout {
@@ -446,26 +505,31 @@ impl Layout {
                 self.insts[block_node.last_inst.unwrap()].next = inst.into();
             }
             block_node.last_inst = inst.into();
+            block_node.count += 1; // PLIRON
         }
         self.assign_inst_seq(inst);
     }
 
     /// Fetch a block's first instruction.
+#[inline]
     pub fn first_inst(&self, block: Block) -> Option<Inst> {
         self.blocks[block].first_inst.into()
     }
 
     /// Fetch a block's last instruction.
+#[inline]
     pub fn last_inst(&self, block: Block) -> Option<Inst> {
         self.blocks[block].last_inst.into()
     }
 
     /// Fetch the instruction following `inst`.
+#[inline]
     pub fn next_inst(&self, inst: Inst) -> Option<Inst> {
         self.insts[inst].next.expand()
     }
 
     /// Fetch the instruction preceding `inst`.
+#[inline]
     pub fn prev_inst(&self, inst: Inst) -> Option<Inst> {
         self.insts[inst].prev.expand()
     }
@@ -488,6 +552,7 @@ impl Layout {
             None => self.blocks[block].first_inst = inst.into(),
             Some(a) => self.insts[a].next = inst.into(),
         }
+        self.blocks[block].count += 1; // PLIRON
         self.assign_inst_seq(inst);
     }
 
@@ -514,6 +579,7 @@ impl Layout {
             None => self.blocks[block].last_inst = prev,
             Some(n) => self.insts[n].prev = prev,
         }
+        self.blocks[block].count -= 1; // PLIRON
     }
 
     /// Iterate over the instructions in `block` in layout order.
@@ -522,7 +588,13 @@ impl Layout {
             layout: self,
             head: self.blocks[block].first_inst.into(),
             tail: self.blocks[block].last_inst.into(),
+            remaining: self.blocks[block].count, // PLIRON
         }
+    }
+
+    /// PLIRON: number of instructions currently in `block`.
+    pub fn block_inst_count(&self, block: Block) -> usize {
+        self.blocks[block].count as usize
     }
 
     /// Does the given block contain exactly one instruction?
@@ -588,12 +660,18 @@ impl Layout {
         }
 
         // Fix the instruction -> block pointers.
+        // PLIRON: `moved` also splits the per-block inst counts.
+        let mut moved: u32 = 0;
         let mut opt_i = Some(before);
         while let Some(i) = opt_i {
             debug_assert_eq!(self.insts[i].block.expand(), Some(old_block));
             self.insts[i].block = new_block.into();
+            moved += 1;
             opt_i = self.insts[i].next.into();
         }
+        self.blocks[new_block].count = moved;
+        self.blocks[old_block].count -= moved;
+        self.num_blocks += 1;
     }
 }
 
@@ -629,11 +707,14 @@ pub struct Insts<'f> {
     layout: &'f Layout,
     head: Option<Inst>,
     tail: Option<Inst>,
+    /// PLIRON: insts left to yield — feeds an exact `size_hint`.
+    remaining: u32,
 }
 
 impl<'f> Iterator for Insts<'f> {
     type Item = Inst;
 
+#[inline]
     fn next(&mut self) -> Option<Inst> {
         let rval = self.head;
         if let Some(inst) = rval {
@@ -643,12 +724,24 @@ impl<'f> Iterator for Insts<'f> {
             } else {
                 self.head = self.layout.insts[inst].next.into();
             }
+            self.remaining -= 1; // PLIRON
         }
         rval
     }
+
+    // PLIRON: exact hint lets `Vec::from_iter(block_insts(..))` preallocate.
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.remaining as usize;
+        (n, Some(n))
+    }
 }
 
+// PLIRON
+impl ExactSizeIterator for Insts<'_> {}
+
 impl<'f> DoubleEndedIterator for Insts<'f> {
+#[inline]
     fn next_back(&mut self) -> Option<Inst> {
         let rval = self.tail;
         if let Some(inst) = rval {
@@ -658,6 +751,7 @@ impl<'f> DoubleEndedIterator for Insts<'f> {
             } else {
                 self.tail = self.layout.insts[inst].prev.into();
             }
+            self.remaining -= 1; // PLIRON
         }
         rval
     }
@@ -689,16 +783,17 @@ mod serde {
         where
             S: Serializer,
         {
-            let size = self.blocks().count() * 3
+            // PLIRON: stored counts replace the per-block list walks.
+            let size = self.num_blocks() * 3
                 + self
                     .blocks()
-                    .map(|block| self.block_insts(block).count())
+                    .map(|block| self.blocks[block].count as usize)
                     .sum::<usize>();
             let mut seq = serializer.serialize_seq(Some(size))?;
             for block in self.blocks() {
                 seq.serialize_element(&block)?;
                 seq.serialize_element(&self.blocks[block].cold)?;
-                seq.serialize_element(&u32::try_from(self.block_insts(block).count()).unwrap())?;
+                seq.serialize_element(&self.blocks[block].count)?;
                 for inst in self.block_insts(block) {
                     seq.serialize_element(&inst)?;
                 }

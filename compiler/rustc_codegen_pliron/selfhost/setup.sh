@@ -6,17 +6,35 @@
 #   selfhost/setup.sh [RUST_CHECKOUT] [WORKTREE]
 set -euo pipefail
 B="$(cd "$(dirname "$0")/.." && pwd)"
-RUST="${1:-$HOME/work/rust}"
-WT="${2:-$HOME/work/rust-sh}"
-COMMIT=$(rustc +nightly-2026-10-06 -vV | sed -n 's/^commit-hash: //p')
+# Default checkout: a `rust` dir next to this repo, else the historical ~/work/rust.
+RUST="${1:-${RUST_CHECKOUT:-$B/../rust}}"
+[[ -d "$RUST/tests/ui" ]] || RUST="$HOME/work/rust"
+WT="${2:-$RUST-sh}"
+COMMIT=$(rustc +nightly-2026-10-22 -vV | sed -n 's/^commit-hash: //p')
 if [[ ! -d "$WT" ]]; then
     git -C "$RUST" cat-file -e "$COMMIT" 2>/dev/null || git -C "$RUST" fetch --depth=1 origin "$COMMIT"
     git -C "$RUST" worktree add --detach "$WT" "$COMMIT"
     git -C "$WT" apply "$B/selfhost/bootstrap.patch"
+    # rustc-side hooks the backend needs (Session::fat_lto_supported,
+    # compiletest backend name). Lives on the rust fork's main branch;
+    # mirrored here as a patch so fresh worktrees don't need it.
+    git -C "$WT" apply "$B/selfhost/rustc-session.patch"
     cp "$B/selfhost/bootstrap.toml" "$WT/bootstrap.toml"
+    # cc for crt/libc paths; wild does the linking. Mach-O links fine with the system ld.
+    if [[ "$(uname -sm)" == "Linux x86_64" ]]; then
+        printf '[target.x86_64-unknown-linux-gnu]\nlinker = "%s"\n' "$B/selfhost/cc-wild" >> "$WT/bootstrap.toml"
+    fi
 fi
+# A worktree made by hand (e.g. from the fork's main, which already carries
+# the patches) still needs the bootstrap config: without it bootstrap
+# silently builds the default LLVM-backed compiler.
+[[ -f "$WT/bootstrap.toml" ]] || cp "$B/selfhost/bootstrap.toml" "$WT/bootstrap.toml"
 # -c, no -t: changed files get a fresh mtime, so cargo rebuilds the backend even
 # when the edit is older than the last build artifact.
 rsync -rlpc --delete --exclude 'target*' --exclude rust-toolchain.toml --exclude examples --exclude .git \
     "$B/" "$WT/compiler/rustc_codegen_pliron/"
+# Provenance: the copy has no .git, so build.rs stamps the dylib from this
+# file — `PLIRON_VERSION=1 build/<host>/stage2/bin/rustc -vV` prints it.
+"$B/harness/src-rev.sh" > "$WT/compiler/rustc_codegen_pliron/.pliron-src-rev"
+echo "synced backend $(cat "$WT/compiler/rustc_codegen_pliron/.pliron-src-rev") -> $WT"
 echo "now: cd $WT && ./x build --stage 1 library && ./x build --stage 2 compiler"

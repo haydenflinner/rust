@@ -17,6 +17,21 @@ use cranelift_control::ControlPlane;
 use cranelift_entity::{EntitySet, SecondaryMap, packed_option::ReservedValue};
 use smallvec::{SmallVec, smallvec};
 
+/// PLIRON: `PLIRON_REMATCALL` (default on; `=0` turns it off) — see
+/// `Elaborator::call_loops` and the `iconst` rule in `opts/remat.isle`.
+pub(crate) fn remat_call_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_REMATCALL").as_deref() != Ok("0"))
+}
+
+/// PLIRON: `PLIRON_ELABLOOPS=1` (opt-in) — rebuild the loop stack from
+/// the loop nest of each block instead of popping entries when the
+/// domtree preorder leaves a loop. See `Elaborator::start_block`.
+pub(crate) fn elab_loops_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_ELABLOOPS").as_deref() == Ok("1"))
+}
+
 pub(crate) struct Elaborator<'a> {
     func: &'a mut Function,
     domtree: &'a DominatorTree,
@@ -49,6 +64,10 @@ pub(crate) struct Elaborator<'a> {
     value_to_best_value: SecondaryMap<Value, BestEntry>,
     /// Stack of blocks and loops in current elaboration path.
     loop_stack: SmallVec<[LoopStackEntry; 8]>,
+    /// PLIRON (`PLIRON_ELABLOOPS=1`): the stack entry of every loop
+    /// whose header has been visited, so `start_block` can rebuild
+    /// `loop_stack` from a block's loop nest.
+    loop_entries: FxHashMap<Loop, LoopStackEntry>,
     /// The current block into which we are elaborating.
     cur_block: Block,
     /// Values that opt rules have indicated should be rematerialized
@@ -63,6 +82,12 @@ pub(crate) struct Elaborator<'a> {
     block_stack: Vec<BlockStackEntry>,
     /// Copies of values that have been rematerialized.
     remat_copies: FxHashMap<(Block, Value), Value>,
+    /// PLIRON: under `PLIRON_REMATCALL=1`, the loops whose body (inner
+    /// loops included) contains a call. A remat clone into such a loop
+    /// costs one cheap instruction per iteration next to a call, while
+    /// the hoisted value it replaces lives across that call in a
+    /// callee-saved register or a spill slot.
+    call_loops: FxHashSet<Loop>,
     /// Stats for various events during egraph processing, to help
     /// with optimization of this infrastructure.
     stats: &'a mut Stats,
@@ -150,6 +175,31 @@ impl<'a> Elaborator<'a> {
         let mut value_to_best_value =
             SecondaryMap::with_default(BestEntry(Cost::infinity(), Value::reserved_value()));
         value_to_best_value.resize(num_values);
+        let mut call_loops = FxHashSet::default();
+        if remat_call_on() {
+            for block in func.layout.blocks() {
+                let Some(mut lp) = loop_analysis.innermost_loop(block) else {
+                    continue;
+                };
+                if call_loops.contains(&lp)
+                    || !func
+                        .layout
+                        .block_insts(block)
+                        .any(|i| func.dfg.insts[i].opcode().is_call())
+                {
+                    continue;
+                }
+                loop {
+                    if !call_loops.insert(lp) {
+                        break;
+                    }
+                    match loop_analysis.loop_parent(lp) {
+                        Some(p) => lp = p,
+                        None => break,
+                    }
+                }
+            }
+        }
         Self {
             func,
             domtree,
@@ -157,12 +207,14 @@ impl<'a> Elaborator<'a> {
             value_to_elaborated_value: ScopedHashMap::with_capacity(num_values),
             value_to_best_value,
             loop_stack: smallvec![],
+            loop_entries: FxHashMap::default(),
             cur_block: Block::reserved_value(),
             remat_values,
             elab_stack: vec![],
             elab_result_stack: vec![],
             block_stack: vec![],
             remat_copies: FxHashMap::default(),
+            call_loops,
             stats,
             ctrl_plane,
         }
@@ -176,6 +228,45 @@ impl<'a> Elaborator<'a> {
             self.loop_stack.len(),
             self.value_to_elaborated_value.depth()
         );
+
+        // PLIRON_ELABLOOPS=1: the loop stack is the loop nest of `block`.
+        // The pop-on-leave rule below drops a loop's entry as soon as the
+        // domtree preorder visits a block outside the loop — and a loop's
+        // exit block is dominated by its header, so it can come before the
+        // rest of the body among the header's domtree children. Every
+        // later body block then sees no entry for its own loop, and its
+        // invariants are placed in the body (parse_only's `ptr + len` end
+        // pointer recomputed per digit). Headers are visited before their
+        // bodies (they dominate them), so the entry recorded at the header
+        // is always available; the hoist block still dominates every body
+        // block, so the scoped-map depth it carries is still open.
+        if elab_loops_on() {
+            self.loop_stack.clear();
+            let mut chain: SmallVec<[Loop; 8]> = smallvec![];
+            let mut lp = self.loop_analysis.innermost_loop(block);
+            while let Some(l) = lp {
+                chain.push(l);
+                lp = self.loop_analysis.loop_parent(l);
+            }
+            for &l in chain.iter().rev() {
+                if self.loop_analysis.loop_header(l) == block {
+                    if let Some(idom) = idom {
+                        let e = LoopStackEntry {
+                            lp: l,
+                            hoist_block: idom,
+                            scope_depth: (self.value_to_elaborated_value.depth() - 1) as u32,
+                        };
+                        self.loop_entries.insert(l, e.clone());
+                        self.loop_stack.push(e);
+                    }
+                } else if let Some(e) = self.loop_entries.get(&l) {
+                    self.loop_stack.push(e.clone());
+                }
+            }
+            trace!("block {}: loop stack is {:?}", block, self.loop_stack);
+            self.cur_block = block;
+            return;
+        }
 
         // Pop any loop levels we're no longer in.
         while let Some(inner_loop) = self.loop_stack.last() {
@@ -416,6 +507,8 @@ impl<'a> Elaborator<'a> {
         remat_values: &FxHashSet<Value>,
         func: &mut Function,
         remat_copies: &mut FxHashMap<(Block, Value), Value>,
+        loop_analysis: &LoopAnalysis,
+        call_loops: &FxHashSet<Loop>,
         insert_block: Block,
         before: Inst,
         arg: &mut ElaboratedValue,
@@ -428,6 +521,42 @@ impl<'a> Elaborator<'a> {
         // currently rematerialized. Right now we don't do this, to
         // avoid the need for another fixpoint loop here.
         if arg.in_block != insert_block && remat_values.contains(&arg.value) {
+            // PLIRON: never remat into a deeper loop — the clone
+            // executes once per iteration, strictly more often than
+            // the def, so it loses to keeping the value in a vreg no
+            // matter how cheap the materialization (a radix constant
+            // deduped above the word loop got re-sunk into every
+            // per-digit block).
+            //
+            // PLIRON_REMATCALL=1: both loop rules give way when the use's
+            // loop contains a call — an extra cheap op per iteration next
+            // to a call beats the value's trip across it.
+            let callful = loop_analysis
+                .innermost_loop(insert_block)
+                .is_some_and(|l| call_loops.contains(&l));
+            if !callful
+                && loop_analysis.loop_level(insert_block).level()
+                    > loop_analysis.loop_level(arg.in_block).level()
+            {
+                return false;
+            }
+            // PLIRON_REMATLOOP (default off; `=1` restores): remat into
+            // another block of the def's own loop. The def already runs
+            // every trip, so the copy is a second execution per iteration
+            // to shorten one live range (parse_only's `byte - '0'`
+            // recomputed past the digit test). Default-off: parse_only
+            // 1.14 → 1.05 with SELCHAIN/MULCARRY/STEPCMP; sieve layout-
+            // checked clean (2026-10-27-slow-kernels.md).
+            static REMATLOOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if !callful
+                && !*REMATLOOP.get_or_init(|| {
+                    std::env::var("PLIRON_REMATLOOP").as_deref() == Ok("1")
+                })
+                && let Some(lp) = loop_analysis.innermost_loop(arg.in_block)
+                && loop_analysis.innermost_loop(insert_block) == Some(lp)
+            {
+                return false;
+            }
             let new_value = match remat_copies.entry((insert_block, arg.value)) {
                 HashEntry::Occupied(o) => *o.get(),
                 HashEntry::Vacant(v) => {
@@ -436,6 +565,7 @@ impl<'a> Elaborator<'a> {
                     let new_inst = func.dfg.clone_inst(inst);
                     func.layout.insert_inst(new_inst, before);
                     let new_result = func.dfg.inst_results(new_inst)[0];
+                    stats.renames.push((new_result, arg.value, true));
                     *v.insert(new_result)
                 }
             };
@@ -638,6 +768,8 @@ impl<'a> Elaborator<'a> {
                             &self.remat_values,
                             &mut self.func,
                             &mut self.remat_copies,
+                            self.loop_analysis,
+                            &self.call_loops,
                             insert_block,
                             before,
                             arg_value,
@@ -688,6 +820,7 @@ impl<'a> Elaborator<'a> {
                                 scope_depth,
                             );
 
+                            self.stats.renames.push((new_result, result, true));
                             self.value_to_best_value[new_result] = best_result;
 
                             trace!(
@@ -785,6 +918,8 @@ impl<'a> Elaborator<'a> {
                     &self.remat_values,
                     &mut self.func,
                     &mut self.remat_copies,
+                    self.loop_analysis,
+                    &self.call_loops,
                     block,
                     inst,
                     &mut new_arg,

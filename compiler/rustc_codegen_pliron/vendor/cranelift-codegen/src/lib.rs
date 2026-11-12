@@ -48,6 +48,28 @@ include!(concat!(env!("ISLE_DIR"), "/isle_numerics.rs"));
 
 #[macro_use]
 mod machinst;
+// PLIRON: frame breakdown of the last compiled function (debug aid).
+pub use crate::machinst::pliron_last_frame;
+/// PLIRON: regalloc2 decision logging for the next allocations on this thread.
+pub use regalloc2::set_explain as ra_set_explain;
+/// PLIRON: block placement (`machinst/placement.rs`), exported for the
+/// workspace's unit tests.
+pub use machinst::placement::place as pliron_place;
+
+std::thread_local! {
+    /// PLIRON: the symbol of the function being compiled on this thread
+    /// (`pliron_set_fn_name`), for the `RA2STAT` lines.
+    pub static PLIRON_FN_NAME: core::cell::RefCell<alloc::string::String> = core::cell::RefCell::new(alloc::string::String::new());
+}
+
+/// PLIRON: name the function this thread compiles next (debug output).
+pub fn pliron_set_fn_name(name: &str) {
+    PLIRON_FN_NAME.with(|n| {
+        let mut n = n.borrow_mut();
+        n.clear();
+        n.push_str(name);
+    });
+}
 
 pub mod binemit;
 pub mod cfg_printer;

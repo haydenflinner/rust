@@ -251,6 +251,16 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
         self.ctx.func.dfg.value_type(val)
     }
 
+    fn pliron_remat_saddr(&mut self) -> Option<()> {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        ON.get_or_init(|| std::env::var("PLIRON_REMAT_SADDR").as_deref() != Ok("0"))
+            .then_some(())
+    }
+
+    fn pliron_remat_call(&mut self) -> Option<()> {
+        crate::egraph::elaborate::remat_call_on().then_some(())
+    }
+
     fn resolve_jump_table_entry(&mut self, table: JumpTable, index: u64) -> BlockCall {
         let jt_data = &self.ctx.func.dfg.jump_tables[table];
         let entries = jt_data.as_slice();
@@ -286,6 +296,85 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
         } else {
             None
         }
+    }
+
+    /// PLIRON: remat is only profitable when the immediate encodes in a
+    /// single instruction — `iconst.i64` can cost a `movz`+`movk` chain
+    /// per use on aarch64, so rematerializing it inside a loop beats
+    /// pinning a vreg only for tiny immediates. `u16` (movz) or
+    /// sign-extended-`i16` (mov/movn) are one insn on every target.
+    fn imm64_remat_cheap(&mut self, ty: Type, imm: Imm64) -> Option<()> {
+        let v = self.i64_sextend_imm64(ty, imm);
+        (v == i64::from(v as u16) || v == i64::from(v as i16)).then_some(())
+    }
+
+    /// PLIRON: remat only pays when the op+imm still lowers to one
+    /// instruction — rematerializing `bxor v, 0x7465...` keeps the
+    /// constant in a register *and* re-xors it per use, a strict loss
+    /// versus keeping the result in a vreg. aarch64 add/sub take a
+    /// 12-bit immediate, optionally shifted left 12 (negative is a
+    /// sub-form swap); conservative for targets with wider immediate
+    /// fields, which only lose a neutral remat.
+    /// PLIRON: `opts/pliron.isle` rules (migrated clifpeep rewrites).
+    /// Default since 11-04; `PLIRON_EGRAPH_RULES=0` disables.
+    fn pliron_rules_on(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_EGRAPH_RULES").as_deref() != Ok("0"))
+    }
+
+    fn imm64_addsub_imm(&mut self, ty: Type, imm: Imm64) -> Option<()> {
+        let v = self.i64_sextend_imm64(ty, imm).unsigned_abs();
+        (v <= 0xfff || (v & 0xfff == 0 && v <= 0xfff_000)).then_some(())
+    }
+
+    /// PLIRON: aarch64 logical-immediate encodability — the value must
+    /// be a replicated `e`-bit pattern (`e` a power of two up to the
+    /// type width) that is one cyclic run of set bits (a run of ones,
+    /// possibly rotated). All-ones is unencodable; all-zero folds
+    /// earlier. Vector and >64-bit types reject: their `band`/`bxor`
+    /// with a materialized constant is never a single instruction.
+    fn imm64_logic_imm(&mut self, ty: Type, imm: Imm64) -> Option<()> {
+        if !ty.is_int() || ty.is_vector() || ty.bits() > 64 {
+            return None;
+        }
+        let w = ty.bits();
+        let v = if w == 64 {
+            self.i64_sextend_imm64(ty, imm) as u64
+        } else {
+            (self.i64_sextend_imm64(ty, imm) as u64) & ((1u64 << w) - 1)
+        };
+        for e in [2u32, 4, 8, 16, 32, 64] {
+            if e > w {
+                break;
+            }
+            let (p, rep) = if e == 64 {
+                (v, v)
+            } else {
+                let m = (1u64 << e) - 1;
+                let p = v & m;
+                // Replicate `p` across `w` bits.
+                let mut rep = 0u64;
+                for _ in 0..(w / e) {
+                    rep = (rep << e) | p;
+                }
+                (p, rep)
+            };
+            if rep != v {
+                continue;
+            }
+            // One cyclic run of set bits: exactly two 0<->1
+            // transitions in the ring.
+            let rot = if e == 64 {
+                v.rotate_left(1)
+            } else {
+                let m = (1u64 << e) - 1;
+                ((p << 1) & m) | (p >> (e - 1))
+            };
+            if (p ^ rot).count_ones() == 2 {
+                return Some(());
+            }
+        }
+        None
     }
 
     fn remat(&mut self, value: Value) -> Value {

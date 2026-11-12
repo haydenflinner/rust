@@ -1,7 +1,10 @@
 //! Rust intrinsics -> pliron ops / `llvm.*` intrinsic calls / libm calls.
 
+use pliron::r#type::TypeHandle;
 use pliron::value::Value;
-use rustc_abi::Align;
+use pliron_llvm::ops::XorOp;
+use rustc_abi::{Align, BackendRepr};
+use rustc_codegen_ssa::MemFlags;
 use rustc_codegen_ssa::common::IntPredicate;
 use rustc_codegen_ssa::mir::IntrinsicResult;
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
@@ -12,8 +15,53 @@ use rustc_middle::ty::{self, Instance};
 use rustc_span::{Span, sym};
 
 use crate::builder::Builder;
+use crate::types::TyK;
+
+/// Or-reduced xor of `pa[0..n]` vs `pb[0..n]` in word chunks — nonzero
+/// iff the byte ranges differ. LLVM expands small constant-size
+/// equality the same way; a libcall sits badly in hot loops (wasm DFA
+/// state-set compares were 32-byte memcmp calls in the search path).
+fn eq_bytes<'a, 'tcx>(
+    b: &mut Builder<'a, 'tcx>,
+    pa: Value,
+    pb: Value,
+    n: u64,
+) -> (Value, TypeHandle) {
+    let i8t = b.type_i8();
+    let mut off = 0u64;
+    let mut acc = None;
+    let mut acc_ty = i8t;
+    for (w, t) in [
+        (8u64, b.type_i64()),
+        (4, b.type_i32()),
+        (2, b.type_i16()),
+        (1, i8t),
+    ] {
+        while off + w <= n {
+            let o = b.const_usize(off);
+            let ga = b.gep(i8t, pa, &[o]);
+            let va = b.load(t, ga, Align::ONE);
+            let gb = b.gep(i8t, pb, &[o]);
+            let vb = b.load(t, gb, Align::ONE);
+            let d = b.xor(va, vb);
+            if acc.is_none() {
+                acc_ty = t;
+            }
+            // Later chunks are narrower than the first: widen to the
+            // accumulator's type before or-ing.
+            let d = if t == acc_ty { d } else { b.zext(d, acc_ty) };
+            acc = Some(match acc {
+                None => d,
+                Some(p) => b.or(p, d),
+            });
+            off += w;
+        }
+    }
+    (acc.unwrap(), acc_ty)
+}
 
 impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
+    // r[impl front.intrinsic.rust]
     fn codegen_intrinsic_call(
         &mut self,
         instance: Instance<'tcx>,
@@ -28,23 +76,29 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         let imm = |v: Value| IntrinsicResult::Operand(OperandValue::Immediate(v));
         let float = |s: &str| -> Option<&'static str> {
             Some(match s {
-                "sqrtf32" | "sqrtf64" => "llvm.sqrt",
-                "fabsf32" | "fabsf64" => "llvm.fabs",
-                "floorf32" | "floorf64" => "llvm.floor",
-                "ceilf32" | "ceilf64" => "llvm.ceil",
-                "truncf32" | "truncf64" => "llvm.trunc",
-                "round_ties_even_f32" | "round_ties_even_f64" => "llvm.roundeven",
-                "copysignf32" | "copysignf64" => "llvm.copysign",
-                "fmaf32" | "fmaf64" | "fmuladdf32" | "fmuladdf64" => "llvm.fma",
-                "minimumf32" | "minimumf64" => "llvm.minimum",
-                "maximumf32" | "maximumf64" => "llvm.maximum",
+                "sqrtf16" | "sqrtf32" | "sqrtf64" | "sqrtf128" => "llvm.sqrt",
+                "fabsf16" | "fabsf32" | "fabsf64" | "fabsf128" => "llvm.fabs",
+                "floorf16" | "floorf32" | "floorf64" | "floorf128" => "llvm.floor",
+                "ceilf16" | "ceilf32" | "ceilf64" | "ceilf128" => "llvm.ceil",
+                "truncf16" | "truncf32" | "truncf64" | "truncf128" => "llvm.trunc",
+                "round_ties_even_f16"
+                | "round_ties_even_f32"
+                | "round_ties_even_f64"
+                | "round_ties_even_f128" => "llvm.roundeven",
+                "copysignf16" | "copysignf32" | "copysignf64" | "copysignf128" => "llvm.copysign",
+                "fmaf16" | "fmaf32" | "fmaf64" | "fmaf128" | "fmuladdf16" | "fmuladdf32"
+                | "fmuladdf64" | "fmuladdf128" => "llvm.fma",
+                "minimumf16" | "minimumf32" | "minimumf64" | "minimumf128" => "llvm.minimum",
+                "maximumf16" | "maximumf32" | "maximumf64" | "maximumf128" => "llvm.maximum",
                 _ => return None,
             })
         };
         let libm = |s: &str| -> Option<&'static str> {
             Some(match s {
+                "roundf16" => "roundf16",
                 "roundf32" => "roundf",
                 "roundf64" => "round",
+                "roundf128" => "roundf128",
                 "sinf32" => "sinf",
                 "sinf64" => "sin",
                 "cosf32" => "cosf",
@@ -63,12 +117,20 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 "log10f64" => "log10",
                 "powf32" => "powf",
                 "powf64" => "pow",
-                "powif32" => "__powisf2",
+                // `powf128` is the glibc/IEEE name; not in compiler-builtins
+                // or libm.dylib, so it may not link on this target.
+                "powf128" => "powf128",
                 "powif64" => "__powidf2",
+                "powif128" => "__powitf2",
+                "powif32" => "__powisf2",
                 "minnumf32" => "fminf",
                 "minnumf64" => "fmin",
                 "maxnumf32" => "fmaxf",
                 "maxnumf64" => "fmax",
+                "minimum_number_nsz_f16" => "fminimum_numf16",
+                "minimum_number_nsz_f128" => "fminimum_numf128",
+                "maximum_number_nsz_f16" => "fmaximum_numf16",
+                "maximum_number_nsz_f128" => "fmaximum_numf128",
                 _ => return None,
             })
         };
@@ -84,6 +146,19 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         if let Some(i) = float(n) {
             let vs: Vec<_> = (0..args.len()).map(a).collect();
             return imm(self.intrinsic(i, ret, &vs));
+        }
+        if n == "powf16" || n == "powif16" {
+            // No f16 pow builtins; promote to f32 like LLVM's soft-f16 path.
+            let f32t = self.type_f32();
+            let vs: Vec<_> = (0..args.len())
+                .map(|i| {
+                    let v = a(i);
+                    if i == 0 { self.fpext(v, f32t) } else { v }
+                })
+                .collect();
+            let f = if n == "powf16" { "powf" } else { "__powisf2" };
+            let r = self.call_sym(f, f32t, &vs);
+            return imm(self.fptrunc(r, ret));
         }
         if let Some(f) = libm(n) {
             let vs: Vec<_> = (0..args.len()).map(a).collect();
@@ -111,7 +186,8 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 let i = match name {
                     sym::ctpop => "llvm.ctpop",
                     sym::ctlz | sym::ctlz_nonzero => "llvm.ctlz",
-                    _ => "llvm.cttz",
+                    sym::cttz => "llvm.cttz",
+                    _ => "llvm.cttz_nz",
                 };
                 let r = self.intrinsic(i, ty, &[x]);
                 self.intcast(r, ret, false)
@@ -183,16 +259,107 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 };
                 self.select(of, sat, r)
             }
-            sym::black_box => return IntrinsicResult::Operand(args[0].val),
+            // r[impl front.intrinsic.blackbox]
+            sym::black_box => {
+                let layout = args[0].layout;
+                // Opaque optimization barrier — LLVM's
+                // `asm("" : "r,~{memory}" :: v)`. Native targets emit a
+                // call to a never-defined `__pliron_bb*`/`__pliron_bbm`
+                // symbol (`call_bb`): the bodiless callee is opaque to
+                // every pliron pass — nowrite marks the caller writing
+                // (the `~{memory}` clobber), nocapture captures the args
+                // (a place's contents become unknown), retarg can't fold
+                // — and lower.rs rewrites the call into the CLIF
+                // `black_box` op, which emits zero machine instructions.
+                // wasm deliberately keeps the alloca + volatile round-trip
+                // below: it is what stock rustc emits there too (LLVM's
+                // wasm `black_box` is a stack store + reload — compare
+                // `k_fib` in both bench modules), and the CLIF op would
+                // lower to a bare identity in `clif_emit`, which V8 folds
+                // through — a cheaper, weaker barrier than LLVM's would
+                // skew every wasm benchmark in our favour.
+                //
+                // Measured and rejected (2026-10-27-slow-kernels.md): a
+                // narrow (i8/i16) scalar through the stack round trip on
+                // native too, LLVM's `*m` shape with a clean `ldrb`
+                // reload instead of a `uxtb` per barrier result. eqbug
+                // 0.1219 → 0.1254 ms: the store→load pair costs more
+                // than the extend it replaces.
+                // r[impl wasm.bb]
+                let clif_bb = !self.tcx.sess.target.is_like_wasm;
+                if layout.is_zst() {
+                    if clif_bb {
+                        let p = self.const_null(self.type_ptr());
+                        self.call_bb("__pliron_bbm", self.type_void(), &[p]);
+                    }
+                    return IntrinsicResult::Operand(OperandValue::ZeroSized);
+                }
+                match &args[0].val {
+                    &OperandValue::Ref(p) if clif_bb => {
+                        self.call_bb("__pliron_bbm", self.type_void(), &[p.llval]);
+                        return IntrinsicResult::Operand(OperandValue::Ref(p));
+                    }
+                    &OperandValue::Immediate(v) if clif_bb => {
+                        return IntrinsicResult::Operand(OperandValue::Immediate(bb_val(self, v)));
+                    }
+                    &OperandValue::Pair(a, b) if clif_bb => {
+                        let a = bb_val(self, a);
+                        let b = bb_val(self, b);
+                        return IntrinsicResult::Operand(OperandValue::Pair(a, b));
+                    }
+                    _ => {}
+                }
+                let src = PlaceRef::new_sized(self.alloca_with_ty(layout), layout);
+                args[0].val.store(self, src);
+                let v = if matches!(
+                    layout.backend_repr,
+                    BackendRepr::Scalar(_)
+                        | BackendRepr::ScalarPair { .. }
+                        | BackendRepr::SimdVector { .. }
+                ) {
+                    let prev = self.tail_op();
+                    let v = self.load_operand(src).val;
+                    self.mark_ops_volatile(prev);
+                    v
+                } else {
+                    // Aggregates load as a place ref, which has no ops to
+                    // mark volatile. A second volatile copy keeps the
+                    // returned ref opaque — reads through it see unknown
+                    // memory, not a forwardable store.
+                    let dst = PlaceRef::new_sized(self.alloca_with_ty(layout), layout);
+                    let sz = self.const_usize(layout.size.bytes());
+                    self.memcpy(
+                        dst.val.llval,
+                        dst.val.align,
+                        src.val.llval,
+                        src.val.align,
+                        sz,
+                        MemFlags::VOLATILE,
+                        None,
+                    );
+                    OperandValue::Ref(dst.val)
+                };
+                return IntrinsicResult::Operand(v);
+            }
             sym::volatile_load | sym::unaligned_volatile_load => {
                 let place = PlaceRef::new_sized(a(0), result_layout);
-                return IntrinsicResult::Operand(self.load_operand(place).val);
+                // `load_operand` goes through plain `load`: mark every op it
+                // emits so they keep volatile semantics (no `notrap`, never
+                // removable or reorderable by the memory passes).
+                let prev = self.tail_op();
+                let v = self.load_operand(place).val;
+                self.mark_ops_volatile(prev);
+                return IntrinsicResult::Operand(v);
             }
             sym::volatile_store | sym::unaligned_volatile_store => {
                 let dst = PlaceRef::new_sized(a(0), args[1].layout);
-                args[1].val.store(self, dst);
+                // `volatile_store` threads MemFlags::VOLATILE through every
+                // emitted store/copy; plain `.store` dropped the flag, so
+                // volatile writes got `notrap` at -O and were removable.
+                args[1].val.volatile_store(self, dst);
                 return IntrinsicResult::Operand(OperandValue::ZeroSized);
             }
+            // r[impl front.eh.catch-unwind]
             sym::catch_unwind => {
                 let (try_fn, data, catch_fn) = (a(0), a(1), a(2));
                 let ptr = self.type_ptr();
@@ -237,13 +404,44 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             sym::is_val_statically_known => self.const_bool(false),
             sym::compare_bytes => {
                 let i32t = self.type_i32();
-                self.call_sym("memcmp", i32t, &[a(0), a(1), a(2)])
+                let kn = crate::sroa::const_int(&self.pctx.borrow(), &self.st.borrow(), a(2));
+                match kn {
+                    // Small constant n: the common result is equality,
+                    // so scan inline and only call memcmp for ordering
+                    // when the ranges differ.
+                    Some(n) if (1..=32).contains(&n) => {
+                        let al = Align::from_bytes(4).unwrap();
+                        let slot = self.alloca(rustc_abi::Size::from_bytes(4), al);
+                        let done = self.append_sibling_block("cmpb_done");
+                        let slow = self.append_sibling_block("cmpb_slow");
+                        let join = self.append_sibling_block("cmpb_join");
+                        let (acc, acc_ty) = eq_bytes(self, a(0), a(1), n as u64);
+                        let z = self.const_int(acc_ty, 0);
+                        let eq = self.icmp(IntPredicate::IntEQ, acc, z);
+                        self.cond_br(eq, done, slow);
+                        self.switch_to_block(done);
+                        let z = self.const_i32(0);
+                        self.store(z, slot, al);
+                        self.br(join);
+                        self.switch_to_block(slow);
+                        let c = self.call_sym("memcmp", i32t, &[a(0), a(1), a(2)]);
+                        self.store(c, slot, al);
+                        self.br(join);
+                        self.switch_to_block(join);
+                        self.load(i32t, slot, al)
+                    }
+                    _ => self.call_sym("memcmp", i32t, &[a(0), a(1), a(2)]),
+                }
             }
             sym::raw_eq => {
                 let tp = instance.args.type_at(0);
                 let size = self.layout_of(tp).size.bytes();
                 if size == 0 {
                     self.const_bool(true)
+                } else if size <= 32 {
+                    let (acc, acc_ty) = eq_bytes(self, a(0), a(1), size);
+                    let z = self.const_int(acc_ty, 0);
+                    self.icmp(IntPredicate::IntEQ, acc, z)
                 } else {
                     let i32t = self.type_i32();
                     let n = self.const_usize(size);
@@ -276,6 +474,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         imm(r)
     }
 
+    // r[impl front.intrinsic.llvm]
     fn codegen_llvm_intrinsic_call(
         &mut self,
         instance: Instance<'tcx>,
@@ -308,7 +507,69 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         let v = self.type_void();
         self.intrinsic("llvm.trap", v, &[]);
     }
+    // r[impl front.intrinsic.hints]
     fn assume(&mut self, val: Value) {
+        // `assume(x != null)` right after `x` is computed (rustc's
+        // `assume_nonnull` when it builds a `NonNull` or a reference from a
+        // raw pointer): `x` is non-null. Only when `x`'s op, the compare and
+        // this call are adjacent, so every use of `x` is reached through the
+        // assumption. On since the split_whitespace niche fold needed the
+        // `slice::Iter::next` assume's fact (~20% there);
+        // `PLIRON_ASSUMENN=0` disables.
+        if crate::pass_enabled("PLIRON_ASSUMENN")
+            && let Some(vop) = val.defining_op()
+        {
+            // `assume(!x.is_null())` arrives as `assume(xor(icmp eq x,0),
+            // -1)`: peel the `not` so the compare lookup sees the `icmp`
+            // op itself.
+            let ctx = self.cx.pctx.borrow();
+            let mut cop = vop;
+            let mut peeled = false;
+            if pliron::operation::Operation::is_op::<XorOp>(vop, &ctx) {
+                let mut it = vop.deref(&ctx).operands(&ctx);
+                if let (Some(a), Some(b)) = (it.next(), it.next()) {
+                    let ones = |v: Value| {
+                        self.cx.const_to_opt_uint(v).is_some_and(|k| {
+                            k == u64::MAX || (k + 1).is_power_of_two()
+                        })
+                    };
+                    let src = if ones(b) {
+                        Some(a)
+                    } else if ones(a) {
+                        Some(b)
+                    } else {
+                        None
+                    };
+                    if let Some(io) = src.and_then(|s| s.defining_op())
+                        && io.get_next(&ctx) == Some(vop)
+                    {
+                        cop = io;
+                        peeled = true;
+                    }
+                }
+            }
+            let st = self.st.borrow();
+            let x = if peeled {
+                st.eq_null.get(cop).copied()
+            } else {
+                st.ne_null.get(cop).copied()
+            };
+            drop(st);
+            if let Some(x) = x
+                && let Some(xop) = x.defining_op()
+            {
+                let adjacent = cop.get_prev(&ctx) == Some(xop)
+                    && (if peeled {
+                        cop.get_next(&ctx) == Some(vop) && vop.get_next(&ctx).is_none()
+                    } else {
+                        cop.get_next(&ctx).is_none()
+                    });
+                if adjacent {
+                    self.st.borrow_mut().nonnull.insert(xop);
+                }
+
+            }
+        }
         // `assume(false)` marks the rest of the block unreachable (e.g. the
         // `unreachable_unchecked` UB-check path); `unreach` then drops the
         // branch into it.
@@ -325,6 +586,12 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     fn expect(&mut self, cond: Value, _expected: bool) -> Value {
         cond
     }
+    fn ctpop(&mut self, val: Value) -> Value {
+        let ty = self.val_ty(val);
+        let r = self.intrinsic("llvm.ctpop", ty, &[val]);
+        let i32t = self.type_i32();
+        self.intcast(r, i32t, false)
+    }
     fn type_checked_load(
         &mut self,
         _llvtable: Value,
@@ -333,21 +600,39 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
     ) -> Value {
         panic!("type_checked_load is not supported by the pliron backend")
     }
+    // r[impl front.abi.variadic]
     fn va_start(&mut self, val: Value) {
         // The variadic-argument buffer pointer, delivered by the lowering as the
-        // hidden extra parameter of a C-variadic function. The VaList place gets
-        // a real SysV `__va_list_tag`: gp/fp offsets exhausted so every va_arg
-        // (ours and a forwarded foreign callee's alike) walks `overflow_arg_area`,
-        // which points at the packed buffer.
+        // hidden extra parameter of a C-variadic function. The VaList place is
+        // initialized as the platform's `va_list` with every register area
+        // exhausted, so every va_arg (ours and a forwarded foreign callee's
+        // alike) walks the stack cursor, which points at the packed buffer.
         let buf = self.intrinsic("pliron.va.buf", self.type_ptr(), &[]);
-        if self.tcx.sess.target.is_like_wasm {
-            // wasm's va_list is a single opaque pointer: the place itself is
-            // the cursor into the packed buffer.
-            self.store(buf, val, Align::from_bytes(4).unwrap());
-            return;
-        }
         let i8t = self.type_i8();
         let i32t = self.type_i32();
+        match crate::builder::va_kind(self.tcx) {
+            crate::builder::VaKind::Ptr => {
+                // A single opaque pointer (wasm, Apple arm64, Windows, ...):
+                // the place itself is the cursor. Writing more overruns it.
+                let al = Align::from_bytes(self.tcx.data_layout.pointer_size().bytes()).unwrap();
+                self.store(buf, val, al);
+                return;
+            }
+            crate::builder::VaKind::Aapcs64 => {
+                // `{ __stack, __gr_top, __vr_top, __gr_offs, __vr_offs }`:
+                // offsets >= 0 send va_arg to `__stack`.
+                self.store(buf, val, Align::EIGHT);
+                let zero = self.const_int(i32t, 0);
+                let p24 = self.gep(i8t, val, &[self.const_usize(24)]);
+                self.store(zero, p24, Align::from_bytes(4).unwrap());
+                let p28 = self.gep(i8t, val, &[self.const_usize(28)]);
+                self.store(zero, p28, Align::from_bytes(4).unwrap());
+                return;
+            }
+            crate::builder::VaKind::SysV => {}
+        }
+        // SysV `__va_list_tag`: gp/fp offsets exhausted, the cursor is
+        // `overflow_arg_area` (+8).
         let gp = self.const_int(i32t, 48);
         self.store(gp, val, Align::from_bytes(4).unwrap());
         let p4 = self.gep(i8t, val, &[self.const_usize(4)]);
@@ -357,5 +642,29 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         self.store(buf, p8, Align::EIGHT);
         let p16 = self.gep(i8t, val, &[self.const_usize(16)]);
         self.store(buf, p16, Align::EIGHT);
+    }
+}
+
+/// `call_bb` round-trip for one scalar/vector value. `__pliron_bbv_<tag>`
+/// is declared `fn(T) -> T`; the per-type suffix keeps each signature's
+/// FuncOp decl distinct (`declare_fn_sym` dedups by name). `lower.rs`
+/// turns the call into the CLIF `black_box` op, so this is zero-cost.
+// r[impl front.intrinsic.blackbox.names]
+fn bb_val(b: &mut Builder<'_, '_>, v: Value) -> Value {
+    let ty = b.ty_of(v);
+    let sym = format!("__pliron_bbv_{}", bb_ty_tag(b, ty));
+    b.call_bb(&sym, ty, &[v])
+}
+
+fn bb_ty_tag(b: &Builder<'_, '_>, ty: TypeHandle) -> String {
+    match b.kind(ty) {
+        TyK::Int(w) => format!("i{w}"),
+        TyK::F16 => "f16".into(),
+        TyK::F32 => "f32".into(),
+        TyK::F64 => "f64".into(),
+        TyK::F128 => "f128".into(),
+        TyK::Ptr => "p".into(),
+        TyK::Vector(e, n) => format!("v{n}x{}", bb_ty_tag(b, e)),
+        _ => "o".into(),
     }
 }

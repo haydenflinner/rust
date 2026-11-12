@@ -14,7 +14,8 @@
 #![allow(clippy::all)]
 #![no_std]
 
-#[cfg(feature = "fuzzing")]
+// PLIRON: also under `std`, for the runtime `PLIRON_RA2_*` knobs.
+#[cfg(any(feature = "fuzzing", feature = "std"))]
 extern crate std;
 
 extern crate alloc;
@@ -25,6 +26,98 @@ macro_rules! trace {
     ($($tt:tt)*) => {
         if cfg!(feature = "trace-log") {
             ::log::trace!($($tt)*);
+        }
+    };
+}
+
+// PLIRON: `explain!` prints allocation decisions (splits, evictions,
+// minimal-bundle fallbacks) for the function being allocated on this
+// thread when `set_explain(true)` was called for it (Cranelift sets it
+// from `PLIRON_RA_EXPLAIN=<symbol substring>`).
+#[cfg(feature = "std")]
+std::thread_local! {
+    static EXPLAIN: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// PLIRON: turn allocation-decision logging on or off for this thread.
+pub fn set_explain(on: bool) {
+    #[cfg(feature = "std")]
+    EXPLAIN.with(|e| e.set(on));
+    #[cfg(not(feature = "std"))]
+    let _ = on;
+}
+
+/// PLIRON: is allocation-decision logging on for this thread?
+pub fn explain_on() -> bool {
+    #[cfg(feature = "std")]
+    return EXPLAIN.with(|e| e.get());
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+/// PLIRON: `PLIRON_RA2_FREQSPLIT=1` (opt-in): move a split to the
+/// cheapest block boundary before the conflict (see `process_bundle`).
+pub(crate) fn freqsplit_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_FREQSPLIT").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+/// PLIRON: `PLIRON_RA2_LOOPSPLIT=1` (opt-in): split a bundle at the
+/// boundaries of the loop around its conflict (see `process_bundle`).
+pub(crate) fn loopsplit_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_LOOPSPLIT").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+/// PLIRON: `PLIRON_RA2_NOPINMERGE` (default on, `=0` off): refuse
+/// blockparam merges that would spread a `FixedReg`/`FixedStack`
+/// requirement onto an unconstrained bundle whose ranges cross a fixed
+/// reservation (clobber) of that preg — the pin would force split+fill
+/// at every clobber where the unmerged edge move is cheaper (see
+/// `merge.rs`). Held-out A/B neutral (0.991 [0.967,1.035]) with a
+/// measured win on the motivating function (HqZopfli −14% `[sp]`
+/// accesses, ~6% faster).
+pub(crate) fn nopinmerge_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_NOPINMERGE").as_deref() != Ok("0"))
+    }
+    #[cfg(not(feature = "std"))]
+    true
+}
+
+/// PLIRON (`PLIRON_RA2_SLOTPAIR`, default on, `=0` off): repack
+/// spill-slot word indices so same-direction spill/reload edits
+/// emitted consecutively land on adjacent slots, letting ISA pair
+/// fusion (`ldp`/`stp` on AArch64) fire in vcode emission. Slot
+/// assignment otherwise follows allocation order, which almost never
+/// matches emission order.
+/// See `ion/spill.rs::slot_pair_layout`.
+pub(crate) fn slotpair_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_SLOTPAIR").as_deref() != Ok("0"))
+    }
+    #[cfg(not(feature = "std"))]
+    true
+}
+
+macro_rules! explain {
+    ($($tt:tt)*) => {
+        if $crate::explain_on() {
+            std::eprintln!("ra2x: {}", format_args!($($tt)*));
         }
     };
 }
@@ -1314,6 +1407,28 @@ pub trait Function {
         &[]
     }
 
+    /// PLIRON: whether `vreg`'s value can be recomputed at any reload for
+    /// the price of one instruction (a constant or symbol address); its
+    /// bundles get a lower spill weight, as LLVM's rematerializable
+    /// intervals do.
+    fn is_remat(&self, _vreg: usize) -> bool {
+        false
+    }
+
+    /// PLIRON: blockparams of this block are not merged with their inputs
+    /// (shrink-wrapping's live-range split at the save block).
+    fn no_param_merge(&self, _block: Block) -> bool {
+        false
+    }
+
+    /// PLIRON: this block's execution frequency relative to the entry
+    /// block, from the frontend's static branch probabilities, for spill
+    /// weights under `PLIRON_RA2_FREQ`; `None` keeps the loop-depth
+    /// estimate for the block.
+    fn block_hotness(&self, _block: Block) -> Option<f32> {
+        None
+    }
+
     // --------------
     // Spills/reloads
     // --------------
@@ -1581,6 +1696,11 @@ pub struct Output {
     /// Edits (insertions or removals). Guaranteed to be sorted by
     /// program point.
     pub edits: Vec<(ProgPoint, Edit)>,
+
+    /// PLIRON: for each entry of `edits`, the vreg its destination holds,
+    /// when the allocator knows it (moves the parallel-move resolver adds
+    /// through a scratch location have none). Empty from the fast allocator.
+    pub edit_vregs: Vec<Option<VReg>>,
 
     /// Allocations for each operand. Mapping from instruction to
     /// allocations provided by `inst_alloc_offsets` below.

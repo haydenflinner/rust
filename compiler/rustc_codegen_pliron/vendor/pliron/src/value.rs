@@ -20,11 +20,10 @@ use crate::{
     identifier::Identifier,
     linked_list::{ContainsLinkedList, LinkedList},
     location::{Located, Location},
-    operation::{DefUseVerifyErr, Operation},
+    operation::{DefUseVerifyErr, Operand, Operation},
     printable::Printable,
     result::Result,
     r#type::{TypeHandle, Typed},
-    utils::table::SmallSet,
     verify_err, verify_error,
 };
 use alloc::{format, vec::Vec};
@@ -39,54 +38,239 @@ pub(crate) trait DefUseParticipant: Copy + Hash + Eq {}
 impl DefUseParticipant for Value {}
 impl DefUseParticipant for Ptr<BasicBlock> {}
 
+/// PLIRON: sentinel for empty/terminated use-list links.
+pub(crate) const USE_NIL: u32 = u32::MAX;
+
+/// PLIRON: one node in a definition's intrusive use list. Nodes live in
+/// the Context-wide [`UseLinks`] arena and are referenced by index;
+/// `use_uid` encodes `(generation << 32) | slot_index` — the generation
+/// bumps on every slot reuse so a stale `Use` can never alias the new
+/// occupant.
+#[derive(Debug)]
+pub(crate) struct UseSlot {
+    /// The operation owning the operand/successor that is this use.
+    pub(crate) user_op: Ptr<Operation>,
+    /// Identity of this use, also stored in the operand. High 32 bits
+    /// are the slot generation, low 32 bits the slot index.
+    pub(crate) use_uid: u64,
+    /// Previous use slot of the same definition, or [`USE_NIL`].
+    pub(crate) prev: u32,
+    /// Next use slot of the same definition, or [`USE_NIL`].
+    pub(crate) next: u32,
+}
+
+/// PLIRON: Context-wide arena of [`UseSlot`]s plus a free list. All
+/// def-use links (value operands *and* block successors) share it, so a
+/// `use_uid` is unique across both namespaces.
+pub(crate) struct UseLinks {
+    /// All use slots ever allocated; freed slots form a free list via `next`.
+    pub(crate) arena: Vec<UseSlot>,
+    /// Head of the free list, or [`USE_NIL`].
+    pub(crate) free: u32,
+}
+
+impl UseLinks {
+    pub(crate) fn new() -> Self {
+        Self {
+            arena: Vec::new(),
+            free: USE_NIL,
+        }
+    }
+
+    /// Allocate a slot for `user_op`, returning its index.
+    /// Reused slots get a bumped generation in `use_uid`.
+    fn alloc(&mut self, user_op: Ptr<Operation>) -> u32 {
+        if self.free != USE_NIL {
+            let idx = self.free;
+            let slot = &mut self.arena[idx as usize];
+            self.free = slot.next;
+            let generation = (slot.use_uid >> 32) + 1;
+            slot.use_uid = (generation << 32) | idx as u64;
+            slot.user_op = user_op;
+            slot.prev = USE_NIL;
+            slot.next = USE_NIL;
+            idx
+        } else {
+            let idx = self.arena.len() as u32;
+            self.arena.push(UseSlot {
+                user_op,
+                use_uid: (1u64 << 32) | idx as u64,
+                prev: USE_NIL,
+                next: USE_NIL,
+            });
+            idx
+        }
+    }
+
+    /// Return a slot to the free list.
+    fn free_slot(&mut self, idx: u32) {
+        let slot = &mut self.arena[idx as usize];
+        slot.next = self.free;
+        slot.prev = USE_NIL;
+        self.free = idx;
+    }
+}
+
+/// PLIRON: iterator over a definition's uses, in use-list order
+/// (insertion order; removal splices the tail node into the freed
+/// position, matching the old `SmallSet`/`indexmap` `swap_remove`
+/// order bit-for-bit). Holds a shared borrow of [`Context::use_links`].
+pub(crate) struct UseIter<'a, T: DefUseParticipant> {
+    links: Ref<'a, UseLinks>,
+    cur: u32,
+    _d: PhantomData<T>,
+}
+
+impl<'a, T: DefUseParticipant> Iterator for UseIter<'a, T> {
+    type Item = Use<T>;
+
+    fn next(&mut self) -> Option<Use<T>> {
+        if self.cur == USE_NIL {
+            return None;
+        }
+        let slot = &self.links.arena[self.cur as usize];
+        let r#use = Use {
+            user_op: slot.user_op,
+            use_uid: slot.use_uid,
+            _dummy: PhantomData,
+        };
+        self.cur = slot.next;
+        Some(r#use)
+    }
+}
+
 /// A def node contains a list of its uses.
+/// PLIRON: intrusive doubly-linked list over the Context's [`UseLinks`]
+/// arena — `head`/`tail`/`count` only (12 bytes vs the old `SmallSet`'s
+/// inline-slot-plus-optional-boxed-IndexSet), with no hashing on
+/// insert/remove.
+#[derive(Debug)]
 pub(crate) struct DefNode<T: DefUseParticipant> {
-    /// The list of uses of this Def.
-    uses: SmallSet<Use<T>, 1>,
+    /// First use slot in [`UseLinks`], or [`USE_NIL`].
+    head: u32,
+    /// Last use slot in [`UseLinks`], or [`USE_NIL`].
+    tail: u32,
+    /// Number of uses.
+    count: u32,
+    _d: PhantomData<T>,
 }
 
 impl<T: DefUseParticipant> DefNode<T> {
     /// Create a new definition.
     pub(crate) fn new() -> DefNode<T> {
         DefNode {
-            uses: SmallSet::default(),
+            head: USE_NIL,
+            tail: USE_NIL,
+            count: 0,
+            _d: PhantomData,
         }
     }
 
     /// Does the definition have a use?
     pub(crate) fn is_used(&self) -> bool {
-        !self.uses.is_empty()
+        self.head != USE_NIL
     }
 
     /// How many uses does this definition have?
     pub(crate) fn num_uses(&self) -> usize {
-        self.uses.len()
+        self.count as usize
     }
 
-    /// Does this definition have a [Use] of `use` ?
-    pub(crate) fn has_use_of(&self, r#use: &Use<T>) -> bool {
-        self.uses.contains(r#use)
-    }
-
-    /// Get a reference to all [Use]es.
-    pub(crate) fn uses(&self) -> impl Iterator<Item = Use<T>> + '_ {
-        self.uses.iter().cloned()
-    }
-
-    /// This definition has a new use. Track it and return a corresponding [Use].
-    /// The returned [UseNode] is to be used in constructing an operand etc.
-    pub(crate) fn add_use(&mut self, self_descr: T, r#use: Use<T>) -> UseNode<T> {
-        if !self.uses.insert(r#use) {
-            panic!("Def: Attempt to insert an existing use");
+    /// Does this definition have a [Use] of `use` ? O(#uses) walk.
+    pub(crate) fn has_use_of(&self, ctx: &Context, r#use: &Use<T>) -> bool {
+        let links = ctx.use_links.borrow();
+        let mut cur = self.head;
+        while cur != USE_NIL {
+            let slot = &links.arena[cur as usize];
+            if slot.user_op == r#use.user_op && slot.use_uid == r#use.use_uid {
+                return true;
+            }
+            cur = slot.next;
         }
-        UseNode { def: self_descr }
+        false
+    }
+
+    /// Get an iterator over all [Use]es of this definition.
+    pub(crate) fn uses<'a>(&self, ctx: &'a Context) -> UseIter<'a, T> {
+        UseIter {
+            links: ctx.use_links.borrow(),
+            cur: self.head,
+            _d: PhantomData,
+        }
+    }
+
+    /// This definition has a new use by `user_op`. Track it and return
+    /// the corresponding [UseNode] and the use's uid, to be stored in
+    /// the operand.
+    /// PLIRON: takes the `use_links` arena mutably so callers creating
+    /// many operands hold one borrow instead of one per operand.
+    pub(crate) fn add_use(
+        &mut self,
+        links: &mut UseLinks,
+        self_descr: T,
+        user_op: Ptr<Operation>,
+    ) -> (UseNode<T>, u64) {
+        let idx = links.alloc(user_op);
+        let uid = links.arena[idx as usize].use_uid;
+        links.arena[idx as usize].prev = self.tail;
+        if self.tail != USE_NIL {
+            links.arena[self.tail as usize].next = idx;
+        } else {
+            self.head = idx;
+        }
+        self.tail = idx;
+        self.count += 1;
+        (UseNode { def: self_descr }, uid)
     }
 
     /// Remove `use` from the underlying definition.
-    pub(crate) fn remove_use(&mut self, r#use: Use<T>) {
-        if !self.uses.remove(&r#use) {
-            panic!("Def: Attempt to remove a use that doesn't exist");
+    /// The tail node takes the removed node's chain position, so
+    /// iteration order matches `indexmap`'s `swap_remove` semantics.
+    /// PLIRON: takes the `use_links` arena mutably — see `add_use`.
+    pub(crate) fn remove_use(&mut self, links: &mut UseLinks, r#use: &Use<T>) {
+        let x = (r#use.use_uid & 0xffff_ffff) as u32;
+        debug_assert!(
+            links.arena[x as usize].use_uid == r#use.use_uid
+                && links.arena[x as usize].user_op == r#use.user_op,
+            "Def: attempt to remove a use that doesn't exist"
+        );
+        let t = self.tail;
+        if x == t {
+            // Remove the tail.
+            let tp = links.arena[t as usize].prev;
+            self.tail = tp;
+            if tp == USE_NIL {
+                self.head = USE_NIL;
+            } else {
+                links.arena[tp as usize].next = USE_NIL;
+            }
+        } else if links.arena[x as usize].next == t {
+            // x directly precedes the tail: splicing x out leaves the
+            // tail in x's former position — the swap_remove result.
+            let xp = links.arena[x as usize].prev;
+            if xp == USE_NIL {
+                self.head = t;
+            } else {
+                links.arena[xp as usize].next = t;
+            }
+            links.arena[t as usize].prev = xp;
+        } else {
+            // Move the tail node into x's chain position.
+            let (xp, xn) = (links.arena[x as usize].prev, links.arena[x as usize].next);
+            let tp = links.arena[t as usize].prev;
+            links.arena[tp as usize].next = USE_NIL;
+            self.tail = tp;
+            links.arena[t as usize].prev = xp;
+            links.arena[t as usize].next = xn;
+            if xp == USE_NIL {
+                self.head = t;
+            } else {
+                links.arena[xp as usize].next = t;
+            }
+            links.arena[xn as usize].prev = t;
         }
+        self.count -= 1;
+        links.free_slot(x);
     }
 
     /// Replace the given use of the underlying definition `this` with `other`.
@@ -98,12 +282,19 @@ impl<T: DefUseParticipant> DefNode<T> {
             return;
         }
 
-        // Add r#use as a use of `other` and replace the [UseNode].
-        let new_use_node = other.get_defnode_mut(ctx).add_use(*other, *r#use);
-        *T::get_usenode_mut(r#use, ctx) = new_use_node;
+        // Add r#use as a use of `other` and repoint the operand (its
+        // [UseNode] and its use uid — the new list entry has a new uid).
+        let mut links = ctx.use_links.borrow_mut();
+        let (new_use_node, new_uid) =
+            other.get_defnode_mut(ctx).add_use(&mut links, *other, r#use.user_op);
+        {
+            let mut operand = T::get_operand_mut(r#use, ctx);
+            operand.r#use = new_use_node;
+            operand.use_uid = new_uid;
+        }
 
         // `this` will no longer have r#use as a use.
-        this.get_defnode_mut(ctx).uses.remove(r#use);
+        this.get_defnode_mut(ctx).remove_use(&mut links, r#use);
     }
 }
 
@@ -128,8 +319,13 @@ pub(crate) trait UseTrait: DefUseParticipant {
     }
     /// Get a reference to the [UseNode] described by this use.
     fn get_usenode_ref<'a>(r#use: &Use<Self>, ctx: &'a Context) -> Ref<'a, UseNode<Self>>;
-    /// Get a mutable reference to the [UseNode] described by this use.
-    fn get_usenode_mut<'a>(r#use: &Use<Self>, ctx: &'a Context) -> RefMut<'a, UseNode<Self>>;
+    /// Get a mutable reference to the [Operand] described by this use.
+    /// PLIRON: `replace_use_with` must rewrite both the operand's
+    /// [UseNode] and its `use_uid`, so it needs the whole [Operand].
+    fn get_operand_mut<'a>(
+        r#use: &Use<Self>,
+        ctx: &'a Context,
+    ) -> RefMut<'a, Operand<Self>>;
 }
 
 /// Interface for [DefNode] wrappers.
@@ -156,6 +352,16 @@ pub struct Value {
     pub(crate) defining_entity: DefiningEntity,
 }
 
+impl Value {
+    /// PLIRON: whether this value's defining op or block still exists.
+    pub fn is_live(&self, ctx: &Context) -> bool {
+        match self.defining_entity {
+            DefiningEntity::Op(p) => p.is_live(ctx),
+            DefiningEntity::Block(p) => p.is_live(ctx),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ValueError {
     #[error("Invalid Value: Defining operation has no result corresponding to this value")]
@@ -166,6 +372,15 @@ pub enum ValueError {
 
 impl Value {
     /// Get the defining entity
+    /// PLIRON: dense per-Context value ordinal — `get_new_value_uid`
+    /// hands out a monotonically increasing uid, so it indexes the
+    /// columnar side tables (`pliron_ir_opt::state::ColMap`/`ColSet`).
+    /// Never reused: a deleted value's uid stays vacated.
+    #[inline]
+    pub fn uid(&self) -> u64 {
+        self.val_uid
+    }
+
     pub fn defining_entity(&self) -> DefiningEntity {
         self.defining_entity
     }
@@ -192,7 +407,7 @@ impl Value {
         match self.defining_entity {
             DefiningEntity::Op(op) => {
                 let op = op.deref(ctx);
-                op.results
+                op.results_slice(ctx)
                     .iter()
                     .position(|res| res.val_uid == self.val_uid)
                     .ok_or_else(|| arg_error!(op.loc(), ValueError::NotInOpResult))
@@ -200,7 +415,7 @@ impl Value {
             DefiningEntity::Block(block) => {
                 let block = block.deref(ctx);
                 block
-                    .args
+                    .args_slice(ctx)
                     .iter()
                     .position(|arg| arg.val_uid == self.val_uid)
                     .ok_or_else(|| arg_error!(block.loc(), ValueError::NotInBlockArgument))
@@ -222,7 +437,23 @@ impl Value {
 
     /// Get all uses of this value.
     pub fn uses(&self, ctx: &Context) -> Vec<Use<Value>> {
-        self.get_defnode_ref(ctx).uses().collect()
+        self.get_defnode_ref(ctx).uses(ctx).collect()
+    }
+
+    /// PLIRON: lazy use iteration — [Value::uses] collects a `Vec` per
+    /// call; this walks the use list with no allocation. Prefer for
+    /// `.all()`/`.any()` queries and read-only loops. The use list must
+    /// not be mutated while iterating.
+    pub fn uses_iter<'a>(&self, ctx: &'a Context) -> impl Iterator<Item = Use<Value>> + 'a {
+        self.get_defnode_ref(ctx).uses(ctx)
+    }
+
+    /// PLIRON: [`Value::uses`] into a caller-owned buffer so per-node
+    /// queries in a worklist walk share one allocation. The copy is still
+    /// required — the defnode sits behind a RefCell.
+    pub fn uses_into(&self, ctx: &Context, out: &mut Vec<Use<Value>>) {
+        out.clear();
+        out.extend(self.get_defnode_ref(ctx).uses(ctx));
     }
 
     /// Does this definition have any [Use]?
@@ -240,10 +471,8 @@ impl Value {
         // We collect because we don't want to keep the defnode locked up.
         let touched_uses: Vec<_> = self
             .get_defnode_ref(ctx)
-            .uses
-            .iter()
+            .uses(ctx)
             .filter(|r#use| predicate(ctx, r#use))
-            .cloned()
             .collect();
         for r#use in &touched_uses {
             DefNode::replace_use_with(ctx, self, r#use, other);
@@ -253,6 +482,13 @@ impl Value {
     /// Replace all uses of the underlying definition with `other`.
     pub fn replace_all_uses_with(&self, ctx: &Context, other: &Value) {
         self.replace_some_uses_with(ctx, |_, _| true, other);
+        // PLIRON: the debug-info notes follow the value (`Context::dbg_notes`).
+        let mut notes = ctx.dbg_notes.borrow_mut();
+        if !notes.is_empty() && self != other {
+            if let Some(n) = notes.remove(self) {
+                notes.entry(*other).or_default().extend(n);
+            }
+        }
     }
 
     /// Replace the given use of `this` [Value] with `other`.
@@ -272,8 +508,10 @@ impl Value {
     pub fn set_type(&self, ctx: &Context, ty: TypeHandle) {
         let index = self.find_index(ctx);
         match self.defining_entity {
-            DefiningEntity::Op(op) => op.deref_mut(ctx).results[index].set_type(ty),
-            DefiningEntity::Block(block) => block.deref_mut(ctx).args[index].set_type(ty),
+            DefiningEntity::Op(op) => op.deref(ctx).results_slice_mut(ctx)[index].set_type(ty),
+            DefiningEntity::Block(block) => {
+                block.deref(ctx).args_slice_mut(ctx)[index].set_type(ty)
+            }
         }
     }
 
@@ -301,10 +539,10 @@ impl Value {
 impl Verify for Value {
     // Check that the value's uses point back to it,
     fn verify(&self, ctx: &Context) -> Result<()> {
-        for r#use in self.uses(ctx) {
+        for r#use in self.uses_iter(ctx) {
             let opd_idx = <Self as UseTrait>::try_find_index(&r#use, ctx)
                 .map_err(|_| verify_error!(self.loc(ctx), DefUseVerifyErr::OperandNotUseOfDef))?;
-            let use_operand = r#use.user_op.deref(ctx).get_operand(opd_idx);
+            let use_operand = r#use.user_op.deref(ctx).get_operand(ctx, opd_idx);
             if use_operand != *self {
                 verify_err!(self.loc(ctx), DefUseVerifyErr::OperandNotUseOfDef)?;
             }
@@ -317,8 +555,10 @@ impl Typed for Value {
     fn get_type(&self, ctx: &Context) -> TypeHandle {
         let index = self.find_index(ctx);
         match self.defining_entity {
-            DefiningEntity::Op(op) => op.deref(ctx).results[index].get_type(),
-            DefiningEntity::Block(block) => block.deref(ctx).args[index].get_type(),
+            DefiningEntity::Op(op) => op.deref(ctx).results_slice(ctx)[index].get_type(),
+            DefiningEntity::Block(block) => {
+                block.deref(ctx).args_slice(ctx)[index].get_type()
+            }
         }
     }
 }
@@ -353,12 +593,14 @@ impl DefTrait for Value {
         let index = self.find_index(ctx);
         match self.defining_entity {
             DefiningEntity::Op(op) => {
-                let op = op.deref(ctx);
-                Ref::map(op, |opref| &opref.results[index].def)
+                let span = op.deref(ctx).results;
+                let pool = ctx.op_result_pool.borrow();
+                Ref::map(pool, |p| &p[span.range()][index].def)
             }
             DefiningEntity::Block(block) => {
-                let block = block.deref(ctx);
-                Ref::map(block, |blockref| &blockref.args[index].def)
+                let span = block.deref(ctx).args;
+                let pool = ctx.block_arg_pool.borrow();
+                Ref::map(pool, |p| &p[span.range()][index].def)
             }
         }
     }
@@ -367,12 +609,14 @@ impl DefTrait for Value {
         let index = self.find_index(ctx);
         match self.defining_entity {
             DefiningEntity::Op(op) => {
-                let op = op.deref_mut(ctx);
-                RefMut::map(op, |opref| &mut opref.results[index].def)
+                let span = op.deref(ctx).results;
+                let pool = ctx.op_result_pool.borrow_mut();
+                RefMut::map(pool, |p| &mut p[span.range()][index].def)
             }
             DefiningEntity::Block(block) => {
-                let block = block.deref_mut(ctx);
-                RefMut::map(block, |blockref| &mut blockref.args[index].def)
+                let span = block.deref(ctx).args;
+                let pool = ctx.block_arg_pool.borrow_mut();
+                RefMut::map(pool, |p| &mut p[span.range()][index].def)
             }
         }
     }
@@ -381,20 +625,25 @@ impl DefTrait for Value {
 impl UseTrait for Value {
     fn try_find_index(r#use: &Use<Self>, ctx: &Context) -> Result<usize> {
         let op = r#use.user_op.deref(ctx);
-        op.operands
+        op.operands_slice(ctx)
             .iter()
             .position(|operand| operand.use_uid == r#use.use_uid)
             .ok_or_else(|| arg_error!(op.loc(), UseError::OperandNotInUserOp))
     }
     fn get_usenode_ref<'a>(r#use: &Use<Self>, ctx: &'a Context) -> Ref<'a, UseNode<Self>> {
         let index = <Self as UseTrait>::find(r#use, ctx);
-        let op = r#use.user_op.deref(ctx);
-        Ref::map(op, |opref| &opref.operands[index].r#use)
+        let span = r#use.user_op.deref(ctx).operands;
+        let pool = ctx.op_operand_pool.borrow();
+        Ref::map(pool, |p| &p[span.range()][index].r#use)
     }
-    fn get_usenode_mut<'a>(r#use: &Use<Self>, ctx: &'a Context) -> RefMut<'a, UseNode<Value>> {
+    fn get_operand_mut<'a>(
+        r#use: &Use<Self>,
+        ctx: &'a Context,
+    ) -> RefMut<'a, Operand<Value>> {
         let index = <Self as UseTrait>::find(r#use, ctx);
-        let op = r#use.user_op.deref_mut(ctx);
-        RefMut::map(op, |opref| &mut opref.operands[index].r#use)
+        let span = r#use.user_op.deref(ctx).operands;
+        let pool = ctx.op_operand_pool.borrow_mut();
+        RefMut::map(pool, |p| &mut p[span.range()][index])
     }
 }
 
@@ -409,7 +658,7 @@ impl Ptr<BasicBlock> {
     pub fn is_pred(&self, ctx: &Context, pred: Ptr<BasicBlock>) -> bool {
         self.deref(ctx)
             .preds
-            .uses()
+            .uses(ctx)
             .any(|r#use| r#use.user_op.deref(ctx).get_parent_block() == Some(pred))
     }
 
@@ -426,7 +675,7 @@ impl Ptr<BasicBlock> {
     pub fn get_pred(&self, ctx: &Context, i: usize) -> Ptr<BasicBlock> {
         self.deref(ctx)
             .preds
-            .uses()
+            .uses(ctx)
             .nth(i)
             .expect("Predecessor index out of bounds")
             .user_op
@@ -441,7 +690,7 @@ impl Ptr<BasicBlock> {
     pub fn preds(&self, ctx: &Context) -> Vec<Ptr<BasicBlock>> {
         self.deref(ctx)
             .preds
-            .uses()
+            .uses(ctx)
             .map(|r#use| {
                 r#use
                     .user_op
@@ -454,7 +703,15 @@ impl Ptr<BasicBlock> {
 
     /// Get uses (as successor operands in an Operation) of this block.
     pub fn uses(&self, ctx: &Context) -> Vec<Use<Ptr<BasicBlock>>> {
-        self.deref(ctx).preds.uses().collect()
+        self.deref(ctx).preds.uses(ctx).collect()
+    }
+
+    /// PLIRON: lazy use iteration — see [`Value::uses_iter`].
+    pub fn uses_iter<'a>(
+        &self,
+        ctx: &'a Context,
+    ) -> impl Iterator<Item = Use<Ptr<BasicBlock>>> + 'a {
+        self.deref(ctx).preds.uses(ctx)
     }
 
     /// Checks whether self is a successor of `pred`.
@@ -465,7 +722,12 @@ impl Ptr<BasicBlock> {
         // object to directly check membership.
         pred.deref(ctx)
             .get_tail()
-            .is_some_and(|pred_term| pred_term.deref(ctx).successors().any(|succ| self == &succ))
+            .is_some_and(|pred_term| {
+                pred_term
+                    .deref(ctx)
+                    .successors(ctx)
+                    .any(|succ| self == &succ)
+            })
     }
     /// Retarget predecessors (that satisfy pred) to `other`.
     pub fn retarget_some_preds_to<P: Fn(&Context, Ptr<BasicBlock>) -> bool>(
@@ -486,10 +748,8 @@ impl Ptr<BasicBlock> {
         // We collect because we don't want to keep the defnode locked up.
         let touched_uses: Vec<_> = self
             .get_defnode_ref(ctx)
-            .uses
-            .iter()
+            .uses(ctx)
             .filter(|r#use| predicate(ctx, r#use))
-            .cloned()
             .collect();
 
         for r#use in &touched_uses {
@@ -537,23 +797,25 @@ impl DefTrait for Ptr<BasicBlock> {
 impl UseTrait for Ptr<BasicBlock> {
     fn try_find_index(r#use: &Use<Self>, ctx: &Context) -> Result<usize> {
         let op = r#use.user_op.deref(ctx);
-        op.successors
+        op.successors_slice(ctx)
             .iter()
             .position(|succ| succ.use_uid == r#use.use_uid)
             .ok_or_else(|| arg_error!(op.loc(), UseError::SuccessorNotInUserOp))
     }
     fn get_usenode_ref<'a>(r#use: &Use<Self>, ctx: &'a Context) -> Ref<'a, UseNode<Self>> {
         let succ_idx = <Self as UseTrait>::find(r#use, ctx);
-        let op = r#use.user_op.deref(ctx);
-        Ref::map(op, |opref| &opref.successors[succ_idx].r#use)
+        let span = r#use.user_op.deref(ctx).successors;
+        let pool = ctx.op_successor_pool.borrow();
+        Ref::map(pool, |p| &p[span.range()][succ_idx].r#use)
     }
-    fn get_usenode_mut<'a>(
+    fn get_operand_mut<'a>(
         r#use: &Use<Ptr<BasicBlock>>,
         ctx: &'a Context,
-    ) -> RefMut<'a, UseNode<Ptr<BasicBlock>>> {
+    ) -> RefMut<'a, Operand<Ptr<BasicBlock>>> {
         let succ_idx = <Self as UseTrait>::find(r#use, ctx);
-        let op = r#use.user_op.deref_mut(ctx);
-        RefMut::map(op, |opref| &mut opref.successors[succ_idx].r#use)
+        let span = r#use.user_op.deref(ctx).successors;
+        let pool = ctx.op_successor_pool.borrow_mut();
+        RefMut::map(pool, |p| &mut p[span.range()][succ_idx])
     }
 }
 

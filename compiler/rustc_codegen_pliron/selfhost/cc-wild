@@ -18,4 +18,38 @@ for a in "$@"; do
     esac
     args+=("$a")
 done
+# PGO instrumentation links every binary against the pliron-prof runtime
+# (the .init_array ctor registers its counters) when the backend's
+# PLIRON_PGO flag is live. The staticlib bundles core/compiler_builtins
+# members whose __rustc shim symbols would collide with the link's own
+# std, so thin it to the runtime object alone (its only undefineds are
+# libc) with the unused panic-handler shim stripped.
+RS="$(cd "$(dirname "$0")/.." && pwd)/tools/pliron-prof-rt/target/release/libpliron_prof_rt.a"
+R="$(dirname "$0")/libpliron_prof_rt.a"
+if [ -n "${PLIRON_PGO:-}" ] && [ -f "$RS" ]; then
+    if [ ! -f "$R" ] || [ "$RS" -nt "$R" ]; then
+        T=$(mktemp -d) && (
+            cd "$T" || exit 1
+            ar x "$RS" &&
+            for o in pliron_prof_rt-*.o; do
+                # hide the rt's panic shim so it can't collide with the
+                # link's own std (`-N` can't drop a reloc-referenced sym)
+                for s in $(nm -g --defined-only "$o" | awk '{print $3}' |
+                    grep -E 'rust_begin_unwind|rust_eh_personality'); do
+                    objcopy --redefine-sym "$s=__pliron_rt_shim_$s" "$o"
+                done
+            done &&
+            ar rcs "$R.tmp" pliron_prof_rt-*.o &&
+            mv "$R.tmp" "$R"
+        ) && rm -rf "$T"
+    fi
+    [ -f "$R" ] && args+=("$R")
+fi
+# Cranelift x86 libcalls (__cranelift_x86_pshufb) — build once, always link.
+S="$(dirname "$0")/clif_stubs.c"
+A="$(dirname "$0")/libclif_stubs.a"
+if [ ! -f "$A" ] && [ -f "$S" ]; then
+    cc -O2 -c "$S" -o "$A.tmp.o" && ar rcs "$A.tmp" "$A.tmp.o" && mv "$A.tmp" "$A" && rm -f "$A.tmp.o"
+fi
+[ -f "$A" ] && args+=("$A")
 exec cc -B"$D" "${args[@]}"

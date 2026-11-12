@@ -1848,6 +1848,7 @@ impl Step for PlironCodegenBackend {
             Kind::Build,
         );
         cargo.arg("--manifest-path").arg(builder.src.join("compiler/rustc_codegen_pliron/Cargo.toml"));
+        cargo.arg("-p").arg("rustc_codegen_pliron");
         let _guard =
             builder.msg(Kind::Build, "codegen backend pliron", Mode::Codegen, build_compiler, target);
         let files = run_cargo(builder, cargo, vec![], &stamp, vec![], ArtifactKeepMode::OnlyDylib);

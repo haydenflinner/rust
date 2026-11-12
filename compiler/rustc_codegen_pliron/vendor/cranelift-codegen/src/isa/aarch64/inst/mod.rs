@@ -35,7 +35,8 @@ mod emit_tests;
 
 pub use crate::isa::aarch64::lower::isle::generated_code::{
     ALUOp, ALUOp3, AMode, APIKey, AtomicRMWLoopOp, AtomicRMWOp, BitOp, BranchTargetType, FPUOp1,
-    FPUOp2, FPUOp3, FpuRoundMode, FpuToIntOp, IntToFpuOp, MInst as Inst, MoveWideOp, VecALUModOp,
+    FPUOp2, FPUOp3, FpuRoundMode, FpuToIntOp, IntToFpuOp, LoadPostOp, MInst as Inst, MoveWideOp,
+    StorePostOp, VecALUModOp,
     VecALUOp, VecExtendOp, VecLanesOp, VecMisc2, VecPairOp, VecRRLongOp, VecRRNarrowOp,
     VecRRPairLongOp, VecRRRLongModOp, VecRRRLongOp, VecShiftImmModOp, VecShiftImmOp,
 };
@@ -313,6 +314,26 @@ impl Inst {
             Inst::FpuStore32 { .. } => Some(F32),
             Inst::FpuStore64 { .. } => Some(F64),
             Inst::FpuStore128 { .. } => Some(I8X16),
+            Inst::LoadPost { op, .. } => Some(match op {
+                LoadPostOp::ULoad8 | LoadPostOp::SLoad8 => I8,
+                LoadPostOp::ULoad16 | LoadPostOp::SLoad16 => I16,
+                LoadPostOp::ULoad32 | LoadPostOp::SLoad32 => I32,
+                LoadPostOp::ULoad64 => I64,
+                LoadPostOp::FpuLoad16 => F16,
+                LoadPostOp::FpuLoad32 => F32,
+                LoadPostOp::FpuLoad64 => F64,
+                LoadPostOp::FpuLoad128 => I8X16,
+            }),
+            Inst::StorePost { op, .. } => Some(match op {
+                StorePostOp::Store8 => I8,
+                StorePostOp::Store16 => I16,
+                StorePostOp::Store32 => I32,
+                StorePostOp::Store64 => I64,
+                StorePostOp::FpuStore16 => F16,
+                StorePostOp::FpuStore32 => F32,
+                StorePostOp::FpuStore64 => F64,
+                StorePostOp::FpuStore128 => I8X16,
+            }),
             _ => None,
         }
     }
@@ -340,6 +361,11 @@ fn memarg_operands(memarg: &mut AMode, collector: &mut impl OperandVisitor) {
         AMode::RegOffset { rn, .. } => {
             collector.reg_use(rn);
         }
+        // Created post-allocation: the writeback def is implied to be
+        // `rn` itself, so only the use is declared.
+        AMode::PostIndex { rn, .. } => {
+            collector.reg_use(rn);
+        }
         AMode::Const { .. } => {}
     }
 }
@@ -347,6 +373,9 @@ fn memarg_operands(memarg: &mut AMode, collector: &mut impl OperandVisitor) {
 fn pairmemarg_operands(pairmemarg: &mut PairAMode, collector: &mut impl OperandVisitor) {
     match pairmemarg {
         PairAMode::SignedOffset { reg, .. } => {
+            collector.reg_use(reg);
+        }
+        PairAMode::PostIndex { reg, .. } => {
             collector.reg_use(reg);
         }
         PairAMode::SPPreIndexed { .. } | PairAMode::SPPostIndexed { .. } => {}
@@ -409,6 +438,20 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_use(rd);
             memarg_operands(mem, collector);
         }
+        Inst::LoadPost {
+            rd, rwb, rn, ..
+        } => {
+            collector.reg_def(rd);
+            collector.reg_use(rn);
+            collector.reg_reuse_def(rwb, 1); // `rwb` == `rn` (operand 1).
+        }
+        Inst::StorePost {
+            rt, rwb, rn, ..
+        } => {
+            collector.reg_use(rt);
+            collector.reg_use(rn);
+            collector.reg_reuse_def(rwb, 1); // `rwb` == `rn` (operand 1).
+        }
         Inst::StoreP64 { rt, rt2, mem, .. } => {
             collector.reg_use(rt);
             collector.reg_use(rt2);
@@ -437,6 +480,15 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_use(rn);
             collector.reg_reuse_def(rd, 0); // `rn` == `rd`.
         }
+        Inst::UBfm { rd, rn, .. } => {
+            collector.reg_use(rn);
+            collector.reg_def(rd);
+        }
+        Inst::Bfm { rd, rn, rd_in, .. } => {
+            collector.reg_use(rn);
+            collector.reg_use(rd_in);
+            collector.reg_reuse_def(rd, 1); // `rd_in` == `rd`.
+        }
         Inst::MovWide { rd, .. } => {
             collector.reg_def(rd);
         }
@@ -446,6 +498,12 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_use(rm);
         }
         Inst::CSNeg { rd, rn, rm, .. } => {
+            collector.reg_def(rd);
+            collector.reg_use(rn);
+            collector.reg_use(rm);
+        }
+        // PLIRON:
+        Inst::CSInc { rd, rn, rm, .. } => {
             collector.reg_def(rd);
             collector.reg_use(rn);
             collector.reg_use(rm);
@@ -1006,6 +1064,38 @@ impl MachInst for Inst {
         }
     }
 
+    fn trap_code(&self) -> Option<crate::ir::TrapCode> {
+        match self {
+            Inst::Udf { trap_code } => Some(*trap_code),
+            _ => None,
+        }
+    }
+
+    fn noreturn_continuation(&self) -> Option<MachLabel> {
+        let tci = match self {
+            Inst::Call { info, .. } => info.try_call_info.as_ref(),
+            Inst::CallInd { info, .. } => info.try_call_info.as_ref(),
+            _ => None,
+        }?;
+        (tci.continuation_trap == Some(crate::ir::TrapCode::NORETURN_CALL))
+            .then_some(tci.continuation)
+    }
+
+    fn elide_noreturn_continuation(&mut self) -> bool {
+        let tci = match self {
+            Inst::Call { info, .. } => info.try_call_info.as_mut(),
+            Inst::CallInd { info, .. } => info.try_call_info.as_mut(),
+            _ => None,
+        };
+        match tci {
+            Some(t) if t.continuation_trap == Some(crate::ir::TrapCode::NORETURN_CALL) => {
+                t.continuation_elide = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn call_type(&self) -> CallType {
         match self {
             Inst::Call { .. }
@@ -1016,6 +1106,40 @@ impl MachInst for Inst {
             Inst::ReturnCall { .. } | Inst::ReturnCallInd { .. } => CallType::TailCall,
 
             _ => CallType::None,
+        }
+    }
+
+    fn cond_br_targets(&self) -> Option<(MachLabel, MachLabel)> {
+        match self {
+            Inst::CondBr {
+                taken, not_taken, ..
+            } => Some((taken.as_label()?, not_taken.as_label()?)),
+            _ => None,
+        }
+    }
+
+    fn set_cond_br_taken(&mut self, l: MachLabel) {
+        if let Inst::CondBr { taken, .. } = self {
+            *taken = BranchTarget::Label(l);
+        }
+    }
+
+    fn invert_cond_br(&mut self) {
+        if let Inst::CondBr {
+            taken,
+            not_taken,
+            kind,
+        } = self
+        {
+            *kind = kind.invert();
+            core::mem::swap(taken, not_taken);
+        }
+    }
+
+    fn uncond_br_target(&self) -> Option<MachLabel> {
+        match self {
+            Inst::Jump { dest } => dest.as_label(),
+            _ => None,
         }
     }
 
@@ -1058,7 +1182,9 @@ impl MachInst for Inst {
             | &Inst::FpuStore16 { .. }
             | &Inst::FpuStore32 { .. }
             | &Inst::FpuStore64 { .. }
-            | &Inst::FpuStore128 { .. } => true,
+            | &Inst::FpuStore128 { .. }
+            | &Inst::LoadPost { .. }
+            | &Inst::StorePost { .. } => true,
             // TODO: verify this carefully
             _ => false,
         }
@@ -1155,6 +1281,87 @@ impl MachInst for Inst {
         }
     }
 
+    fn fixed_inst_size() -> Option<CodeOffset> {
+        Some(4)
+    }
+
+    fn rematerialize(&self, dst: Writable<Reg>) -> Option<Inst> {
+        match self {
+            Inst::MovWide { op, imm, size, .. } => Some(Inst::MovWide { op: *op, rd: dst, imm: *imm, size: *size }),
+            Inst::LoadExtNameNear { name, offset, .. } => {
+                Some(Inst::LoadExtNameNear { rd: dst, name: name.clone(), offset: *offset })
+            }
+            Inst::LoadExtNameGot { name, .. } => Some(Inst::LoadExtNameGot { rd: dst, name: name.clone() }),
+            // Vector and FP immediates (`movi`/`mvni`/`fmov #imm`): the
+            // escape-scan splats serde_json and memchr spill across calls
+            // (every q register is caller-saved).
+            Inst::VecDupImm { imm, invert, size, .. } => {
+                Some(Inst::VecDupImm { rd: dst, imm: *imm, invert: *invert, size: *size })
+            }
+            Inst::VecDupFPImm { imm, size, .. } => Some(Inst::VecDupFPImm { rd: dst, imm: *imm, size: *size }),
+            Inst::FpuMoveFPImm { imm, size, .. } => Some(Inst::FpuMoveFPImm { rd: dst, imm: *imm, size: *size }),
+            // A bitmask immediate: `orr rd, xzr, #imm`.
+            Inst::AluRRImmLogic { alu_op: ALUOp::Orr, size, rn, imml, .. } if *rn == zero_reg() => {
+                Some(Inst::AluRRImmLogic { alu_op: ALUOp::Orr, size: *size, rd: dst, rn: *rn, imml: *imml })
+            }
+            _ => None,
+        }
+    }
+
+    fn pliron_frame_free(&self) -> bool {
+        let ok = |r: &Reg| *r != stack_reg() && *r != fp_reg() && *r != link_reg();
+        let am = |m: &AMode| match m {
+            AMode::RegReg { rn, .. }
+            | AMode::RegScaled { rn, .. }
+            | AMode::RegScaledExtended { rn, .. }
+            | AMode::RegExtended { rn, .. }
+            | AMode::Unscaled { rn, .. }
+            | AMode::UnsignedOffset { rn, .. } => ok(rn),
+            _ => false,
+        };
+        match self {
+            Inst::Nop0 | Inst::Nop4 | Inst::Jump { .. } | Inst::CondBr { .. } | Inst::TestBitAndBranch { .. } => true,
+            Inst::TrapIf { .. } | Inst::Udf { .. } | Inst::Csdb | Inst::JTSequence { .. } => true,
+            // Pseudo-instructions with no code of their own (argument
+            // definitions are fixed-register operands, checked by the
+            // allocation scan).
+            Inst::Args { .. } | Inst::DummyUse { .. } | Inst::SequencePoint { .. } => true,
+            Inst::AluRRR { rn, rm, .. } | Inst::AluRRRShift { rn, rm, .. } | Inst::AluRRRExtend { rn, rm, .. } => {
+                ok(rn) && ok(rm)
+            }
+            Inst::AluRRRR { rn, rm, ra, .. } => ok(rn) && ok(rm) && ok(ra),
+            Inst::AluRRImm12 { rn, .. } | Inst::AluRRImmLogic { rn, .. } | Inst::AluRRImmShift { rn, .. } => ok(rn),
+            Inst::BitRR { rn, .. } | Inst::Extend { rn, .. } | Inst::UBfm { rn, .. } => ok(rn),
+            Inst::Bfm { rn, rd_in, .. } => ok(rn) && ok(rd_in),
+            Inst::Mov { rm, .. } => ok(rm),
+            Inst::MovWide { .. } | Inst::MovK { .. } | Inst::CSet { .. } | Inst::CSetm { .. } => true,
+            Inst::CSel { rn, rm, .. } | Inst::CSNeg { rn, rm, .. } | Inst::CSInc { rn, rm, .. } => ok(rn) && ok(rm),
+            Inst::CCmp { rn, rm, .. } => ok(rn) && ok(rm),
+            Inst::CCmpImm { rn, .. } => ok(rn),
+            Inst::LoadExtNameGot { .. } | Inst::LoadExtNameNear { .. } => true,
+            Inst::VecDupImm { .. } | Inst::VecDupFPImm { .. } | Inst::FpuMoveFPImm { .. } => true,
+            Inst::ULoad8 { mem, .. }
+            | Inst::SLoad8 { mem, .. }
+            | Inst::ULoad16 { mem, .. }
+            | Inst::SLoad16 { mem, .. }
+            | Inst::ULoad32 { mem, .. }
+            | Inst::SLoad32 { mem, .. }
+            | Inst::ULoad64 { mem, .. }
+            | Inst::Store8 { mem, .. }
+            | Inst::Store16 { mem, .. }
+            | Inst::Store32 { mem, .. }
+            | Inst::Store64 { mem, .. }
+            | Inst::FpuLoad64 { mem, .. }
+            | Inst::FpuStore64 { mem, .. }
+            | Inst::FpuLoad128 { mem, .. }
+            | Inst::FpuStore128 { mem, .. } => am(mem),
+            Inst::LoadP64 { mem, .. } | Inst::StoreP64 { mem, .. } => {
+                matches!(mem, PairAMode::SignedOffset { reg, .. } if ok(reg))
+            }
+            _ => false,
+        }
+    }
+
     fn worst_case_size() -> CodeOffset {
         // The maximum size, in bytes, of any `Inst`'s emitted code. We have at least one case of
         // an 8-instruction sequence (saturating int-to-float conversions) with three embedded
@@ -1195,9 +1402,18 @@ impl MachInst for Inst {
     fn function_alignment() -> FunctionAlignment {
         // We use 32-byte alignment for performance reasons, but for correctness
         // we would only need 4-byte alignment.
+        // `PLIRON_FNALIGN=<bytes>` overrides the preferred alignment.
+        static FA: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let preferred = *FA.get_or_init(|| {
+            std::env::var("PLIRON_FNALIGN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|v: &u32| v.is_power_of_two())
+                .unwrap_or(32)
+        });
         FunctionAlignment {
             minimum: 4,
-            preferred: 32,
+            preferred,
         }
     }
 }
@@ -1307,13 +1523,26 @@ impl Inst {
                 ref imm12,
             } => {
                 let op = op_name(alu_op);
-                let rd = pretty_print_ireg(rd.to_reg(), size);
+                let rd_reg = rd.to_reg();
                 let rn = pretty_print_ireg(rn, size);
 
                 if imm12.bits == 0 && alu_op == ALUOp::Add && size.is64() {
                     // special-case MOV (used for moving into SP).
+                    let rd = pretty_print_ireg(rd_reg, size);
                     format!("mov {rd}, {rn}")
+                } else if rd_reg == zero_reg() {
+                    // PLIRON: flag-setting ops into the zero register are
+                    // `cmp`/`cmn`/`tst`-class aliases; keep the mnemonic
+                    // readable instead of `adds xzr, ...`.
+                    let imm12 = imm12.pretty_print(0);
+                    let alias = match alu_op {
+                        ALUOp::AddS => "cmn",
+                        ALUOp::SubS => "cmp",
+                        _ => op,
+                    };
+                    format!("{alias} {rn}, {imm12}")
                 } else {
+                    let rd = pretty_print_ireg(rd_reg, size);
                     let imm12 = imm12.pretty_print(0);
                     format!("{op} {rd}, {rn}, {imm12}")
                 }
@@ -1443,6 +1672,69 @@ impl Inst {
 
                 format!("{mem_str}{op} {rd}, {mem}")
             }
+            &Inst::LoadPost {
+                op,
+                rd,
+                rwb,
+                rn,
+                simm9,
+                ..
+            } => {
+                let (op_str, size) = match op {
+                    LoadPostOp::ULoad8 => ("ldrb", OperandSize::Size32),
+                    LoadPostOp::SLoad8 => ("ldrsb", OperandSize::Size64),
+                    LoadPostOp::ULoad16 => ("ldrh", OperandSize::Size32),
+                    LoadPostOp::SLoad16 => ("ldrsh", OperandSize::Size64),
+                    LoadPostOp::ULoad32 => ("ldr", OperandSize::Size32),
+                    LoadPostOp::SLoad32 => ("ldrsw", OperandSize::Size64),
+                    LoadPostOp::ULoad64 => ("ldr", OperandSize::Size64),
+                    LoadPostOp::FpuLoad16 => ("ldr", OperandSize::Size64),
+                    LoadPostOp::FpuLoad32 => ("ldr", OperandSize::Size64),
+                    LoadPostOp::FpuLoad64 => ("ldr", OperandSize::Size64),
+                    LoadPostOp::FpuLoad128 => ("ldr", OperandSize::Size64),
+                };
+                let rd = match op {
+                    LoadPostOp::FpuLoad16 | LoadPostOp::FpuLoad32
+                    | LoadPostOp::FpuLoad64 | LoadPostOp::FpuLoad128 => {
+                        pretty_print_reg(rd.to_reg())
+                    }
+                    _ => pretty_print_ireg(rd.to_reg(), size),
+                };
+                let rn = pretty_print_reg(rn);
+                let wb = pretty_print_reg(rwb.to_reg());
+                let simm9 = simm9.pretty_print(8);
+                format!("{op_str} {rd}, [{rn}], {simm9} ; wb={wb}")
+            }
+            &Inst::StorePost {
+                op,
+                rt,
+                rwb,
+                rn,
+                simm9,
+                ..
+            } => {
+                let (op_str, size) = match op {
+                    StorePostOp::Store8 => ("strb", OperandSize::Size32),
+                    StorePostOp::Store16 => ("strh", OperandSize::Size32),
+                    StorePostOp::Store32 => ("str", OperandSize::Size32),
+                    StorePostOp::Store64 => ("str", OperandSize::Size64),
+                    StorePostOp::FpuStore16 => ("str", OperandSize::Size64),
+                    StorePostOp::FpuStore32 => ("str", OperandSize::Size64),
+                    StorePostOp::FpuStore64 => ("str", OperandSize::Size64),
+                    StorePostOp::FpuStore128 => ("str", OperandSize::Size64),
+                };
+                let rt = match op {
+                    StorePostOp::FpuStore16 | StorePostOp::FpuStore32
+                    | StorePostOp::FpuStore64 | StorePostOp::FpuStore128 => {
+                        pretty_print_reg(rt)
+                    }
+                    _ => pretty_print_ireg(rt, size),
+                };
+                let rn = pretty_print_reg(rn);
+                let wb = pretty_print_reg(rwb.to_reg());
+                let simm9 = simm9.pretty_print(8);
+                format!("{op_str} {rt}, [{rn}], {simm9} ; wb={wb}")
+            }
             &Inst::StoreP64 {
                 rt, rt2, ref mem, ..
             } => {
@@ -1514,6 +1806,14 @@ impl Inst {
                 let rm = pretty_print_ireg(rm, OperandSize::Size64);
                 let cond = cond.pretty_print(0);
                 format!("csneg {rd}, {rn}, {rm}, {cond}")
+            }
+            // PLIRON:
+            &Inst::CSInc { rd, rn, rm, cond } => {
+                let rd = pretty_print_ireg(rd.to_reg(), OperandSize::Size64);
+                let rn = pretty_print_ireg(rn, OperandSize::Size64);
+                let rm = pretty_print_ireg(rm, OperandSize::Size64);
+                let cond = cond.pretty_print(0);
+                format!("csinc {rd}, {rn}, {rm}, {cond}")
             }
             &Inst::CSet { rd, cond } => {
                 let rd = pretty_print_ireg(rd.to_reg(), OperandSize::Size64);
@@ -1730,10 +2030,15 @@ impl Inst {
                     FPUOp1::Neg => "fneg",
                     FPUOp1::Sqrt => "fsqrt",
                     FPUOp1::Cvt32To64 | FPUOp1::Cvt64To32 => "fcvt",
+                    // PLIRON
+                    FPUOp1::Cvt16To32 | FPUOp1::Cvt32To16 => "fcvt",
                 };
                 let dst_size = match fpu_op {
                     FPUOp1::Cvt32To64 => ScalarSize::Size64,
                     FPUOp1::Cvt64To32 => ScalarSize::Size32,
+                    // PLIRON
+                    FPUOp1::Cvt16To32 => ScalarSize::Size32,
+                    FPUOp1::Cvt32To16 => ScalarSize::Size16,
                     _ => size,
                 };
                 let rd = pretty_print_vreg_scalar(rd.to_reg(), dst_size);
@@ -2289,7 +2594,10 @@ impl Inst {
                     VecALUModOp::Fmls => ("fmls", size),
                     // Note: the real operand arrangement is .4s, .16b, .16b;
                     // this debug print renders all lanes as .4s.
+                    VecALUModOp::Mla => ("mla", size),
+                    VecALUModOp::Mls => ("mls", size),
                     VecALUModOp::Sdot => ("sdot", VectorSize::Size32x4),
+                    VecALUModOp::Udot => ("udot", VectorSize::Size32x4),
                     VecALUModOp::Usdot => ("usdot", VectorSize::Size32x4),
                 };
                 let rd = pretty_print_vreg_vector(rd.to_reg(), size);
@@ -2362,9 +2670,92 @@ impl Inst {
                     (VecRRRLongOp::Umull32, true) => {
                         ("umull2", VectorSize::Size64x2, VectorSize::Size32x4)
                     }
+                    (VecRRRLongOp::Saddw8, false) => {
+                        ("saddw", VectorSize::Size16x8, VectorSize::Size8x8)
+                    }
+                    (VecRRRLongOp::Saddw8, true) => {
+                        ("saddw2", VectorSize::Size16x8, VectorSize::Size8x16)
+                    }
+                    (VecRRRLongOp::Saddw16, false) => {
+                        ("saddw", VectorSize::Size32x4, VectorSize::Size16x4)
+                    }
+                    (VecRRRLongOp::Saddw16, true) => {
+                        ("saddw2", VectorSize::Size32x4, VectorSize::Size16x8)
+                    }
+                    (VecRRRLongOp::Saddw32, false) => {
+                        ("saddw", VectorSize::Size64x2, VectorSize::Size32x2)
+                    }
+                    (VecRRRLongOp::Saddw32, true) => {
+                        ("saddw2", VectorSize::Size64x2, VectorSize::Size32x4)
+                    }
+                    (VecRRRLongOp::Uaddw8, false) => {
+                        ("uaddw", VectorSize::Size16x8, VectorSize::Size8x8)
+                    }
+                    (VecRRRLongOp::Uaddw8, true) => {
+                        ("uaddw2", VectorSize::Size16x8, VectorSize::Size8x16)
+                    }
+                    (VecRRRLongOp::Uaddw16, false) => {
+                        ("uaddw", VectorSize::Size32x4, VectorSize::Size16x4)
+                    }
+                    (VecRRRLongOp::Uaddw16, true) => {
+                        ("uaddw2", VectorSize::Size32x4, VectorSize::Size16x8)
+                    }
+                    (VecRRRLongOp::Uaddw32, false) => {
+                        ("uaddw", VectorSize::Size64x2, VectorSize::Size32x2)
+                    }
+                    (VecRRRLongOp::Uaddw32, true) => {
+                        ("uaddw2", VectorSize::Size64x2, VectorSize::Size32x4)
+                    }
+                    (VecRRRLongOp::Saddl8, false) => {
+                        ("saddl", VectorSize::Size16x8, VectorSize::Size8x8)
+                    }
+                    (VecRRRLongOp::Saddl8, true) => {
+                        ("saddl2", VectorSize::Size16x8, VectorSize::Size8x16)
+                    }
+                    (VecRRRLongOp::Saddl16, false) => {
+                        ("saddl", VectorSize::Size32x4, VectorSize::Size16x4)
+                    }
+                    (VecRRRLongOp::Saddl16, true) => {
+                        ("saddl2", VectorSize::Size32x4, VectorSize::Size16x8)
+                    }
+                    (VecRRRLongOp::Saddl32, false) => {
+                        ("saddl", VectorSize::Size64x2, VectorSize::Size32x2)
+                    }
+                    (VecRRRLongOp::Saddl32, true) => {
+                        ("saddl2", VectorSize::Size64x2, VectorSize::Size32x4)
+                    }
+                    (VecRRRLongOp::Uaddl8, false) => {
+                        ("uaddl", VectorSize::Size16x8, VectorSize::Size8x8)
+                    }
+                    (VecRRRLongOp::Uaddl8, true) => {
+                        ("uaddl2", VectorSize::Size16x8, VectorSize::Size8x16)
+                    }
+                    (VecRRRLongOp::Uaddl16, false) => {
+                        ("uaddl", VectorSize::Size32x4, VectorSize::Size16x4)
+                    }
+                    (VecRRRLongOp::Uaddl16, true) => {
+                        ("uaddl2", VectorSize::Size32x4, VectorSize::Size16x8)
+                    }
+                    (VecRRRLongOp::Uaddl32, false) => {
+                        ("uaddl", VectorSize::Size64x2, VectorSize::Size32x2)
+                    }
+                    (VecRRRLongOp::Uaddl32, true) => {
+                        ("uaddl2", VectorSize::Size64x2, VectorSize::Size32x4)
+                    }
+                };
+                // Widening adds (`saddw`/`uaddw`) take the wide accumulator
+                // as `Vn`; the multiplies' `Vn` is narrow like `Vm`.
+                let rn_size = match alu_op {
+                    VecRRRLongOp::Saddw8
+                    | VecRRRLongOp::Saddw16
+                    | VecRRRLongOp::Saddw32
+                    | VecRRRLongOp::Uaddw8
+                    | VecRRRLongOp::Uaddw16
+                    | VecRRRLongOp::Uaddw32 => dest_size,
+                    _ => src_size,
                 };
                 let rd = pretty_print_vreg_vector(rd.to_reg(), dest_size);
-                let rn = pretty_print_vreg_vector(rn, src_size);
+                let rn = pretty_print_vreg_vector(rn, rn_size);
                 let rm = pretty_print_vreg_vector(rm, src_size);
                 format!("{op} {rd}, {rn}, {rm}")
             }
@@ -2394,6 +2785,24 @@ impl Inst {
                     }
                     (VecRRRLongModOp::Umlal32, true) => {
                         ("umlal2", VectorSize::Size64x2, VectorSize::Size32x4)
+                    }
+                    (VecRRRLongModOp::Smlal8, false) => {
+                        ("smlal", VectorSize::Size16x8, VectorSize::Size8x8)
+                    }
+                    (VecRRRLongModOp::Smlal8, true) => {
+                        ("smlal2", VectorSize::Size16x8, VectorSize::Size8x16)
+                    }
+                    (VecRRRLongModOp::Smlal16, false) => {
+                        ("smlal", VectorSize::Size32x4, VectorSize::Size16x4)
+                    }
+                    (VecRRRLongModOp::Smlal16, true) => {
+                        ("smlal2", VectorSize::Size32x4, VectorSize::Size16x8)
+                    }
+                    (VecRRRLongModOp::Smlal32, false) => {
+                        ("smlal", VectorSize::Size64x2, VectorSize::Size32x2)
+                    }
+                    (VecRRRLongModOp::Smlal32, true) => {
+                        ("smlal2", VectorSize::Size64x2, VectorSize::Size32x4)
                     }
                 };
                 let rd = pretty_print_vreg_vector(rd.to_reg(), dest_size);
@@ -2456,13 +2865,14 @@ impl Inst {
                 size,
                 imm,
             } => {
-                let op = match op {
-                    VecShiftImmOp::Shl => "shl",
-                    VecShiftImmOp::Ushr => "ushr",
-                    VecShiftImmOp::Sshr => "sshr",
+                let (op, nsize) = match op {
+                    VecShiftImmOp::Shl => ("shl", size),
+                    VecShiftImmOp::Ushr => ("ushr", size),
+                    VecShiftImmOp::Sshr => ("sshr", size),
+                    VecShiftImmOp::Shrn => ("shrn", VectorSize::from_lane_size(size.lane_size().widen(), true)),
                 };
                 let rd = pretty_print_vreg_vector(rd.to_reg(), size);
-                let rn = pretty_print_vreg_vector(rn, size);
+                let rn = pretty_print_vreg_vector(rn, nsize);
                 format!("{op} {rd}, {rn}, #{imm}")
             }
             &Inst::VecShiftImmMod {
@@ -2598,6 +3008,32 @@ impl Inst {
                     let rd = pretty_print_ireg(rd.to_reg(), dest_size);
                     let rn = pretty_print_ireg(rn, OperandSize::from_bits(from_bits));
                     format!("{op} {rd}, {rn}")
+                }
+            }
+            &Inst::UBfm { rd, rn, immr, imms, size } => {
+                let bits = u32::from(size.bits());
+                let rd = pretty_print_ireg(rd.to_reg(), size);
+                let rn = pretty_print_ireg(rn, size);
+                let (immr, imms) = (u32::from(immr), u32::from(imms));
+                if imms == bits - 1 && immr > 0 {
+                    format!("lsr {rd}, {rn}, #{immr}")
+                } else if immr == imms + 1 {
+                    format!("lsl {rd}, {rn}, #{}", bits - immr)
+                } else if immr > imms {
+                    format!("ubfiz {rd}, {rn}, #{}, #{}", bits - immr, imms + 1)
+                } else {
+                    format!("ubfx {rd}, {rn}, #{immr}, #{}", imms + 1 - immr)
+                }
+            }
+            &Inst::Bfm { rd, rn, rd_in: _, immr, imms, size } => {
+                let bits = u32::from(size.bits());
+                let rd = pretty_print_ireg(rd.to_reg(), size);
+                let rn = pretty_print_ireg(rn, size);
+                let (immr, imms) = (u32::from(immr), u32::from(imms));
+                if immr > imms {
+                    format!("bfi {rd}, {rn}, #{}, #{}", bits - immr, imms + 1)
+                } else {
+                    format!("bfm {rd}, {rn}, #{immr}, #{imms}")
                 }
             }
             &Inst::Call { ref info } => {
@@ -2756,26 +3192,27 @@ impl Inst {
                 ridx,
                 rtmp1,
                 rtmp2,
-                ..
+                checked,
             } => {
                 let ridx = pretty_print_reg(ridx);
                 let rtmp1 = pretty_print_reg(rtmp1.to_reg());
                 let rtmp2 = pretty_print_reg(rtmp2.to_reg());
                 let default_target = BranchTarget::Label(default).pretty_print(0);
+                let guard = if checked {
+                    format!("b.hs {default_target} ; csel {rtmp2}, xzr, {ridx}, hs ; csdb ; ")
+                } else {
+                    format!("mov {rtmp2}, {ridx} ; ")
+                };
                 format!(
                     concat!(
-                        "b.hs {} ; ",
-                        "csel {}, xzr, {}, hs ; ",
-                        "csdb ; ",
+                        "{}",
                         "adr {}, pc+16 ; ",
                         "ldrsw {}, [{}, {}, uxtw #2] ; ",
                         "add {}, {}, {} ; ",
                         "br {} ; ",
                         "jt_entries {:?}"
                     ),
-                    default_target,
-                    rtmp2,
-                    ridx,
+                    guard,
                     rtmp1,
                     rtmp2,
                     rtmp1,
@@ -3046,13 +3483,14 @@ impl MachInstLabelUse for LabelUse {
     fn veneer_size(self) -> CodeOffset {
         match self {
             LabelUse::Branch14 | LabelUse::Branch19 => 4,
+            LabelUse::Branch26 if regs::x17_allocatable() => 28,
             LabelUse::Branch26 => 20,
             _ => unreachable!(),
         }
     }
 
     fn worst_case_veneer_size() -> CodeOffset {
-        20
+        if regs::x17_allocatable() { 28 } else { 20 }
     }
 
     /// Generate a veneer into the buffer, given that this veneer is at `veneer_offset`, and return
@@ -3081,6 +3519,30 @@ impl MachInstLabelUse for LabelUse {
             // available. Otherwise for intra-function jumps we also reserve
             // x16/x17 as spill-style registers. In both cases these are
             // available for us to use.
+            // With `PLIRON_X17`, x17 may hold a live value across an
+            // intra-function jump, so the veneer saves it below sp around its use.
+            LabelUse::Branch26 if regs::x17_allocatable() => {
+                let tmp1 = regs::spilltmp_reg();
+                let tmp1_w = regs::writable_spilltmp_reg();
+                let tmp2 = regs::tmp2_reg();
+                let tmp2_w = regs::writable_tmp2_reg();
+                // str x17, [sp, #-16]!
+                let save = 0xf81f0ff1u32;
+                // ldrsw x16, 20
+                let ldr = emit::enc_ldst_imm19(0b1001_1000, 20 / 4, tmp1);
+                // adr x17, 16
+                let adr = emit::enc_adr(16, tmp2_w);
+                // add x16, x16, x17
+                let add = emit::enc_arith_rrr(0b10001011_000, 0, tmp1_w, tmp1, tmp2);
+                // ldr x17, [sp], #16
+                let restore = 0xf84107f1u32;
+                // br x16
+                let br = emit::enc_br(tmp1);
+                for (i, w) in [save, ldr, adr, add, restore, br].into_iter().enumerate() {
+                    buffer[i * 4..i * 4 + 4].clone_from_slice(&u32::to_le_bytes(w));
+                }
+                (veneer_offset + 24, LabelUse::PCRel32)
+            }
             LabelUse::Branch26 => {
                 let tmp1 = regs::spilltmp_reg();
                 let tmp1_w = regs::writable_spilltmp_reg();

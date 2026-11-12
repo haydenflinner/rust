@@ -18,41 +18,34 @@ extern crate rustc_hir;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_structures;
 extern crate rustc_symbol_mangling;
 extern crate rustc_target;
 
 mod abi;
 mod asm;
 mod builder;
-mod clifpeep;
-mod constload;
+mod cgupool;
+mod debuginfo;
 mod consts;
 mod context;
-mod domcheck;
-mod eh;
-mod hot;
-mod inline;
-mod instcombine;
 mod intrinsic;
-mod jumpthread;
-mod loadfwd;
-mod loopdel;
-mod looprot;
-mod lower;
-mod memcpyopt;
-mod nounwind;
-mod objmerge;
-mod phisimp;
+mod lto;
 mod simd;
-mod sroa;
-mod switchmap;
-mod taildup;
-mod tailmerge;
 mod type_of;
 mod types;
-mod unreach;
 mod wasm;
 mod xcgu;
+
+// CLIF-pass modules live in the stable-Rust `pliron-clif-opt` crate; the
+// glob re-export keeps `crate::<pass>` paths working unchanged.
+pub use pliron_clif_lower::{eh, hot, lower, obj_sym, objmerge};
+pub use pliron_clif_opt::*;
+pub use pliron_ir_opt::{
+    address_taken, callgvn, constload, domcheck, guardelim, has_body, inline, instcombine, lutcorr,
+    memcpyopt, nnret, nocapture, nounwind, nowrite, pgo, phisimp, retarg, spec, sroa, willreturn,
+    xoridem,
+};
 
 use std::any::Any;
 use std::path::PathBuf;
@@ -94,9 +87,21 @@ pub struct PlironModule {
     pub obj: Vec<u8>,
     pub ir: String,
     pub asm: String,
+    /// `Some` while this module's finish work is queued in `cgupool`;
+    /// `optimize` resolves it into `obj`/`ir`/`asm` on a worker thread.
+    pub pending: Option<u32>,
 }
 
 pub struct PlironBuffer(Vec<u8>);
+
+/// `serialize_module` of a module whose stage B `cgupool` holds
+/// (`PLIRON_XFACTS_ALL`): this prefix, then the pool key (LE u32).
+const PENDING_MAGIC: &[u8] = b"pliron-held\0";
+
+fn pending_key(data: &[u8]) -> Option<u32> {
+    let k = data.strip_prefix(PENDING_MAGIC)?;
+    Some(u32::from_le_bytes(k.try_into().ok()?))
+}
 
 impl ModuleBufferMethods for PlironBuffer {
     fn data(&self) -> &[u8] {
@@ -104,10 +109,81 @@ impl ModuleBufferMethods for PlironBuffer {
     }
 }
 
-fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
+/// `base_has_feature` for the codegen `Session` (its twin takes
+/// `EarlySession`), plus `-Ctarget-feature` `+/-` overrides on top.
+fn sess_has_feature(sess: &Session, feature: &str) -> bool {
+    let baseline: &[&str] = match sess.target.arch {
+        rustc_target::spec::Arch::X86_64 => &["fxsr", "sse", "sse2", "x87"],
+        rustc_target::spec::Arch::AArch64 => &["neon"],
+        _ => &[],
+    };
+    let cpu = sess
+        .opts
+        .cg
+        .target_cpu
+        .as_deref()
+        .unwrap_or(&sess.target.cpu);
+    let mut on = baseline.contains(&feature)
+        || if cpu == "native" {
+            native_feat(sess, feature)
+        } else {
+            cpu_features(cpu).contains(&feature)
+        };
+    for t in sess.opts.cg.target_feature.split(',') {
+        let t = t.trim();
+        if t == feature || t == format!("+{feature}") {
+            on = true;
+        } else if t == format!("-{feature}") {
+            on = false;
+        }
+    }
+    on
+}
+#[cfg(target_arch = "x86_64")]
+fn native_feat(sess: &Session, feature: &str) -> bool {
+    let _ = sess;
+    match feature {
+        "sse3" => std::arch::is_x86_feature_detected!("sse3"),
+        "ssse3" => std::arch::is_x86_feature_detected!("ssse3"),
+        "sse4.1" => std::arch::is_x86_feature_detected!("sse4.1"),
+        "sse4.2" => std::arch::is_x86_feature_detected!("sse4.2"),
+        "avx" => std::arch::is_x86_feature_detected!("avx"),
+        "avx2" => std::arch::is_x86_feature_detected!("avx2"),
+        "fma" => std::arch::is_x86_feature_detected!("fma"),
+        "popcnt" => std::arch::is_x86_feature_detected!("popcnt"),
+        "bmi1" => std::arch::is_x86_feature_detected!("bmi1"),
+        "bmi2" => std::arch::is_x86_feature_detected!("bmi2"),
+        "lzcnt" => std::arch::is_x86_feature_detected!("lzcnt"),
+        "cmpxchg16b" => std::arch::is_x86_feature_detected!("cmpxchg16b"),
+        "avx512f" => std::arch::is_x86_feature_detected!("avx512f"),
+        "avx512dq" => std::arch::is_x86_feature_detected!("avx512dq"),
+        "avx512vl" => std::arch::is_x86_feature_detected!("avx512vl"),
+        "avx512bw" => std::arch::is_x86_feature_detected!("avx512bw"),
+        "avx512cd" => std::arch::is_x86_feature_detected!("avx512cd"),
+        "avx512vbmi" => std::arch::is_x86_feature_detected!("avx512vbmi"),
+        "avx512bitalg" => std::arch::is_x86_feature_detected!("avx512bitalg"),
+        "avx512vnni" => std::arch::is_x86_feature_detected!("avx512vnni"),
+        "avxvnni" => std::arch::is_x86_feature_detected!("avxvnni"),
+        _ => false,
+    }
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn native_feat(_sess: &Session, _feature: &str) -> bool {
+    false
+}
+// r[impl front.target.isa]
+// r[impl front.target.settings]
+// r[impl front.target.fp]
+// r[impl native.obj.pic-tls]
+// r[impl native.obj.fp]
+pub(crate) fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     let mut fb = settings::builder();
-    fb.set("is_pic", "true").unwrap();
-    if std::env::var("PLIRON_RA_CHECK").is_ok_and(|v| v == "1") {
+    // COFF has no GOT: is_pic would emit sym@GOTPCREL loads that read the
+    // symbol's bytes rather than its address.
+    let coff = sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Coff;
+    fb.set("is_pic", if coff { "false" } else { "true" })
+        .unwrap();
+    if crate::env_is("PLIRON_RA_CHECK", "1") {
         fb.set("regalloc_checker", "true").unwrap();
     }
     fb.set(
@@ -120,34 +196,87 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
     )
     .unwrap();
     // Frame pointers follow the target default and `-Cforce-frame-pointers`, as in
-    // cg_clif: unwinding uses .eh_frame, so rbp is free for the register allocator.
-    // `PLIRON_OMIT_FP=0` keeps them unconditionally.
+    // cg_clif: unwinding uses .eh_frame/.xdata, so rbp is free for the register
+    // allocator. `PLIRON_OMIT_FP=0` keeps them unconditionally.
     let fp = { sess.target.options.frame_pointer }.ratchet(sess.opts.cg.force_frame_pointers);
-    // Cranelift's x64 `return_call` emission requires frame pointers.
-    let keep_fp = fp != rustc_target::spec::FramePointer::MayOmit
-        || !pass_enabled("PLIRON_OMIT_FP")
-        || tail_calls;
+    // Cranelift's x64 `return_call` emission requires frame pointers, and an
+    // explicit `-Cforce-frame-pointers` wins outright. Otherwise omit fp even
+    // where the spec defaults to `Always` (windows-msvc): unwind is
+    // metadata-driven and LLVM drops it for ordinary functions the same way.
+    let forced = sess.opts.cg.force_frame_pointers != rustc_target::spec::FramePointer::MayOmit;
+    let keep_fp = tail_calls || forced || !pass_enabled("PLIRON_OMIT_FP");
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::lib", tracing::Level::DEBUG) {
+        if pliron_cfg::tracing_on() {
+            tracing::debug!(target: "pliron::lib", "fp debug: spec={:?} cgflag={:?} ratchet={:?} tail_calls={} forced={} omit_fp={} keep={}",
+                sess.target.options.frame_pointer,
+                sess.opts.cg.force_frame_pointers,
+                fp,
+                tail_calls,
+                forced,
+                pass_enabled("PLIRON_OMIT_FP"),
+                keep_fp
+            )
+        };
+    }
     fb.set(
         "preserve_frame_pointers",
         if keep_fp { "true" } else { "false" },
     )
     .unwrap();
+    let tls_model = match sess.target.options.binary_format {
+        rustc_target::spec::BinaryFormat::Elf => "elf_gd",
+        rustc_target::spec::BinaryFormat::MachO => "macho",
+        rustc_target::spec::BinaryFormat::Coff => "coff",
+        _ => "none",
+    };
     // `-Ztls-model=initial-exec` (bootstrap passes it for rustc itself): no
     // `__tls_get_addr` call per access. `PLIRON_TLS_IE=0` keeps general-dynamic.
     let ie = sess.target.arch == rustc_target::spec::Arch::X86_64
-        && sess.target.binary_format == rustc_target::spec::BinaryFormat::Elf
+        && sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Elf
         && matches!(
             sess.tls_model(),
             rustc_target::spec::TlsModel::InitialExec | rustc_target::spec::TlsModel::LocalExec
         )
         && pass_enabled("PLIRON_TLS_IE");
-    fb.set("tls_model", if ie { "elf_ie" } else { "elf_gd" })
+    crate::lower::RET_NOEXT.store(
+        sess.target.arch == rustc_target::spec::Arch::X86_64 && pass_enabled("PLIRON_RET_NOEXT"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    fb.set("tls_model", if ie { "elf_ie" } else { tls_model })
         .unwrap();
     fb.set("enable_llvm_abi_extensions", "true").unwrap();
     fb.enable("enable_multi_ret_implicit_sret").unwrap();
+    // ISA extension flags from rustc's effective target features.
+    // Without this everything compiles to the arch baseline (SSE2 on
+    // x86-64) no matter what `-Ctarget-cpu`/`-Ctarget-feature` asks.
+    for (feat, flag) in [
+        ("sse3", "has_sse3"),
+        ("ssse3", "has_ssse3"),
+        ("sse4.1", "has_sse41"),
+        ("sse4.2", "has_sse42"),
+        ("popcnt", "has_popcnt"),
+        ("avx", "has_avx"),
+        ("avx2", "has_avx2"),
+        ("fma", "has_fma"),
+        ("bmi1", "has_bmi1"),
+        ("bmi2", "has_bmi2"),
+        ("lzcnt", "has_lzcnt"),
+        ("cmpxchg16b", "has_cmpxchg16b"),
+        ("avx512f", "has_avx512f"),
+        ("avx512dq", "has_avx512dq"),
+        ("avx512vl", "has_avx512vl"),
+        ("avx512vbmi", "has_avx512vbmi"),
+        ("avx512bitalg", "has_avx512bitalg"),
+        ("avx512vnni", "has_avx512vnni"),
+        ("avxvnni", "has_avx_vnni"),
+    ] {
+        if sess_has_feature(sess, feat) {
+            let _ = fb.enable(flag);
+        }
+    }
     fb.set(
         "opt_level",
-        if sess.opts.optimize == OptLevel::No {
+        if sess.opts.optimize == OptLevel::No || !crate::pass_enabled("PLIRON_COMPILE_EGRAPH") {
             "none"
         } else {
             "speed_and_size"
@@ -167,179 +296,718 @@ fn build_isa(sess: &Session, tail_calls: bool) -> Arc<dyn TargetIsa> {
         fb.set("probestack_strategy", "inline").unwrap();
     }
     let flags = settings::Flags::new(fb);
-    let isa = cranelift_codegen::isa::lookup(triple)
+    let mut isa = cranelift_codegen::isa::lookup(triple.clone())
         .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")));
+    // Target features → ISA flags. `sess.internal_target_features` holds the
+    // effective set (spec baseline + `-Ctarget-cpu` + `-Ctarget-feature`).
+    let tf = |rust: &str| {
+        sess.internal_target_features
+            .contains(&Symbol::intern(rust))
+    };
+    let isa_feats: &[(&str, &str)] = match triple.architecture {
+        target_lexicon::Architecture::Aarch64(_) => &[
+            ("lse", "has_lse"),
+            ("dotprod", "has_dotprod"),
+            ("i8mm", "has_i8mm"),
+            ("fp16", "has_fp16"),
+            ("bti", "use_bti"),
+        ],
+        // The VEX families (avx/avx2/fma/avx512*) are mapped by default on
+        // real hardware: they unlock the 3-operand encodings and, under
+        // AVX2/AVX512F, the wide-vector lowerings (loopvec probes the
+        // resulting ISA flags per function; `WIDE_VECTOR_BITS` tracks the
+        // ceiling). `PLIRON_X64_VEX=0` opts out -- e.g. under Rosetta, where
+        // VEX-128 encodings translate ~2x slower than legacy SSE.
+        // BMI1/BMI2 stay: GPR VEX (mulx/shlx/…) measures fast under Rosetta.
+        target_lexicon::Architecture::X86_64 => &[
+            ("sse3", "has_sse3"),
+            ("ssse3", "has_ssse3"),
+            ("sse4.1", "has_sse41"),
+            ("sse4.2", "has_sse42"),
+            ("popcnt", "has_popcnt"),
+            ("bmi1", "has_bmi1"),
+            ("bmi2", "has_bmi2"),
+            ("lzcnt", "has_lzcnt"),
+            ("cmpxchg16b", "has_cmpxchg16b"),
+        ],
+        _ => &[],
+    };
+    for &(rust, flag) in isa_feats {
+        if tf(rust) {
+            isa.enable(flag)
+                .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift flag {flag}: {e}")));
+        }
+    }
+    // VEX encodings on x64, default-on (see the comment on the flag table
+    // above); PLIRON_X64_VEX=0 opts out.
+    if triple.architecture == target_lexicon::Architecture::X86_64
+        && !crate::env_is("PLIRON_X64_VEX", "0")
+    {
+        for &(rust, flag) in &[
+            ("avx", "has_avx"),
+            ("avx2", "has_avx2"),
+            ("fma", "has_fma"),
+            ("avx512f", "has_avx512f"),
+            ("avx512bw", "has_avx512bw"),
+            ("avx512vl", "has_avx512vl"),
+            ("avx512dq", "has_avx512dq"),
+            ("avx512bitalg", "has_avx512bitalg"),
+            ("avx512vbmi", "has_avx512vbmi"),
+            ("avx512vnni", "has_avx512vnni"),
+            ("avxvnni", "has_avx_vnni"),
+        ] {
+            if tf(rust) {
+                isa.enable(flag)
+                    .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift flag {flag}: {e}")));
+            }
+        }
+        // The wide-vector ceiling follows the enabled VEX level: loopvec
+        // emits 256-bit lanes under AVX2 and 512 under AVX512F (its own
+        // per-loop caps still apply). 128 leaves the register file xmm-only.
+        let wide = if tf("avx512f") {
+            512
+        } else if tf("avx2") {
+            256
+        } else {
+            128
+        };
+        // The vendored static only exists with the `x86` codegen feature —
+        // `host-arch` gives it on x86 hosts (the only hosts x64 targets
+        // build on today; all-arch cross would need a different gate).
+        #[cfg(target_arch = "x86_64")]
+        cranelift_codegen::isa::x64::WIDE_VECTOR_BITS
+            .store(wide, std::sync::atomic::Ordering::Relaxed);
+        // Mirror for the noarch opt crate, which can't see the `x86`-
+        // feature-gated static (pipeline.rs `x64_wide_bits`).
+        pliron_clif_opt::pipeline::X64_WIDE_VECTOR_BITS
+            .store(wide, std::sync::atomic::Ordering::Relaxed);
+    }
     isa.finish(flags)
         .unwrap_or_else(|e| sess.dcx().fatal(format!("cranelift: {e}")))
 }
 
-/// Per-pass ablation toggle: `PLIRON_<PASS>=0` turns a pass off.
-/// LLVM's `\x01` prefix (bindgen's `link_name = "\u{1}sym"`) means "emit the name verbatim".
-pub(crate) fn obj_sym(n: &str) -> &str {
-    n.strip_prefix('\u{1}').unwrap_or(n)
+/// [`lower::Host`] over rustc's session: self-profile activities,
+/// diagnostics, and target features.
+pub(crate) struct RustcHost<'a> {
+    sess: &'a Session,
+    prof: Arc<RustcProf>,
 }
 
-pub(crate) fn pass_enabled(var: &str) -> bool {
-    std::env::var(var).map_or(true, |v| v != "0")
+/// `Session` is not `Sync`; worker threads only see the profiler.
+/// `SelfProfilerRef` is itself Arc-backed, so the wrapper is `'static`.
+pub(crate) struct RustcProf(pub(crate) SelfProfilerRef);
+
+impl lower::Prof for RustcProf {
+    fn activity(&self, nm: &'static str, arg: Option<&str>) -> Box<dyn Send + '_> {
+        match arg {
+            Some(a) => Box::new(self.0.generic_activity_with_arg(nm, a)),
+            None => Box::new(self.0.generic_activity(nm)),
+        }
+    }
 }
 
-fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
-    let emit_ir = cx
-        .tcx
-        .sess
-        .opts
-        .output_types
-        .contains_key(&OutputType::LlvmAssembly)
-        || std::env::var_os("PLIRON_DUMP").is_some();
-    let ir = if emit_ir {
-        cx.print_ir()
-    } else {
-        String::new()
-    };
-    if std::env::var_os("PLIRON_DUMP").is_some() {
-        eprintln!("==== {name} ====\n{ir}");
+impl lower::Host for RustcHost<'_> {
+    fn prof(&self) -> Arc<dyn lower::Prof> {
+        self.prof.clone()
     }
-    if cx.tcx.sess.opts.optimize == OptLevel::No && pass_enabled("PLIRON_ALWAYS_INLINE") {
-        let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
-        inline::run(ctx, st, true, None, true);
-        domcheck::run(ctx, st, "always-inline");
-        inline::dead_fns(ctx, st);
+    fn fatal(&self, msg: String) -> ! {
+        self.sess.dcx().fatal(msg)
     }
-    if cx.tcx.sess.opts.optimize != OptLevel::No {
-        let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
-        let small = cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32
-            || matches!(
-                cx.tcx.sess.opts.optimize,
-                OptLevel::Size | OptLevel::SizeMin
-            );
-        if pass_enabled("PLIRON_FROZEN") {
-            st.frozen = context::frozen_values(ctx, st).into_iter().collect();
-        }
-        inline::run(ctx, st, small, None, false);
-        domcheck::run(ctx, st, "inline");
-        if std::env::var("PLIRON_NOUNWIND").is_ok_and(|v| v == "1") {
-            nounwind::run(ctx, st);
-        }
-        if pass_enabled("PLIRON_SRET2REG") {
-            abi::run(ctx, st);
-            domcheck::run(ctx, st, "abi");
-        }
-        if std::env::var("PLIRON_DEADARG").is_ok_and(|v| v == "1") {
-            abi::dead_args(ctx, st);
-        }
-        if pass_enabled("PLIRON_INSTCOMBINE") {
-            instcombine::run(ctx, st);
-            domcheck::run(ctx, st, "instcombine");
-        }
-        if std::env::var("PLIRON_MEMCPYOPT").is_ok_and(|v| v == "1") {
-            memcpyopt::run(ctx, st);
-        }
-        if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {
-            sroa::forward(ctx, st);
-            domcheck::run(ctx, st, "sroa-fwd");
-        }
-        if pass_enabled("PLIRON_PHISIMP") {
-            phisimp::run(ctx, st);
-            domcheck::run(ctx, st, "phisimp");
-        }
-        if pass_enabled("PLIRON_SROA") {
-            sroa::run(ctx, st);
-            domcheck::run(ctx, st, "sroa");
-        }
-        if pass_enabled("PLIRON_CONSTLOAD") {
-            constload::run(ctx, st);
-            domcheck::run(ctx, st, "constload");
-            // Inlining + SROA make vtable pointers constant: call those slots
-            // directly, inline them and clean up again (`PLIRON_DEVIRT=0` disables).
-            if pass_enabled("PLIRON_DEVIRT") {
-                let sites = inline::devirt(ctx, st);
-                domcheck::run(ctx, st, "devirt");
-                if !sites.is_empty() && pass_enabled("PLIRON_DEVIRT_INLINE") {
-                    inline::run(ctx, st, small, Some(&sites), false);
-                    domcheck::run(ctx, st, "devirt-inline");
-                    if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_SROA_FWD") {
-                        sroa::forward(ctx, st);
-                    }
-                    if pass_enabled("PLIRON_PHISIMP") && pass_enabled("PLIRON_DEVIRT_PHI") {
-                        phisimp::run(ctx, st);
-                    }
-                    if pass_enabled("PLIRON_SROA") && pass_enabled("PLIRON_DEVIRT_SROA") {
-                        sroa::run(ctx, st);
-                    }
-                    if pass_enabled("PLIRON_DEVIRT_CL") {
-                        constload::run(ctx, st);
-                    }
-                }
+    fn sse42(&self) -> bool {
+        self.sess
+            .internal_target_features
+            .contains(&Symbol::intern("sse4.2"))
+    }
+}
+
+/// Install the tracing subscriber when `PLIRON_TRACE` or any legacy
+/// diagnostic knob is set. `PLIRON_TRACE` is an
+/// [`EnvFilter`](tracing_subscriber::EnvFilter) over our `pliron::*`
+/// targets -- `pliron` for everything, `pliron::phase` for per-phase
+/// times, `pliron::iropt` for each ir-opt pass, `pliron::step` for every
+/// pipeline step (span name = step name), `pliron::fn` per function,
+/// `pliron::<pass>` for per-pass diagnostics (what used to be
+/// `PLIRON_<PASS>_DEBUG`/`_PROF`), `pliron::stats`, `pliron::timing`,
+/// `pliron::facts`, `pliron::dump` for the aggregated report channels.
+/// The fmt layer emits each span's `time.busy` on close. Narrow further
+/// with grep -- EnvFilter's `[{field=x}]` syntax only gates events
+/// *inside* a matching span, not the span's own close line. When no
+/// knob is set no subscriber is installed and span/event sites cost a
+/// branch or a hash lookup.
+///
+/// Legacy knob table: `(env var, target, level)` -- setting the var
+/// enables that target at that level, so `PLIRON_JT_PROF=1` keeps
+/// printing jumpthread phase timings (now as `INFO pliron::jumpthread`).
+/// Print-gating knobs only; behavioral knobs stay `env_set` reads.
+// r[impl front.trace]
+const KNOB_TARGETS: &[(&str, &str, tracing::Level)] = &[
+    ("PLIRON_STATS", "pliron::stats", tracing::Level::INFO),
+    ("PLIRON_STATS_OPS", "pliron::stats", tracing::Level::INFO),
+    ("PLIRON_STATS_WHY", "pliron::stats", tracing::Level::INFO),
+    ("PLIRON_STATS_MEMCPY", "pliron::stats", tracing::Level::INFO),
+    ("PLIRON_STATS_DEVIRT", "pliron::stats", tracing::Level::INFO),
+    ("PLIRON_STATS_XCGU", "pliron::stats", tracing::Level::INFO),
+    ("PLIRON_TIMING", "pliron::timing", tracing::Level::INFO),
+    ("PLIRON_FACTS", "pliron::facts", tracing::Level::INFO),
+    ("PLIRON_DUMP", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_DUMP_OPT", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_CLIF", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_CGDUMP", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_CGDUMP2", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_XPACK_CLIF", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_VCODE", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_WASM_DUMP", "pliron::dump", tracing::Level::INFO),
+    ("PLIRON_JT_PROF", "pliron::jumpthread", tracing::Level::INFO),
+    (
+        "PLIRON_JT_PROF2",
+        "pliron::jumpthread",
+        tracing::Level::INFO,
+    ),
+    ("PLIRON_JT_PROF2", "pliron::edgespec", tracing::Level::INFO),
+    ("PLIRON_JT_PROF2", "pliron::celim", tracing::Level::INFO),
+    ("PLIRON_JT_PROF2", "pliron::loadfwd", tracing::Level::INFO),
+    ("PLIRON_DSE_PROF", "pliron::dse", tracing::Level::INFO),
+    ("PLIRON_DSE_DUMP", "pliron::dse", tracing::Level::INFO),
+    ("PLIRON_ICPROF", "pliron::ifconv", tracing::Level::INFO),
+    (
+        "PLIRON_CHAIN_PROF",
+        "pliron::pipeline",
+        tracing::Level::INFO,
+    ),
+    (
+        "PLIRON_SLOTPROM_TIME",
+        "pliron::slotprom",
+        tracing::Level::INFO,
+    ),
+    (
+        "PLIRON_CACHE_LOG",
+        "pliron::stepcache",
+        tracing::Level::INFO,
+    ),
+    ("PLIRON_PGO", "pliron::pgo", tracing::Level::INFO),
+    ("PLIRON_PGO_USE", "pliron::pgo", tracing::Level::INFO),
+    (
+        "PLIRON_DIFFCHECK_VERBOSE",
+        "pliron::diffcheck",
+        tracing::Level::INFO,
+    ),
+    (
+        "PLIRON_CHECK_DOM",
+        "pliron::domcheck",
+        tracing::Level::ERROR,
+    ),
+    (
+        "PLIRON_JT_DEBUG",
+        "pliron::jumpthread",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_NNDBG", "pliron::pipeline", tracing::Level::DEBUG),
+    ("PLIRON_NNDBG", "pliron::lower", tracing::Level::DEBUG),
+    (
+        "PLIRON_SELTEST_DBG",
+        "pliron::jumpthread",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_VEC_DEBUG", "pliron::loopvec", tracing::Level::DEBUG),
+    (
+        "PLIRON_LOOPVEC_DEBUG",
+        "pliron::loopvec",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_XPACK_DEBUG", "pliron::slp", tracing::Level::DEBUG),
+    ("PLIRON_TDDBG", "pliron::taildup", tracing::Level::DEBUG),
+    (
+        "PLIRON_FROZEN_SCAN",
+        "pliron::frozen",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_FROZEN_DEBUG",
+        "pliron::frozen",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_IDIOM_DEBUG",
+        "pliron::loopidiom",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_GATHER_DEBUG",
+        "pliron::loopidiom",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_LOOPROT_DEBUG",
+        "pliron::looprot",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_INDUCT_DEBUG",
+        "pliron::indvars",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_INDUCT_DEBUG",
+        "pliron::celim",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_POSTINC_DEBUG",
+        "pliron::indvars",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_BCHECK_DEBUG",
+        "pliron::bcheck",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_UNSWITCH_DEBUG",
+        "pliron::unswitch",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_UNROLL_DEBUG",
+        "pliron::unroll",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_SLOTPROM_WHY",
+        "pliron::slotprom",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_MEMSPEC_DEBUG",
+        "pliron::memspec",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_IFCONV_DEBUG",
+        "pliron::ifconv",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_GEDBG", "pliron::guardelim", tracing::Level::DEBUG),
+    ("PLIRON_XIDBG", "pliron::xoridem", tracing::Level::DEBUG),
+    (
+        "PLIRON_EDGESPEC_DEBUG",
+        "pliron::edgespec",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_CELIM_DEBUG", "pliron::celim", tracing::Level::DEBUG),
+    ("PLIRON_CGDBG", "pliron::callgvn", tracing::Level::DEBUG),
+    (
+        "PLIRON_NOCAPDBG",
+        "pliron::nocapture",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_CONSTBR_DEBUG",
+        "pliron::constbr",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_SWITCHMAP_DEBUG",
+        "pliron::switchmap",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_DEBUG_FP", "pliron::lib", tracing::Level::DEBUG),
+    (
+        "PLIRON_DIVCONST_DEBUG",
+        "pliron::divconst",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_DSE_DEBUG", "pliron::dse", tracing::Level::DEBUG),
+    (
+        "PLIRON_IVREFOLD_DEBUG",
+        "pliron::ivrefold",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_LFDEBUG", "pliron::loadfwd", tracing::Level::DEBUG),
+    ("PLIRON_LF_DEBUG", "pliron::loadfwd", tracing::Level::DEBUG),
+    ("PLIRON_LICM_DEBUG", "pliron::licm", tracing::Level::DEBUG),
+    ("PLIRON_LICM_DEBUG2", "pliron::licm", tracing::Level::DEBUG),
+    (
+        "PLIRON_PHI_DEBUG",
+        "pliron::sameargs",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_SA_DEBUG", "pliron::sameargs", tracing::Level::DEBUG),
+    ("PLIRON_PINMISS", "pliron::sroa", tracing::Level::DEBUG),
+    ("PLIRON_SROA_WHYFN", "pliron::stats", tracing::Level::INFO),
+    (
+        "PLIRON_PUNROLL_DEBUG",
+        "pliron::punroll",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_RF_DEBUG",
+        "pliron::rangefold",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_SHAPE_DEBUG",
+        "pliron::pipeline",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_SLOTMERGE_DEBUG",
+        "pliron::slotmerge",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_SPEC_DEBUG", "pliron::spec", tracing::Level::DEBUG),
+    ("PLIRON_WM_PROF", "pliron::clifpeep", tracing::Level::INFO),
+    ("PLIRON_WM_SIZES", "pliron::clifpeep", tracing::Level::DEBUG),
+    (
+        "PLIRON_WEBMERGE_REL",
+        "pliron::clifpeep",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_WIDE_DEBUG",
+        "pliron::scalarize",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_CONSTDBG", "pliron::lower", tracing::Level::DEBUG),
+    (
+        "PLIRON_OPT_BISECT_DEBUG",
+        "pliron::cfg",
+        tracing::Level::DEBUG,
+    ),
+    (
+        "PLIRON_INLINE_VERBOSE",
+        "pliron::inline",
+        tracing::Level::DEBUG,
+    ),
+    ("PLIRON_WASM_VERBOSE", "pliron::wasm", tracing::Level::DEBUG),
+];
+
+// r[impl par.cfg.trace]
+fn tracing_init() {
+    let mut filter = String::new();
+    if let Ok(t) = std::env::var("PLIRON_TRACE") {
+        filter = t;
+    }
+    for &(var, target, level) in KNOB_TARGETS {
+        if std::env::var_os(var).is_some() {
+            if !filter.is_empty() {
+                filter.push(',');
             }
+            filter.push_str(target);
+            filter.push('=');
+            // `PLIRON_UNROLL_DEBUG=3` was the deepest spew tier; keep it
+            // reachable behind `trace` now that levels unify there.
+            let level = if var == "PLIRON_UNROLL_DEBUG" && std::env::var(var).as_deref() == Ok("3")
+            {
+                tracing::Level::TRACE
+            } else {
+                level
+            };
+            filter.push_str(level.as_str());
         }
-        st.notrap = pass_enabled("PLIRON_NOTRAP");
-        st.jumpthread = pass_enabled("PLIRON_JUMPTHREAD");
-        st.loadfwd = pass_enabled("PLIRON_LOADFWD");
-        st.peep = pass_enabled("PLIRON_PEEP");
-        st.tailmerge = pass_enabled("PLIRON_TAILMERGE");
-        st.unreach = pass_enabled("PLIRON_UNREACH");
-        st.taildup = pass_enabled("PLIRON_TAILDUP");
-        if pass_enabled("PLIRON_DEADFN") {
-            inline::dead_fns(ctx, st);
-        }
     }
-    if std::env::var_os("PLIRON_DUMP_OPT").is_some() {
-        eprintln!("==== {name} (optimized) ====\n{}", cx.print_ir());
+    if filter.is_empty() {
+        return;
     }
-    if cx.tcx.sess.target.arch == rustc_target::spec::Arch::Wasm32 {
-        let obj = wasm::lower_to_wasm(
-            &cx.pctx.borrow(),
-            &cx.st.borrow(),
-            name,
-            &wasm::target_features(&cx.tcx.sess.target, &cx.tcx.sess.opts),
-            cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
-        );
-        return PlironModule {
-            obj,
-            ir,
-            asm: String::new(),
-        };
-    }
-    let isa = build_isa(
-        cx.tcx.sess,
-        cx.tcx.features().enabled(rustc_span::sym::explicit_tail_calls)
-            || std::env::var("PLIRON_TAILCALL").is_ok(),
-    );
-    let hot = std::env::var("PLIRON_HOT")
-        .is_ok_and(|c| c == cx.tcx.crate_name(rustc_span::def_id::LOCAL_CRATE).as_str());
-    let obj = lower::lower_to_object(
-        cx.tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind,
-        hot,
-        &cx.pctx.borrow(),
-        &cx.st.borrow(),
-        isa,
-        name,
-    );
-    let asm = std::mem::take(&mut cx.st.borrow_mut().asm);
-    PlironModule { obj, ir, asm }
+    pliron_cfg::mark_tracing_on();
+    use tracing_subscriber::prelude::*;
+    let filter = tracing_subscriber::EnvFilter::builder().parse_lossy(filter);
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+                .with_ansi(false)
+                // Bare messages: the filter already scopes output, and
+                // test.sh/bench grep stats/facts/timing lines verbatim.
+                .with_level(false)
+                .with_target(false)
+                .without_time()
+                .compact(),
+        )
+        .with(filter)
+        .try_init();
 }
 
+/// Wrap an ir-opt pass call in a tracing span: `PLIRON_TRACE=pliron::iropt`
+/// prints each pass's `time.busy` on span close (see `tracing_init`).
+macro_rules! pt {
+    ($prof:expr, $cgu:expr, $n:literal, $e:expr) => {{
+        let _s = tracing::info_span!(target: "pliron::iropt", $n).entered();
+        // Same interval in rustc's self-profile: `-Zself-profile` shows
+        // `pliron_ir_<pass>` next to LLVM's own `LLVM_*` activities.
+        let _pg = $prof.generic_activity(concat!("pliron_ir_", $n));
+        let _t = std::time::Instant::now();
+        let _r = $e;
+        pliron_cfg::trace($n, _t.elapsed().as_secs_f64() * 1e3, $cgu);
+        if pliron_cfg::env_set("PLIRON_MEM_MARK") {
+            pliron_cfg::mark(concat!("pass ", $n));
+        }
+        _r
+    }};
+}
+pub(crate) use pt;
+
+// r[impl front.finish]
+fn finish_module(cx: &CodegenCx<'_>, name: &str) -> PlironModule {
+    let cfg = cgupool::CrateCfg::new(cx.tcx);
+    let (ctx, st) = (&mut *cx.pctx.borrow_mut(), &mut *cx.st.borrow_mut());
+    let ir = cgupool::finish_pre(ctx, st, cx.module, name, &cfg);
+    let mut iropt = std::time::Duration::ZERO;
+    if cfg.optimize {
+        let _siro = tracing::info_span!(target: "pliron::phase", "iropt").entered();
+        let _pgiro = cx.tcx.sess.prof.generic_activity("pliron_iropt");
+        let t = std::time::Instant::now();
+        cgupool::iropt_head(
+            ctx,
+            st,
+            &cx.tcx.sess.prof,
+            name,
+            &cfg,
+            cgupool::FactsMode::Share,
+        );
+        cgupool::iropt_tail(ctx, st, &cx.tcx.sess.prof, name, &cfg, None);
+        iropt = t.elapsed();
+    }
+    let host = RustcHost {
+        sess: cx.tcx.sess,
+        prof: Arc::new(RustcProf(cx.tcx.sess.prof.clone())),
+    };
+    let fin = cgupool::finish_b(lower::CtxSlot::Ref(ctx), st, cx.module, name, &cfg, &host, ir, iropt);
+    PlironModule {
+        obj: fin.obj,
+        ir: fin.ir,
+        asm: fin.asm,
+        pending: None,
+    }
+}
+
+/// Whether a rustc target feature is enabled in the *base* target machine:
+/// the arch baseline, the spec's `features` string, or the spec/`-C` cpu.
+fn base_has_feature(sess: &rustc_session::EarlySession, feature: &str) -> bool {
+    // The spec `features` string is a comma-separated "+x"/"-y" list; a later
+    // entry wins. An explicit `-feat` suppresses even a cpu-implied feature.
+    let mut spec = None;
+    for f in sess.target.features.split(',') {
+        let n = f.strip_prefix('+').or_else(|| f.strip_prefix('-'));
+        if n == Some(feature) {
+            spec = Some(f.starts_with('+'));
+        }
+    }
+    if let Some(v) = spec {
+        return v;
+    }
+    let baseline: &[&str] = match sess.target.arch {
+        // x86_64 mandates SSE2; rustc requires fxsr/x87 on top.
+        rustc_target::spec::Arch::X86_64 => &["fxsr", "sse", "sse2", "x87"],
+        // Every aarch64 platform chip has NEON.
+        rustc_target::spec::Arch::AArch64 => &["neon"],
+        _ => &[],
+    };
+    if baseline.contains(&feature) {
+        return true;
+    }
+    let cpu = sess
+        .opts
+        .cg
+        .target_cpu
+        .as_deref()
+        .unwrap_or(&sess.target.cpu);
+    if cpu == "native" {
+        return native_has_feature(sess, feature);
+    }
+    cpu_features(cpu).contains(&feature)
+}
+/// `-Ctarget-cpu=native`: LLVM would expand the host cpu name; we probe the
+/// host directly. Only meaningful when compiling for the host arch.
+fn native_has_feature(sess: &rustc_session::EarlySession, feature: &str) -> bool {
+    use rustc_target::spec::Arch;
+    match sess.target.arch {
+        #[cfg(target_arch = "aarch64")]
+        Arch::AArch64 => match feature {
+            "aes" => std::arch::is_aarch64_feature_detected!("aes"),
+            "dotprod" => std::arch::is_aarch64_feature_detected!("dotprod"),
+            "fcma" => std::arch::is_aarch64_feature_detected!("fcma"),
+            "fp16" => std::arch::is_aarch64_feature_detected!("fp16"),
+            "i8mm" => std::arch::is_aarch64_feature_detected!("i8mm"),
+            "lse" => std::arch::is_aarch64_feature_detected!("lse"),
+            "neon" => true,
+            "rcpc" => std::arch::is_aarch64_feature_detected!("rcpc"),
+            "sha2" => std::arch::is_aarch64_feature_detected!("sha2"),
+            "sha3" => std::arch::is_aarch64_feature_detected!("sha3"),
+            _ => false,
+        },
+        #[cfg(target_arch = "x86_64")]
+        Arch::X86_64 => match feature {
+            "sse3" => std::arch::is_x86_feature_detected!("sse3"),
+            "ssse3" => std::arch::is_x86_feature_detected!("ssse3"),
+            "sse4.1" => std::arch::is_x86_feature_detected!("sse4.1"),
+            "sse4.2" => std::arch::is_x86_feature_detected!("sse4.2"),
+            "avx" => std::arch::is_x86_feature_detected!("avx"),
+            "avx2" => std::arch::is_x86_feature_detected!("avx2"),
+            "fma" => std::arch::is_x86_feature_detected!("fma"),
+            "popcnt" => std::arch::is_x86_feature_detected!("popcnt"),
+            "bmi1" => std::arch::is_x86_feature_detected!("bmi1"),
+            "bmi2" => std::arch::is_x86_feature_detected!("bmi2"),
+            "lzcnt" => std::arch::is_x86_feature_detected!("lzcnt"),
+            "cmpxchg16b" => std::arch::is_x86_feature_detected!("cmpxchg16b"),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+/// rustc `-Ctarget-cpu` names → feature sets, for the cpus whose properties
+/// feed cranelift lowering. Only entries we can state confidently go here;
+/// anything else falls back to the spec baseline.
+// r[impl front.target.cpu]
+fn cpu_features(cpu: &str) -> &'static [&'static str] {
+    // x86-64 psABI levels: each arm lists entry-point features only —
+    // `internal_target_features` expands the implied closure
+    // (avx2 → avx → sse4.2 → … → sse2), so the v2 non-SIMD extras are the
+    // only ones repeated per tier.
+    const X64_V2: &[&str] = &["cmpxchg16b", "lahfsahf", "popcnt", "sse4.2"];
+    const X64_AVX: &[&str] = &["avx", "cmpxchg16b", "lahfsahf", "popcnt"];
+    const X64_V3: &[&str] = &[
+        "avx2",
+        "bmi1",
+        "bmi2",
+        "f16c",
+        "fma",
+        "lzcnt",
+        "movbe",
+        "cmpxchg16b",
+        "lahfsahf",
+        "popcnt",
+    ];
+    const X64_V4: &[&str] = &[
+        "avx2",
+        "bmi1",
+        "bmi2",
+        "f16c",
+        "fma",
+        "lzcnt",
+        "movbe",
+        "cmpxchg16b",
+        "lahfsahf",
+        "popcnt",
+        "avx512bw",
+        "avx512cd",
+        "avx512dq",
+        "avx512vl",
+    ];
+    const X64_V4_EXT: &[&str] = &[
+        "avx2",
+        "bmi1",
+        "bmi2",
+        "f16c",
+        "fma",
+        "lzcnt",
+        "movbe",
+        "cmpxchg16b",
+        "lahfsahf",
+        "popcnt",
+        "avx512bw",
+        "avx512cd",
+        "avx512dq",
+        "avx512vl",
+        "avx512bitalg",
+        "avx512vbmi",
+        "avx512vnni",
+    ];
+    match cpu {
+        // Apple tiers seed the same entry features LLVM's cpu model does;
+        // `internal_target_features` expands the v8.xa closure
+        // (v8.1a → crc/lse/rdm/pan/lor/vh, v8.4a → dotprod/dit/flagm, ...),
+        // matching `rustc --print cfg -Ctarget-cpu=<name>` under stock.
+        // A12 generation: ARMv8.3-era (no dotprod in LLVM's A12 model).
+        "apple-a12" | "apple-s4" | "apple-s5" => {
+            &["aes", "sha2", "fp16", "fcma", "pmuv3", "v8.3a"]
+        }
+        // A13 generation: FEAT_SHA3 arrives, v8.4a + lse2/rcpc2.
+        "apple-a13" | "apple-s6" | "apple-s7" | "apple-s8" => &[
+            "aes", "sha2", "sha3", "fp16", "fhm", "fcma", "lse2", "rcpc2", "pmuv3", "v8.4a",
+        ],
+        // A14/M1: adds frintts, flagm2, ssbs, sb, dpb2 over A13.
+        "apple-a14" | "apple-m1" => &[
+            "aes", "sha2", "sha3", "fp16", "fhm", "fcma", "frintts", "flagm2", "lse2",
+            "rcpc2", "pmuv3", "ssbs", "sb", "dpb2", "v8.4a",
+        ],
+        // A15/M2 generation: v8.6a pulls bf16+i8mm (+bti/ssbs/sb/dpb2 via v8.5a).
+        "apple-a15" | "apple-a16" | "apple-a17" | "apple-s9" | "apple-s10" | "apple-s11"
+        | "apple-m2" | "apple-m3" => &[
+            "aes", "sha2", "sha3", "fp16", "fhm", "fcma", "frintts", "flagm2", "lse2",
+            "rcpc2", "pmuv3", "ecv", "v8.6a",
+        ],
+        // M4/A18-class: v8.7a (+wfxt) and SME2.
+        "apple-m4" | "apple-a18" => &[
+            "aes", "sha2", "sha3", "fp16", "fhm", "fcma", "frintts", "flagm2", "lse2",
+            "rcpc2", "pmuv3", "ecv", "sme", "sme2", "sme-f64f64", "sme-i16i64", "v8.7a",
+        ],
+        // apple-latest (A18 Pro): M4 + cssc/hbc/mte and the remaining SME2
+        // sub-features.
+        "apple-latest" => &[
+            "aes", "sha2", "sha3", "fp16", "fhm", "fcma", "frintts", "flagm2", "lse2",
+            "rcpc2", "pmuv3", "ecv", "sme", "sme2", "sme-f64f64", "sme-i16i64",
+            "sme-b16b16", "sme-f16f16", "sme2p1", "sve-b16b16", "cssc", "hbc", "mte",
+            "v8.7a",
+        ],
+        // SSSE3-era (Core 2, original Atom): no SSE4.
+        "core2" | "bonnell" | "saltwell" => &["cmpxchg16b", "lahfsahf", "ssse3"],
+        // SSE4.1-era (Penryn; also the x86_64-apple-darwin spec default).
+        "penryn" => &["cmpxchg16b", "lahfsahf", "sse4.1"],
+        // SSE4.2-era Intel (v2): Nehalem/Westmere and friends.
+        "x86-64-v2" | "nehalem" | "corei7" | "westmere" | "silvermont" | "slm" | "goldmont"
+        | "goldmont-plus" | "tremont" => X64_V2,
+        // AVX without AVX2: Sandy Bridge/Ivy Bridge and the matching AMD.
+        "sandybridge" | "corei7-avx" | "ivybridge" | "core-avx-i" | "bdver1" | "bdver2"
+        | "btver2" => X64_AVX,
+        // AVX2-class (v3): Haswell onward, Zen 1–3, recent E-cores.
+        "x86-64-v3" | "haswell" | "core-avx2" | "broadwell" | "skylake" | "kabylake"
+        | "coffeelake" | "cometlake" | "whiskeylake" | "amberlake" | "alderlake" | "raptorlake"
+        | "meteorlake" | "arrowlake" | "arrowlake-s" | "lunarlake" | "pantherlake"
+        | "sierraforest" | "grandridge" | "clearwaterforest" | "gracemont" | "bdver4"
+        | "znver1" | "znver2" | "znver3" => X64_V3,
+        // AVX-512 F/BW/CD/DQ/VL (v4): Skylake-SP through Cascade/Cooper Lake.
+        "x86-64-v4" | "skylake-avx512" | "cascadelake" | "cooperlake" => X64_V4,
+        // v4 plus the VNNI/VBMI/BITALG extensions Cranelift has flags for
+        // (Ice Lake onward, Zen 4/5).
+        "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake" | "sapphirerapids"
+        | "emeraldrapids" | "graniterapids" | "graniterapids-d" | "diamondrapids" | "znver4"
+        | "znver5" => X64_V4_EXT,
+        _ => &[],
+    }
+}
 impl CodegenBackend for PlironCodegenBackend {
+    // r[impl front.target.features]
+    // r[impl front.target.f16]
     fn target_config(&self, sess: &rustc_session::EarlySession) -> TargetConfig {
         types::PTR32.store(
             sess.target.pointer_width == 32,
             std::sync::atomic::Ordering::Relaxed,
         );
         use rustc_target::spec::{Arch, Os};
-        let feats: Vec<Symbol> = match sess.target.arch {
-            Arch::X86_64 if sess.target.os != Os::None => ["fxsr", "sse", "sse2", "x87"]
-                .iter()
-                .map(|f| Symbol::intern(f))
-                .collect(),
-            Arch::AArch64 if sess.target.os != Os::None => vec![rustc_span::sym::neon],
-            Arch::Wasm32 => wasm::target_features(&sess.target, &sess.opts)
-                .iter()
-                .map(|f| Symbol::intern(f))
-                .collect(),
-            _ => vec![],
+        // Base-target features: the arch baseline, plus whatever the spec's
+        // `features` string / `cpu` name imply, plus `-Ctarget-feature` (parsed
+        // and validated by the helper against rustc's feature names).
+        let feats = match sess.target.arch {
+            Arch::X86_64 | Arch::AArch64 if sess.target.os != Os::None => {
+                rustc_codegen_ssa::target_features::internal_target_features::<0>(
+                    sess,
+                    |_| Default::default(),
+                    |feature| base_has_feature(sess, feature),
+                )
+            }
+            Arch::Wasm32 => {
+                let fs = wasm::target_features(&sess.target, &sess.opts);
+                types::NATIVE_SIMD.store(
+                    fs.iter().any(|f| f == "simd128"),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                fs.iter().map(|f| Symbol::intern(f)).collect()
+            }
+            _ => Default::default(),
         };
         TargetConfig {
-            internal_target_features: rustc_data_structures::unord::UnordSet::from_iter(feats),
+            internal_target_features: feats,
             has_reliable_f16: false,
             has_reliable_f16_math: false,
             has_reliable_f16b: false,
@@ -352,10 +1020,34 @@ impl CodegenBackend for PlironCodegenBackend {
         "pliron"
     }
 
-    fn init(&mut self, _sess: &rustc_session::EarlySession) -> rustc_session::CodegenBackendInit {
-        // No LTO: keep rustc from requesting thin-local LTO at opt-level > 0.
+    // `Session::lto` doesn't exist yet: `init` sees only the early
+    // session, so it reads `-Clto` from the options directly.
+    #[cfg_attr(rustc_in_tree, allow(rustc::bad_opt_access))]
+    // r[impl front.lto]
+    // r[impl native.lto.thin]
+    // r[impl par.cfg.version]
+    fn init(&mut self, sess: &rustc_session::EarlySession) -> rustc_session::CodegenBackendInit {
+        tracing_init();
+        // Which source tree built this dylib (harness/src-rev.sh) — check it
+        // before trusting a self-host or bisect result.
+        if pliron_cfg::env_set("PLIRON_VERSION") {
+            eprintln!("pliron backend {}", env!("PLIRON_SRC_REV"));
+        }
+        // No ThinLTO: rustc then never runs thin-local LTO at opt-level > 0,
+        // and `-Clto=thin` falls back to fat LTO (`lto.rs`), with a warning.
         rustc_session::CodegenBackendInit {
-            thin_lto_supported: false,
+            // `PLIRON_XFACTS_ALL=1`: accept thin-local LTO, whose barrier
+            // (`run_thin_lto` runs once every module is optimized) is the
+            // two-phase facts split — `optimize` publishes, the thin step
+            // adopts from every CGU and lowers. Real cross-crate ThinLTO
+            // stays unsupported: under an explicit `-Clto=thin` (cargo's
+            // `lto = "thin"`, nushell) we claim no ThinLTO, so rustc falls
+            // back to fat LTO as without the flag instead of reaching
+            // `run_thin_lto` with other crates' rlibs.
+            thin_lto_supported: pliron_cfg::env_is("PLIRON_XFACTS_ALL", "1")
+                && sess.opts.cg.lto != rustc_session::config::LtoCli::Thin,
+            // The fork's knob drops LTO requests entirely; the self-hosted
+            // build keeps doing that until fat LTO is verified in-tree.
             #[cfg(rustc_in_tree)]
             fat_lto_supported: false,
             ..Default::default()
@@ -367,6 +1059,13 @@ impl CodegenBackend for PlironCodegenBackend {
     }
 
     fn codegen_crate(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
+        if cgupool::enabled(tcx) {
+            cgupool::begin(tcx);
+        } else {
+            // Even on the serial path the facts table is per-ordinal now;
+            // a fresh crate must not inherit a previous one's ordinals.
+            pliron_ir_opt::state::reset_facts();
+        }
         Box::new(codegen_crate(self.clone(), tcx))
     }
 
@@ -388,6 +1087,8 @@ impl CodegenBackend for PlironCodegenBackend {
 impl ExtraBackendMethods for PlironCodegenBackend {
     type Module = PlironModule;
 
+    // r[impl front.alloc-shim]
+    // r[impl native.win.crtfree]
     fn codegen_allocator<'tcx>(
         &self,
         tcx: TyCtxt<'tcx>,
@@ -428,6 +1129,337 @@ impl ExtraBackendMethods for PlironCodegenBackend {
             &[],
             None,
         );
+        let coff = tcx.sess.target.options.binary_format == rustc_target::spec::BinaryFormat::Coff;
+        // PLIRON_CRTFREE: emit the static-CRT bits msvcrt.lib/vcruntime
+        // normally supply -- the TLS directory anchor (_tls_used), TLS index
+        // slot, template boundary markers, _fltused, and the PE entry
+        // thunks -- so `rust-lld` plus synthesized import libraries (see
+        // tools/mkwinlibs) need nothing from a Visual Studio install.
+        // Opt-in: a stock `link.exe` + real CRT link resolves the same
+        // symbols from msvcrt.lib, so emitting the stubs unconditionally
+        // produces `__security_cookie` LNK2005/ucrtbase LNK1104 dupes.
+        let crtfree = coff && pliron_cfg::env_is("PLIRON_CRTFREE", "1");
+        if crtfree {
+            let i32t = cx.type_i32();
+            let ptr = cx.type_ptr();
+            let mk = |name: &str,
+                      ty,
+                      init: pliron_ir_opt::state::ConstVal,
+                      mutable: bool,
+                      tls: bool,
+                      section: Option<&str>| {
+                cx.declare_global(
+                    name,
+                    context::GlobalInfo {
+                        ty,
+                        init: Some(cx.new_value(ty, init)),
+                        align: 8,
+                        mutable,
+                        tls,
+                        linkage: Linkage::Export,
+                        used: true,
+                        section: section.map(|s| s.to_string()),
+                    },
+                );
+            };
+            // `_tls_start` must anchor the merged .tls region: a plain
+            // (non-TLS) byte in an unsuffixed `.tls` section. Cranelift
+            // emits real TLS data as `.tls$$subsection`, which sorts after
+            // plain `.tls`, so this marker always precedes every TLS var.
+            mk(
+                "_tls_start",
+                cx.type_array(cx.type_i8(), 1),
+                context::ConstVal::Zero,
+                true,
+                false,
+                Some(".tls"),
+            );
+            mk(
+                "_tls_index",
+                i32t,
+                context::ConstVal::Zero,
+                true,
+                false,
+                None,
+            );
+            mk(
+                "_pliron_tls_cbs",
+                cx.type_array(ptr, 1),
+                context::ConstVal::Zero,
+                false,
+                false,
+                None,
+            );
+            // IMAGE_TLS_DIRECTORY64: {StartRaw, EndRaw, IndexAddr, CbAddr,
+            // ZeroFill: u32, Flags: u32}
+            let dirty = cx.type_struct(&[ptr, ptr, ptr, ptr, i32t, i32t], false);
+            let dirinit = cx.new_value(
+                dirty,
+                context::ConstVal::Agg(vec![
+                    cx.sym_addr("_tls_start"),
+                    cx.sym_addr("_tls_end"),
+                    cx.sym_addr("_tls_index"),
+                    cx.sym_addr("_pliron_tls_cbs"),
+                    cx.new_value(i32t, context::ConstVal::Bits(0)),
+                    cx.new_value(i32t, context::ConstVal::Bits(0)),
+                ]),
+            );
+            cx.declare_global(
+                "_tls_used",
+                context::GlobalInfo {
+                    ty: dirty,
+                    init: Some(dirinit),
+                    align: 8,
+                    mutable: false,
+                    tls: false,
+                    linkage: Linkage::Export,
+                    used: true,
+                    section: None,
+                },
+            );
+            // Not a TLS datum -- plain data in a `.tls$ZZZ`-named section,
+            // which the linker sorts to the end of the merged .tls region.
+            mk(
+                "_tls_end",
+                cx.type_array(cx.type_i8(), 1),
+                context::ConstVal::Zero,
+                true,
+                false,
+                Some(".tls$ZZZ"),
+            );
+            mk(
+                "_fltused",
+                i32t,
+                context::ConstVal::Bits(0),
+                false,
+                false,
+                None,
+            );
+            mk(
+                "??_7type_info@@6B@",
+                cx.type_array(ptr, 2),
+                context::ConstVal::Zero,
+                false,
+                false,
+                None,
+            );
+            // GS stack-cookie symbols for foreign objects built with /GS
+            // (e.g. winapi's alloca.o). Cookie is the MSVC default sentinel;
+            // __GSHandlerCheck returning 1 (ExceptionContinueSearch) is
+            // correct for unwinding, it just skips cookie validation.
+            mk(
+                "__security_cookie",
+                cx.type_isize(),
+                context::ConstVal::Bits(0x2B99_2DDF_A232),
+                false,
+                false,
+                None,
+            );
+            {
+                let gsty = cx.type_func(&[ptr, ptr, ptr, ptr], i32t);
+                let f =
+                    cx.declare_fn_sym("__GSHandlerCheck", gsty, Linkage::Export, Exts::default());
+                let bb = Builder::append_block(&cx, f, "entry");
+                let mut bx = Builder::build(&cx, bb);
+                bx.ret(bx.const_uint(i32t, 1));
+            }
+            {
+                let ckty = cx.type_func(&[ptr], cx.type_void());
+                let f = cx.declare_fn_sym(
+                    "__security_check_cookie",
+                    ckty,
+                    Linkage::Export,
+                    Exts::default(),
+                );
+                let bb = Builder::append_block(&cx, f, "entry");
+                let mut bx = Builder::build(&cx, bb);
+                let cookie = bx.get_param(0);
+                let want = bx.load(
+                    ptr,
+                    cx.sym_addr("__security_cookie"),
+                    rustc_abi::Align::EIGHT,
+                );
+                let ok = bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntEQ, cookie, want);
+                let good = bx.append_sibling_block("ok");
+                let bad = bx.append_sibling_block("bad");
+                bx.cond_br(ok, good, bad);
+                bx.switch_to_block(good);
+                bx.ret_void();
+                bx.switch_to_block(bad);
+                bx.call_sym("__report_gsfailure", cx.type_void(), &[cookie]);
+                bx.ret_void();
+            }
+
+            let cts = tcx.crate_types();
+            let exec = cts.contains(&rustc_structures::CrateType::Executable);
+            let dylib = cts.contains(&rustc_structures::CrateType::Dylib)
+                || cts.contains(&rustc_structures::CrateType::Cdylib);
+            let void = cx.type_void();
+            if exec {
+                for entry in [
+                    "mainCRTStartup",
+                    "wmainCRTStartup",
+                    "WinMainCRTStartup",
+                    "wWinMainCRTStartup",
+                ] {
+                    let sty = cx.type_func(&[], void);
+                    let f = cx.declare_fn_sym(entry, sty, Linkage::Export, Exts::default());
+                    let bb = Builder::append_block(&cx, f, "entry");
+                    let mut bx = Builder::build(&cx, bb);
+                    let z = bx.const_uint(i32t, 0);
+                    let np = bx.const_null(ptr);
+                    let r = bx.call_sym("main", i32t, &[z, np, np]);
+                    bx.call_sym("ExitProcess", void, &[r]);
+                    bx.ret_void();
+                }
+            }
+            if dylib {
+                let sty = cx.type_func(&[ptr, i32t, ptr], i32t);
+                let f =
+                    cx.declare_fn_sym("_DllMainCRTStartup", sty, Linkage::Export, Exts::default());
+                let bb = Builder::append_block(&cx, f, "entry");
+                let mut bx = Builder::build(&cx, bb);
+                let one = bx.const_uint(i32t, 1);
+                bx.ret(one);
+            }
+        }
+        if tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind && coff {
+            // TLS slot driving emulated EH on COFF: `{ flag: i32, _pad: i32,
+            // exn: ptr, buf: [u8; 32] }` -- the buffer holds a copy of
+            // `panic_unwind::seh::Exception` made at the throw site so it
+            // outlives the unwound frame. See `eh_tls`/`eh_check` in lower.rs.
+            let ty = cx.type_array(cx.type_i8(), 48);
+            let init = cx.new_value(ty, context::ConstVal::Bytes(vec![0; 48]));
+            cx.declare_global(
+                "__pliron_eh",
+                context::GlobalInfo {
+                    ty,
+                    init: Some(init),
+                    align: 8,
+                    mutable: true,
+                    tls: true,
+                    linkage: Linkage::Export,
+                    used: false,
+                    section: None,
+                },
+            );
+            if pliron_cfg::env_is("PLIRON_SEH", "0") {
+                // docs/seh-design.md: SEH personality named by .xdata
+                // EHANDLER. Handler data = {u32 n, {u32 begin, u32 end,
+                // u32 target}[n]}, fn-relative code offsets; claim when
+                // begin <= ControlPc-ImageBase < end. On claim, stash
+                // {exn, throwinfo, base} into __pliron_eh at +8/+16/+24,
+                // set dc->TargetIp, return ExceptionExecuteHandler(4).
+                let i32t = cx.type_i32();
+                let ptr = cx.type_ptr();
+                let sty = cx.type_func(&[ptr, ptr, ptr, ptr], i32t);
+                let f = cx.declare_fn_sym(
+                    "__pliron_seh_personality",
+                    sty,
+                    Linkage::Export,
+                    Exts::default(),
+                );
+                let bb = Builder::append_block(&cx, f, "entry");
+                let mut bx = Builder::build(&cx, bb);
+                let isz = cx.type_isize();
+                let i8t = cx.type_i8();
+                let a1 = rustc_abi::Align::ONE;
+                let rec = bx.get_param(0);
+                let est = bx.get_param(1);
+                let dc = bx.get_param(3);
+                let _ = est;
+                let decline = bx.append_sibling_block("decline");
+                let fla = bx.gep(i8t, rec, &[bx.const_uint(isz, 4)]);
+                let fl = bx.load(i32t, fla, a1);
+                let m = bx.and(fl, bx.const_uint(i32t, 0x26));
+                let isunw = bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntNE, m, bx.const_uint(i32t, 0));
+                let search = bx.append_sibling_block("search");
+                bx.cond_br(isunw, decline, search);
+                bx.switch_to_block(search);
+                let cd = bx.load(i32t, rec, a1);
+                let ismsc =
+                    bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntEQ, cd, bx.const_uint(i32t, 0xE06D7363u64));
+                let body = bx.append_sibling_block("body");
+                bx.cond_br(ismsc, body, decline);
+                bx.switch_to_block(body);
+                let pcp = bx.gep(i8t, dc, &[bx.const_uint(isz, 0)]);
+                let pcload = bx.load(isz, pcp, a1);
+                let bpp = bx.gep(i8t, dc, &[bx.const_uint(isz, 8)]);
+                let base = bx.load(isz, bpp, a1);
+                let pc = bx.sub(pcload, base);
+                let hdp = bx.gep(i8t, dc, &[bx.const_uint(isz, 56)]);
+                let hd = bx.load(isz, hdp, a1);
+                // loop vars in allocas: remaining count, record cursor
+                let nv = bx.alloca(rustc_abi::Size::from_bytes(4), rustc_abi::Align::EIGHT);
+                let pv = bx.alloca(rustc_abi::Size::from_bytes(8), rustc_abi::Align::EIGHT);
+                let n0 = bx.load(i32t, hd, a1);
+                bx.store(n0, nv, a1);
+                let p0 = bx.gep(i8t, hd, &[bx.const_uint(isz, 4)]);
+                bx.store(p0, pv, a1);
+                let scan = bx.append_sibling_block("scan");
+                bx.br(scan);
+                bx.switch_to_block(scan);
+                let n = bx.load(i32t, nv, a1);
+                let done = bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntEQ, n, bx.const_uint(i32t, 0));
+                let go = bx.append_sibling_block("go");
+                bx.cond_br(done, decline, go);
+                bx.switch_to_block(go);
+                let p = bx.load(ptr, pv, a1);
+                let b32v = bx.load(i32t, p, a1);
+                let b64 = bx.zext(b32v, isz);
+                let ep = bx.gep(i8t, p, &[bx.const_uint(isz, 4)]);
+                let e32v = bx.load(i32t, ep, a1);
+                let e64 = bx.zext(e32v, isz);
+                let lo = bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntULE, b64, pc);
+                let hi = bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntULT, pc, e64);
+                let inr = bx.and(lo, hi);
+                let hit = bx.append_sibling_block("hit");
+                let next = bx.append_sibling_block("next");
+                bx.cond_br(inr, hit, next);
+                bx.switch_to_block(hit);
+                let x1 = bx.gep(i8t, rec, &[bx.const_uint(isz, 40)]);
+                let exn = bx.load(isz, x1, a1);
+                let x2 = bx.gep(i8t, rec, &[bx.const_uint(isz, 48)]);
+                let ti = bx.load(isz, x2, a1);
+                let tls = cx.sym_addr("__pliron_eh");
+                for (o, v) in [(8u64, exn), (16, ti), (24, base)] {
+                    let d = bx.gep(i8t, tls, &[bx.const_uint(isz, o)]);
+                    bx.store(v, d, a1);
+                }
+                let tp = bx.gep(i8t, p, &[bx.const_uint(isz, 8)]);
+                let t32 = bx.load(i32t, tp, a1);
+                let t64 = bx.zext(t32, isz);
+                let tip = bx.add(base, t64);
+                let dip = bx.gep(i8t, dc, &[bx.const_uint(isz, 32)]);
+                bx.store(tip, dip, a1);
+                bx.ret(bx.const_uint(i32t, 4));
+                bx.switch_to_block(next);
+                let np = bx.gep(i8t, p, &[bx.const_uint(isz, 12)]);
+                bx.store(np, pv, a1);
+                let n1 = bx.sub(n, bx.const_uint(i32t, 1));
+                bx.store(n1, nv, a1);
+                bx.br(scan);
+                bx.switch_to_block(decline);
+                bx.ret(bx.const_uint(i32t, 1));
+            }
+        }
+        if cgupool::enabled(tcx) {
+            // The allocator shim is created ahead of every CGU, so its
+            // store ordinal is 0 — the same position its `share_facts`
+            // call holds on the serial path.
+            let pending = cgupool::submit(
+                module_name.to_string(),
+                cx.pctx.into_inner(),
+                cx.st.into_inner(),
+                cx.module,
+            );
+            return PlironModule {
+                obj: Vec::new(),
+                ir: String::new(),
+                asm: String::new(),
+                pending: Some(pending),
+            };
+        }
         finish_module(&cx, module_name)
     }
 
@@ -435,38 +1467,123 @@ impl ExtraBackendMethods for PlironCodegenBackend {
         &self,
         tcx: TyCtxt<'_>,
         cgu_name: Symbol,
-        _bitcode_needed: bool,
+        bitcode_needed: bool,
     ) -> (ModuleCodegen<PlironModule>, u64) {
         let start = std::time::Instant::now();
         let dep_node = tcx.codegen_unit(cgu_name).codegen_dep_node(tcx);
+        pliron_cfg::mark(&format!("define+ {cgu_name}"));
         let (module, _) = tcx.dep_graph.with_task(
             dep_node,
             tcx,
-            || module_codegen(tcx, cgu_name),
+            || module_codegen(tcx, cgu_name, bitcode_needed),
             Some(rustc_middle::dep_graph::hash_result),
         );
+        pliron_cfg::mark(&format!("define- {cgu_name}"));
         (module, start.elapsed().as_nanos() as u64)
     }
 }
 
-fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModule> {
+// r[impl front.cgu.order]
+fn module_codegen(
+    tcx: TyCtxt<'_>,
+    cgu_name: Symbol,
+    bitcode_needed: bool,
+) -> ModuleCodegen<PlironModule> {
+    let tmod = std::time::Instant::now();
+    let _smod = tracing::info_span!(target: "pliron::module", "module", cgu = %cgu_name).entered();
+    let _pgmod = tcx
+        .sess
+        .prof
+        .generic_activity_with_arg("pliron_module", cgu_name.as_str());
     let cgu = tcx.codegen_unit(cgu_name);
     let mut cx = CodegenCx::new(tcx, cgu_name.as_str());
     cx.st.borrow_mut().cgu = cgu_name.to_string();
+    // rustc wants "bitcode" in this CGU's object (an rlib a later -Clto
+    // link may read, `-Clinker-plugin-lto`, ...): embed our LTO payload.
+    cx.st.borrow_mut().lto_payload = bitcode_needed.then(lto::embedded_payload);
+    cx.st.borrow_mut().xcgufn_kill = env_is("PLIRON_XCGUFN_KILL", "1");
+    cx.st.borrow_mut().deadunopt_on = pass_enabled("PLIRON_DEADUNOPT");
+    cx.st.borrow_mut().spec_skip_copies =
+        tcx.sess.target.is_like_wasm && !pliron_cfg::env_is("PLIRON_SPEC_COPIES", "1");
+    cx.st.borrow_mut().deadfree = env_is("PLIRON_DEADFREE", "1");
+    cx.st.borrow_mut().earlydead =
+        pass_enabled("PLIRON_EARLYDEAD") && env_get("PLIRON_OPT_FNS").is_none();
     let mono_items = cgu.items_in_deterministic_order(tcx);
-    let extra = if tcx.sess.opts.optimize != OptLevel::No
+    let mut extra = if tcx.sess.opts.optimize != OptLevel::No
         && pass_enabled("PLIRON_XCGU")
-        && !tcx.sess.target.is_like_wasm
-        && std::env::var_os("PLIRON_HOT").is_none()
+        && !crate::env_set("PLIRON_HOT")
     {
         xcgu::copies(tcx, cgu)
     } else {
         Vec::new()
     };
-    if std::env::var_os("PLIRON_STATS").is_some() {
-        eprintln!("xcgu {cgu_name}: {} local copies", extra.len());
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "xcgu {cgu_name}: {} local copies", extra.len())
+        };
     }
+    // `PLIRON_XCGU_HOME=1`: degraded copies only; `=all`: every copy;
+    // `=mono`: shared `inlined` mono items (rustc's "CGU-private copies")
+    // keep one owner definition and import it elsewhere. Native only:
+    // wasm's copies feed the waffle inliner and link through
+    // pliron-wasm-ld, untested here.
+    let home_mode = env_get("PLIRON_XCGU_HOME")
+        .filter(|_| !extra.is_empty() && !tcx.sess.target.is_like_wasm);
+    let mono_home = env_get("PLIRON_XCGU_HOME") == Some("mono")
+        && !tcx.sess.target.is_like_wasm;
+    // `=skip`: don't make degraded copies whose home is linkable at all, so
+    // the inliner never inlines a body whose callees are calls here and the
+    // home definition (callees local) is called instead. Dropping a copy can
+    // degrade another, so iterate. Measured worse overall (codegen-plan.md).
+    if home_mode == Some("skip") {
+        loop {
+            let set: rustc_hash::FxHashSet<_> = extra.iter().copied().collect();
+            let before = extra.len();
+            extra.retain(|&i| {
+                !(xcgu::home_linkable(tcx).contains(tcx.symbol_name(i).name)
+                    && xcgu::degraded(tcx, i, cgu, &set))
+            });
+            if extra.len() == before {
+                break;
+            }
+        }
+    }
+    let home_mode = home_mode.map(|m| if m == "skip" { "1" } else { m });
+    let extra_set: rustc_hash::FxHashSet<_> =
+        if home_mode.is_some() { extra.iter().copied().collect() } else { Default::default() };
     for &inst in &extra {
+        let sym = tcx.symbol_name(inst).name;
+        // `=mono` adds inlined-mono conversion on top of `=all` copy
+        // conversion: `inlined_home` covers items whose home is a shared
+        // `inlined` mono item, `home_linkable` the single-home ones.
+        if let Some(m) = home_mode
+            && (m == "all" || m == "mono"
+                || m == "1" && xcgu::degraded(tcx, inst, cgu, &extra_set))
+            && (xcgu::home_linkable(tcx).contains(sym)
+                || (m == "mono"
+                    && xcgu::inlined_home(tcx)
+                        .get(sym)
+                        .is_some_and(|owner| owner != cgu_name.as_str())))
+        {
+            cx.st
+                .borrow_mut()
+                .xcgu_home
+                .insert(sym.to_string());
+        }
+        // Rustc's `used` lists don't cover copy-to-copy calls, so these
+        // bodies can end up with zero `direct_callee`-resolvable callers
+        // while still being referenced at lowering — keep them off
+        // `dead_fns` (see `State::xcgu_copies`). `xcgu_extra` keeps the
+        // `promoted` flip off this copy's own decl (`predefine_fn`).
+        cx.st
+            .borrow_mut()
+            .xcgu_copies
+            .insert(tcx.symbol_name(inst).name.to_string());
+        cx.st
+            .borrow_mut()
+            .xcgu_extra
+            .insert(tcx.symbol_name(inst).name.to_string());
         rustc_middle::mono::MonoItem::Fn(inst).predefine::<Builder<'_, '_>>(
             &mut cx,
             cgu_name.as_str(),
@@ -474,7 +1591,38 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
             rustc_middle::mono::Visibility::Default,
         );
     }
+    let dump = crate::env_set("PLIRON_MONODUMP");
+    if dump {
+        eprintln!("PLIRON-MONO {cgu_name} items={} extra={}", mono_items.len(), extra.len());
+        for &inst in &extra {
+            eprintln!("PLIRON-MONO {cgu_name} EXTRA {}", inst);
+        }
+    }
     for &(mono_item, data) in &mono_items {
+        // `inlined` local-copy and `Internal` instances share the same
+        // dangling-call hazard as `extra` copies: xcgu copies elsewhere
+        // in this CGU can call them through ops `direct_callee` can't
+        // resolve, and neither shows up as a caller in `call_counts`.
+        if data.inlined || data.linkage == rustc_attr_ir::Linkage::Internal {
+            if let rustc_middle::mono::MonoItem::Fn(inst) = mono_item {
+                let sym = tcx.symbol_name(inst).name.to_string();
+                cx.st.borrow_mut().xcgu_copies.insert(sym.clone());
+                // `PLIRON_XCGU_HOME=mono`: this CGU isn't the elected
+                // owner — suppress the `promoted` flip on its own decl
+                // (`xcgu_extra`) and send the body back to an import of
+                // the owner's def after inlining (`xcgu_home`).
+                if mono_home && data.inlined
+                    && xcgu::inlined_home(tcx).get(sym.as_str())
+                        .is_some_and(|owner| owner != cgu_name.as_str())
+                {
+                    cx.st.borrow_mut().xcgu_extra.insert(sym.clone());
+                    cx.st.borrow_mut().xcgu_home.insert(sym);
+                }
+            }
+        }
+        if dump {
+            eprintln!("PLIRON-MONO {cgu_name} {:?} inlined={} vis={:?}", (mono_item, data.linkage), data.inlined, data.visibility);
+        }
         mono_item.predefine::<Builder<'_, '_>>(
             &mut cx,
             cgu_name.as_str(),
@@ -482,6 +1630,8 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
             data.visibility,
         );
     }
+    let _sdef = tracing::info_span!(target: "pliron::phase", "define").entered();
+    let _pgdef = tcx.sess.prof.generic_activity("pliron_define");
     for &(mono_item, data) in &mono_items {
         mono_item.define::<Builder<'_, '_>>(&mut cx, cgu_name.as_str(), data);
     }
@@ -497,9 +1647,42 @@ fn module_codegen(tcx: TyCtxt<'_>, cgu_name: Symbol) -> ModuleCodegen<PlironModu
             cgu_name.as_str(),
             data,
         );
+        if let Some(w) = crate::env_get("PLIRON_STATS_XCGU")
+            && rustc_middle::ty::print::with_no_trimmed_paths!(inst.to_string())
+                .contains(&w)
+            && pliron_cfg::tracing_on()
+        {
+            let sym = tcx.symbol_name(inst).name;
+            let st = cx.st.borrow();
+            let f = st.funcs.get(sym);
+            tracing::info!(target: "pliron::stats", "xcgu def {} -> {sym}: linkage={:?} body={}",
+                rustc_middle::ty::print::with_no_trimmed_paths!(inst.to_string()),
+                f.map(|f| f.linkage),
+                f.is_some_and(|f| has_body(&*cx.pctx.borrow(), f.op)),
+            );
+        }
     }
     maybe_create_entry_wrapper::<Builder<'_, '_>>(&cx, cgu);
-    let m = finish_module(&cx, cgu_name.as_str());
+    drop(_sdef);
+    let m = if cgupool::enabled(tcx) {
+        // Hand the finished pliron module to the worker pool: IR-opt,
+        // the facts merge and CLIF lowering all run off the main thread.
+        let pending = cgupool::submit(
+            cgu_name.to_string(),
+            cx.pctx.into_inner(),
+            cx.st.into_inner(),
+            cx.module,
+        );
+        PlironModule {
+            obj: Vec::new(),
+            ir: String::new(),
+            asm: String::new(),
+            pending: Some(pending),
+        }
+    } else {
+        finish_module(&cx, cgu_name.as_str())
+    };
+    pliron_cfg::trace("*modgen*", tmod.elapsed().as_secs_f64() * 1e3, cgu_name.as_str());
     ModuleCodegen::new_regular(cgu_name.to_string(), m)
 }
 
@@ -537,7 +1720,10 @@ impl WriteBackendMethods for PlironCodegenBackend {
     type ThinData = ();
 
     fn supports_parallel(&self) -> bool {
-        false
+        // The jobserver-token worker pool schedules `optimize` items;
+        // each one runs our queued IR-opt + lowering for whichever CGU
+        // is runnable (see `cgupool`).
+        true
     }
 
     fn target_machine_factory(
@@ -549,55 +1735,133 @@ impl WriteBackendMethods for PlironCodegenBackend {
     }
 
     fn optimize_and_codegen_fat_lto(
-        _sess: &Session,
-        _cgcx: &CodegenContext,
-        _shared_emitter: &SharedEmitter,
+        sess: &Session,
+        cgcx: &CodegenContext,
+        shared_emitter: &SharedEmitter,
         _tm_factory: TargetMachineFactoryFn<Self>,
+        // No internalization yet: every symbol stays as visible as it was
+        // in its own object, and the final link's dead-stripping prunes.
         _exported_symbols_for_lto: &[String],
-        _each_linked_rlib_for_lto: &[PathBuf],
-        _modules: Vec<FatLtoInput<Self>>,
+        each_linked_rlib_for_lto: &[PathBuf],
+        modules: Vec<FatLtoInput<Self>>,
     ) -> CompiledModule {
-        unimplemented!("LTO is not supported by the pliron backend")
+        lto::fat(sess, cgcx, shared_emitter, each_linked_rlib_for_lto, modules)
     }
 
+    // r[impl par.facts.thin-claim]
     fn run_thin_lto(
         _cgcx: &CodegenContext,
         _prof: &SelfProfilerRef,
-        _dcx: DiagCtxtHandle<'_>,
+        _incr_comp_session: Option<&rustc_session::BorrowedIncrCompSession>,
+        dcx: DiagCtxtHandle<'_>,
         _exported_symbols_for_lto: &[String],
-        _each_linked_rlib_for_lto: &[PathBuf],
-        _modules: Vec<ThinLtoInput<Self>>,
+        each_linked_rlib_for_lto: &[PathBuf],
+        modules: Vec<ThinLtoInput<Self>>,
     ) -> (Vec<ThinModule<Self>>, Vec<WorkProduct>) {
-        unimplemented!("LTO is not supported by the pliron backend")
+        // Only thin-local, as the two-phase facts barrier
+        // (`PLIRON_XFACTS_ALL`): each module goes through unchanged, and
+        // `optimize_and_codegen_thin` runs its held stage B.
+        if !each_linked_rlib_for_lto.is_empty() {
+            dcx.fatal("cross-crate ThinLTO is not supported by the pliron backend (PLIRON_XFACTS_ALL only uses thin-local LTO)");
+        }
+        let mut bufs = Vec::new();
+        let mut names = Vec::new();
+        for m in modules {
+            match m {
+                ThinLtoInput::Red { name, buffer } => {
+                    names.push(std::ffi::CString::new(name).expect("module name"));
+                    bufs.push(buffer);
+                }
+                ThinLtoInput::Green { .. } => dcx.fatal(
+                    "PLIRON_XFACTS_ALL does not support incremental thin-local LTO (reused modules)",
+                ),
+            }
+        }
+        let shared = Arc::new(rustc_codegen_ssa::back::lto::ThinShared { data: (), modules: bufs, module_names: names });
+        let n = shared.modules.len();
+        ((0..n).map(|idx| ThinModule { shared: shared.clone(), idx }).collect(), Vec::new())
     }
 
     fn optimize(
         _cgcx: &CodegenContext,
-        _prof: &SelfProfilerRef,
-        _shared_emitter: &SharedEmitter,
-        _module: &mut ModuleCodegen<PlironModule>,
+        prof: &SelfProfilerRef,
+        shared_emitter: &SharedEmitter,
+        module: &mut ModuleCodegen<PlironModule>,
         _config: &ModuleConfig,
     ) {
+        let Some(key) = module.module_llvm.pending.take() else {
+            return;
+        };
+        let fin = if cgupool::holding() {
+            // Two-phase facts: stop after publish; the thin step finishes.
+            // The allocator shim is codegened outside the LTO barrier (and
+            // optimized before any CGU), so it finishes here, on prefix
+            // facts.
+            match cgupool::run_until_published(key, prof, shared_emitter) {
+                Some(f) => f,
+                None if module.kind == rustc_codegen_ssa::ModuleKind::Allocator => {
+                    cgupool::finish_held(key, false, prof, shared_emitter)
+                }
+                None => {
+                    module.module_llvm.pending = Some(key);
+                    return;
+                }
+            }
+        } else {
+            cgupool::run_until(key, prof, shared_emitter)
+        };
+        module.module_llvm.obj = fin.obj;
+        module.module_llvm.ir = fin.ir;
+        module.module_llvm.asm = fin.asm;
     }
 
     fn optimize_and_codegen_thin(
-        _cgcx: &CodegenContext,
-        _prof: &SelfProfilerRef,
-        _shared_emitter: &SharedEmitter,
+        cgcx: &CodegenContext,
+        prof: &SelfProfilerRef,
+        shared_emitter: &SharedEmitter,
         _tm_factory: TargetMachineFactoryFn<Self>,
-        _thin: ThinModule<Self>,
+        thin: ThinModule<Self>,
     ) -> CompiledModule {
-        unimplemented!("LTO is not supported by the pliron backend")
+        use rustc_codegen_ssa::back::lto::SerializedModule;
+        let data = match &thin.shared.modules[thin.idx] {
+            SerializedModule::Local(b) => b.0.as_slice(),
+            _ => unreachable!("thin-local LTO hands back only this crate's own modules"),
+        };
+        let module = if let Some(key) = pending_key(data) {
+            let fin = cgupool::finish_held(key, true, prof, shared_emitter);
+            PlironModule { obj: fin.obj, ir: fin.ir, asm: fin.asm, pending: None }
+        } else {
+            // Finished outright (not a pool participant): its object.
+            let p = lto::LtoPayload::decode(data).expect("thin-local module payload");
+            let obj = p.objects.into_iter().next().map(|o| o.bytes).unwrap_or_default();
+            PlironModule { obj, ir: String::new(), asm: String::new(), pending: None }
+        };
+        if pliron_cfg::env_set("PLIRON_THIN_DEBUG") {
+            eprintln!("thin: {} held={} obj={}B", thin.name(), pending_key(data).is_some(), module.obj.len());
+        }
+        let m = ModuleCodegen::new_regular(thin.name(), module);
+        Self::codegen(cgcx, prof, shared_emitter, m, &cgcx.module_config)
     }
 
+    // r[impl front.emit]
     fn codegen(
         cgcx: &CodegenContext,
-        _prof: &SelfProfilerRef,
-        _shared_emitter: &SharedEmitter,
+        prof: &SelfProfilerRef,
+        shared_emitter: &SharedEmitter,
         module: ModuleCodegen<PlironModule>,
         config: &ModuleConfig,
     ) -> CompiledModule {
         let outs = &cgcx.output_filenames;
+        let mut module = module;
+        // A module still held for the two-phase barrier (rustc skipped the
+        // thin step): finish it on the facts published so far, as the
+        // allocator shim is, rather than write its empty object.
+        if let Some(key) = module.module_llvm.pending.take() {
+            let fin = cgupool::finish_held(key, false, prof, shared_emitter);
+            module.module_llvm.obj = fin.obj;
+            module.module_llvm.ir = fin.ir;
+            module.module_llvm.asm = fin.asm;
+        }
         let emit_obj = config.emit_obj != EmitObj::None;
         if emit_obj {
             let path = outs.temp_path_for_cgu(OutputType::Object, &module.name);
@@ -612,11 +1876,25 @@ impl WriteBackendMethods for PlironCodegenBackend {
     }
 
     fn serialize_module(module: PlironModule, _is_thin: bool) -> PlironBuffer {
-        PlironBuffer(module.obj)
+        // Two-phase facts: a module held after publish travels as its key.
+        if let Some(key) = module.pending {
+            let mut b = PENDING_MAGIC.to_vec();
+            b.extend(key.to_le_bytes());
+            return PlironBuffer(b);
+        }
+        // Pre-LTO module files (incremental + -Clto): the object by value.
+        PlironBuffer(
+            lto::LtoPayload::new(vec![lto::LtoObject {
+                name: String::new(),
+                bytes: module.obj,
+            }])
+            .encode(),
+        )
     }
 }
 
 /// Entry point loaded by `-Zcodegen-backend=path/to/librustc_codegen_pliron.so`.
+// r[impl front.entry]
 #[unsafe(no_mangle)]
 pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     Box::new(PlironCodegenBackend)

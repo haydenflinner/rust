@@ -84,6 +84,7 @@ impl BlockCall {
     }
 
     /// Return the block for this BlockCall.
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     pub fn block(&self, pool: &ValueListPool) -> Block {
         let val = self.values.first(pool).unwrap();
         Self::value_to_block(val)
@@ -121,7 +122,13 @@ impl BlockCall {
         pool: &mut ValueListPool,
         mut f: F,
     ) {
-        for raw in self.values.as_mut_slice(pool)[1..].iter_mut() {
+        // PLIRON: a block call whose list the egraph freed (its inst left
+        // the layout) is empty; `resolve_all_aliases` walks every inst in
+        // the dfg, so skip it instead of indexing past the block slot.
+        let Some(args) = self.values.as_mut_slice(pool).get_mut(1..) else {
+            return;
+        };
+        for raw in args.iter_mut() {
             let new = f(BlockArg::decode_from_value(*raw));
             *raw = new.encode_as_value();
         }
@@ -231,6 +238,7 @@ impl BlockArg {
     }
 
     /// Decode a raw `Value` encoding of this block argument.
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     fn decode_from_value(v: Value) -> Self {
         let raw = v.as_u32();
         let tag = raw >> 30;
@@ -423,6 +431,7 @@ impl InstructionData {
     /// Get the destinations of this instruction, if it's a branch.
     ///
     /// `br_table` returns the empty slice.
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     pub fn branch_destination<'a>(
         &'a self,
         jump_tables: &'a ir::JumpTables,
@@ -445,6 +454,7 @@ impl InstructionData {
     /// Get a mutable slice of the destinations of this instruction, if it's a branch.
     ///
     /// `br_table` returns the empty slice.
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     pub fn branch_destination_mut<'a>(
         &'a mut self,
         jump_tables: &'a mut ir::JumpTables,

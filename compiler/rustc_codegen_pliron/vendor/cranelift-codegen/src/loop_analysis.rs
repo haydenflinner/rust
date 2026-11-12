@@ -24,6 +24,12 @@ entity_impl!(Loop, "loop");
 pub struct LoopAnalysis {
     loops: PrimaryMap<Loop, LoopData>,
     block_loop_map: SecondaryMap<Block, PackedOption<Loop>>,
+    // PLIRON (patch 46): Euler-tour intervals over the loop forest.
+    // `inner` is `lp` or a descendant iff `tin[lp] <= tin[inner] <
+    // tout[lp]`, so `is_in_loop` is O(1) — the opt pipeline calls it
+    // once per (loop, block) pair inside per-loop block filters.
+    tin: SecondaryMap<Loop, u32>,
+    tout: SecondaryMap<Loop, u32>,
     valid: bool,
 }
 
@@ -94,6 +100,8 @@ impl LoopAnalysis {
             valid: false,
             loops: PrimaryMap::new(),
             block_loop_map: SecondaryMap::new(),
+            tin: SecondaryMap::new(),
+            tout: SecondaryMap::new(),
         }
     }
 
@@ -126,14 +134,16 @@ impl LoopAnalysis {
             .filter(|&lp| self.loop_header(lp) == block)
     }
 
-    /// Determine if a Block belongs to a loop by running a finger along the loop tree.
+    /// Determine if a Block is in a loop.
     ///
     /// Returns `true` if `block` is in loop `lp`.
     pub fn is_in_loop(&self, block: Block, lp: Loop) -> bool {
-        let block_loop = self.block_loop_map[block];
-        match block_loop.expand() {
+        // PLIRON (patch 46): O(1) subtree-interval test — the upstream
+        // version ran a finger along the parent chain (O(loop depth)
+        // per query), and passes filter `layout.blocks()` per loop.
+        match self.block_loop_map[block].expand() {
             None => false,
-            Some(block_loop) => self.is_child_loop(block_loop, lp),
+            Some(inner) => self.tin[lp] <= self.tin[inner] && self.tin[inner] < self.tout[lp],
         }
     }
 
@@ -169,6 +179,7 @@ impl LoopAnalysis {
         self.find_loop_headers(cfg, domtree);
         self.discover_loop_blocks(cfg, domtree);
         self.assign_loop_levels();
+        self.assign_loop_intervals(); // PLIRON (patch 46)
         self.valid = true;
     }
 
@@ -187,6 +198,8 @@ impl LoopAnalysis {
     pub fn clear(&mut self) {
         self.loops.clear();
         self.block_loop_map.clear();
+        self.tin.clear();
+        self.tout.clear();
         self.valid = false;
     }
 
@@ -194,8 +207,12 @@ impl LoopAnalysis {
     // and thus is a loop header.
     fn is_block_loop_header(block: Block, cfg: &ControlFlowGraph, domtree: &DominatorTree) -> bool {
         // A block is a loop header if it dominates any of its predecessors.
+        // PLIRON: only reachable predecessors — pliron's pipeline computes
+        // loop analysis mid-pipeline, where steps can leave unreachable
+        // blocks jumping into loops (Cranelift's own pipeline strips them
+        // first). Dominance against an unreachable block is meaningless.
         cfg.pred_iter(block)
-            .any(|pred| domtree.block_dominates(block, pred.block))
+            .any(|pred| domtree.is_reachable(pred.block) && domtree.block_dominates(block, pred.block))
     }
 
     // Traverses the CFG in reverse postorder and create a loop object for every block having a
@@ -224,7 +241,8 @@ impl LoopAnalysis {
                 cfg.pred_iter(self.loops[lp].header)
                     .filter(|pred| {
                         // We follow the back edges
-                        domtree.block_dominates(self.loops[lp].header, pred.block)
+                        domtree.is_reachable(pred.block)
+                            && domtree.block_dominates(self.loops[lp].header, pred.block)
                     })
                     .map(|pred| pred.block),
             );
@@ -272,7 +290,16 @@ impl LoopAnalysis {
                 // Now we have handled the popped node and need to continue the DFS by adding the
                 // predecessors of that node
                 if let Some(continue_dfs) = continue_dfs {
-                    stack.extend(cfg.pred_iter(continue_dfs).map(|pred| pred.block));
+                    // PLIRON: don't climb into unreachable predecessors
+                    // (see `is_block_loop_header`): their loop/parent links
+                    // can close a cycle, and `assign_loop_levels` /
+                    // the parent chase above then never terminate
+                    // (rustlantis seed 1776 hung in postinc2's analysis).
+                    stack.extend(
+                        cfg.pred_iter(continue_dfs)
+                            .map(|pred| pred.block)
+                            .filter(|&b| domtree.is_reachable(b)),
+                    );
                 }
             }
         }
@@ -295,6 +322,44 @@ impl LoopAnalysis {
                         self.loops[lp].level = LoopLevel::root().inc();
                         stack.pop();
                     }
+                }
+            }
+        }
+    }
+
+    // PLIRON (patch 46): one DFS numbering over the whole loop forest.
+    // A loop's descendants occupy a contiguous `tin` range, so
+    // `tin[lp] <= tin[x] < tout[lp]` iff `x` is `lp` or nested inside it.
+    fn assign_loop_intervals(&mut self) {
+        self.tin.clear();
+        self.tout.clear();
+        // Child lists keyed by parent (roots have none).
+        let mut children: SecondaryMap<Loop, Vec<Loop>> = SecondaryMap::new();
+        for lp in self.loops.keys() {
+            if let Some(parent) = self.loops[lp].parent.expand() {
+                children[parent].push(lp);
+            }
+        }
+        let mut tick = 0u32;
+        // Iterative DFS: (loop, next child index) frames.
+        let mut stack: Vec<(Loop, usize)> = Vec::new();
+        for lp in self.loops.keys() {
+            if self.loops[lp].parent.is_some() {
+                continue;
+            }
+            self.tin[lp] = tick;
+            tick += 1;
+            stack.push((lp, 0));
+            while let Some(&(node, ci)) = stack.last() {
+                if ci < children[node].len() {
+                    let child = children[node][ci];
+                    stack.last_mut().unwrap().1 += 1;
+                    self.tin[child] = tick;
+                    tick += 1;
+                    stack.push((child, 0));
+                } else {
+                    self.tout[node] = tick;
+                    stack.pop();
                 }
             }
         }

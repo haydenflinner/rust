@@ -2,7 +2,7 @@
 
 // Pull in the ISLE generated code.
 pub mod generated_code;
-use generated_code::{Context, ImmExtend};
+use generated_code::{ALUOp, CondResult, Context, ImmExtend, ProducesFlags};
 
 // Types that the generated ISLE code uses via `use super::*`.
 use super::{
@@ -33,6 +33,7 @@ use crate::{
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use crate::FxHashSet;
 use regalloc2::PReg;
 
 type BoxCallInfo = Box<CallInfo<ExternalName>>;
@@ -65,6 +66,554 @@ pub(crate) fn lower_branch(
     // internal heap allocations.
     let mut isle_ctx = IsleContext { lower_ctx, backend };
     generated_code::constructor_lower_branch(&mut isle_ctx, branch, targets)
+}
+
+/// PLIRON: the `val_already_extended` oracle for `Uext`, from Rust.
+pub(crate) fn val_uext_clean(lower_ctx: &mut Lower<MInst>, backend: &AArch64Backend, val: Value) -> bool {
+    let mut isle_ctx = IsleContext { lower_ctx, backend };
+    generated_code::constructor_val_already_extended(&mut isle_ctx, &ArgumentExtension::Uext, val)
+        == Some(true)
+}
+
+/// PLIRON: `PLIRON_NARROWEXT` (default on; `=0` off) turns on the extra
+/// narrow-int cleanliness facts (`narrowext_clean`) and the rules that
+/// consume them: skipping the return-value `uxtb`/`uxth`, `uextend`
+/// passthrough, `cbnz` on a clean narrow `brif`, and `band (ireduce x) k`
+/// reading `x` directly.
+pub(crate) fn narrowext_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_NARROWEXT").as_deref() != Ok("0"))
+}
+
+/// PLIRON: one `PLIRON_NARROWEXT` user, by bit, for bisecting:
+/// 1 = the extra cleanliness facts, 2 = return extension (the ABI
+/// `uext`-on-retval skip and the `ret (ireduce)` source sink, both via
+/// `narrow_ret_uext_clean`), 4 = `uextend`
+/// passthrough, 8 = `cbnz` on a clean byte, 16 = `band (ireduce x) k`,
+/// 32 = narrow `ushr`-of-clean and `ushr`-operand fusion on narrow
+/// `bor`/`band`/`bxor`, 64 = narrow `ireduce` passthrough when the wide
+/// source is already clean (`wide_uext_clean`), 128 = `ireduce` source
+/// fusions (`ushr`+`ireduce` → `ubfm`, `load`+`ireduce` → narrow `uload`,
+/// `istore8`/`store` of `ireduce` → store the wide reg), 256 = `ireduce`
+/// consumer sinks: `ushr` by a constant → `ubfx` on the wide register,
+/// chained narrow `ireduce`s extend once, and `select` arms read the
+/// wide source directly (the low bits are exact and the result is
+/// modelled dirty anyway), 512 = call-arg `uext` skip
+/// (`narrow_arg_uext_clean`: a clean narrow operand needs no
+/// `uxtb`/`uxth` at the call site, mirroring the return path), 1024 =
+/// narrow `icmp` of `iadd`/`isub`-by-constant against a constant: drop
+/// the operand's `uxtb`/`uxth` by rolling the constant (eq/ne) or by
+/// comparing the unmasked 32-bit result when the wrapped/unwrapped
+/// orderings agree (`narrow_addsub_cmp`), and the same unsigned-bound
+/// fold on `br_table` indices (`btsub_imm`), 2048 = cleanliness of
+/// blockparams (proven clean when every incoming blockcall arg is
+/// clean — `build_clean_blockparams`' greatest-fixpoint sweep) and of
+/// call results whose signature return slot declares `uext`.
+/// `PLIRON_NARROWEXT_MASK` (default all) selects which are live.
+pub(crate) fn narrowext_part(bit: u64) -> bool {
+    static MASK: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    narrowext_enabled()
+        && *MASK.get_or_init(|| {
+            std::env::var("PLIRON_NARROWEXT_MASK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(u64::MAX)
+        }) & bit
+            != 0
+}
+
+/// PLIRON: is the register of `v` (an i8/i16 value) zero-extended through
+/// all 64 bits? Covers the producers `val_already_extended` leaves out:
+/// canonical narrow `iconst` (materialized by `movz` or a masked constant
+/// load), `band` with a clean operand, `bor`/`bxor` with two clean operands
+/// (all three lower to exact 32-bit `and`/`orr`/`eor`; the `bic`/`orn`/`eon`
+/// forms only match through a `bnot` operand, which is never clean),
+/// blockparams in `params` (`build_clean_blockparams` proves them clean
+/// from every incoming edge arg), call results whose signature declares a
+/// zero-extended return, plus the existing leaf cases so the recursion
+/// sees through them. `budget` bounds the walk; running out answers
+/// "dirty".
+pub(crate) fn narrow_uext_clean(
+    lctx: &Lower<'_, MInst>,
+    v: Value,
+    budget: &mut u32,
+    params: &FxHashSet<Value>,
+) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    let dfg = lctx.dfg();
+    let ty = dfg.value_type(v);
+    let mask: u64 = match ty {
+        I8 => 0xff,
+        I16 => 0xffff,
+        _ => return false,
+    };
+    let def = dfg.value_def(v);
+    if let crate::ir::ValueDef::Param(..) = def {
+        return params.contains(&v);
+    }
+    let Some(inst) = def.inst() else {
+        return false;
+    };
+    match &dfg.insts[inst] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => (imm.bits() as u64) <= mask,
+        InstructionData::IntCompare { .. } | InstructionData::FloatCompare { .. } => true,
+        InstructionData::Unary {
+            opcode: Opcode::Uextend | Opcode::Ireduce | Opcode::BlackBox,
+            ..
+        } => true,
+        InstructionData::Load {
+            opcode: Opcode::Load | Opcode::Uload8,
+            ..
+        } => true,
+        InstructionData::Binary {
+            opcode: Opcode::Band,
+            args,
+        } => {
+            let [a, b] = *args;
+            narrow_uext_clean(lctx, b, budget, params)
+                || narrow_uext_clean(lctx, a, budget, params)
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Bor | Opcode::Bxor,
+            args,
+        } => {
+            let [a, b] = *args;
+            narrow_uext_clean(lctx, a, budget, params)
+                && narrow_uext_clean(lctx, b, budget, params)
+        }
+        // A call result is clean when this return slot's ABI declares
+        // unsigned extension (`call_signature` covers `call`,
+        // `call_indirect`, and the `try_call` pair; `try_call` return
+        // values are `ValueDef::Result`s of the try_call).
+        InstructionData::Call { .. }
+        | InstructionData::CallIndirect { .. }
+        | InstructionData::TryCall { .. }
+        | InstructionData::TryCallIndirect { .. } => {
+            narrowext_part(2048)
+                && dfg
+                    .call_signature(inst)
+                    .and_then(|sig| dfg.signatures[sig].returns.get(def.num()))
+                    .map(|p| p.extension == ArgumentExtension::Uext)
+                    .unwrap_or(false)
+        }
+        // A narrow `ushr`'s register is clean either way: the default
+        // lowering zero-extends the operand first, and the clean-operand
+        // rule (`ushr_clean_narrow`) shifts an already-narrow register.
+        InstructionData::Binary {
+            opcode: Opcode::Ushr,
+            ..
+        } => true,
+        // `ishl v, k` on extended operands computes `(v & mask) << k`;
+        // the register is clean only when `v`'s bits at and above
+        // `bits - k` are known zero (`bool << 5`, the lowercase-bit
+        // idiom, is the common case).
+        InstructionData::Binary {
+            opcode: Opcode::Ishl,
+            args: [a, k],
+        } => {
+            let Some(k) = iconst_bits(dfg, *k) else {
+                return false;
+            };
+            let bits = ty.bits() as u64;
+            if k >= bits {
+                return false;
+            }
+            let keep = bits - k;
+            (bf_known_zero(dfg, *a, budget) >> keep) == (u64::MAX >> keep)
+        }
+        _ => false,
+    }
+}
+
+/// PLIRON: blockparams whose every incoming blockcall arg is provably
+/// narrow-clean — O(E) per pass, converging in a few passes, memoized
+/// in `Lower::narrow_clean_params`.
+///
+/// Greatest-fixpoint direction: start from all params assumed clean and
+/// evict any param with an edge arg that fails under the assumption,
+/// to a fixpoint. The converged set is sound by coinduction — for every
+/// survivor, every edge arg is clean given that all survivors' regs are
+/// clean, so induction over any execution trace keeps them clean —
+/// and it proves self-sustaining cases a grow-direction pass cannot,
+/// like loop-carried `y = phi(clean, band(y, k))`. Intermediate sets
+/// are NOT sound, so on the (unrealistic) non-convergence cap the
+/// result is thrown away rather than shipped half-proven.
+fn build_clean_blockparams(lctx: &Lower<'_, MInst>) -> FxHashSet<Value> {
+    let f = lctx.f;
+    let dfg = &f.dfg;
+    let mut edges: Vec<(Value, Option<Value>)> = Vec::new();
+    let mut prev: FxHashSet<Value> = FxHashSet::default();
+    for block in f.layout.blocks() {
+        for p in dfg.block_params(block) {
+            if matches!(dfg.value_type(*p), I8 | I16) {
+                prev.insert(*p);
+            }
+        }
+        let Some(term) = f.layout.last_inst(block) else {
+            continue;
+        };
+        for bc in dfg.insts[term].branch_destination(&dfg.jump_tables, &dfg.exception_tables) {
+            let target = bc.block(&dfg.value_lists);
+            for (i, arg) in bc.args(&dfg.value_lists).enumerate() {
+                if let Some(&p) = dfg.block_params(target).get(i) {
+                    edges.push((p, arg.as_value()));
+                }
+            }
+        }
+    }
+    // Entry params whose signature arg doesn't declare uext can be
+    // dirty in the register; evict them up front rather than assume.
+    if let Some(entry) = f.layout.entry_block() {
+        for (i, p) in dfg.block_params(entry).iter().enumerate() {
+            if !f
+                .signature
+                .params
+                .get(i)
+                .map(|a| a.extension == ArgumentExtension::Uext)
+                .unwrap_or(false)
+            {
+                prev.remove(p);
+            }
+        }
+    }
+    for _ in 0..16 {
+        let mut next = prev.clone();
+        let mut dirty = FxHashSet::default();
+        for &(p, arg) in &edges {
+            if dirty.contains(&p) {
+                continue;
+            }
+            let ok = match arg {
+                Some(av) => {
+                    let mut budget = 8;
+                    narrow_uext_clean(lctx, av, &mut budget, &prev)
+                }
+                None => false,
+            };
+            if !ok {
+                next.remove(&p);
+                dirty.insert(p);
+            }
+        }
+        if next == prev {
+            return next;
+        }
+        prev = next;
+    }
+    FxHashSet::default()
+}
+
+/// PLIRON: bits of `v` known zero — a bounded known-bits walk for the
+/// `bfi` fusion (`y | field` lowers to `bfm` only when `y`'s field bits
+/// are all provably zero). Answers a `u64` mask; a miss returns 0
+/// (nothing known), never a wrong bit. Only low-bandwidth producers are
+/// followed; `budget` bounds the walk.
+fn bf_known_zero(dfg: &crate::ir::DataFlowGraph, v: Value, budget: &mut u32) -> u64 {
+    if *budget == 0 {
+        return 0;
+    }
+    *budget -= 1;
+    let ty = dfg.value_type(v);
+    let Some(inst) = dfg.value_def(v).inst() else {
+        return 0;
+    };
+    match &dfg.insts[inst] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => !imm.bits() as u64,
+        InstructionData::Binary {
+            opcode: Opcode::Band,
+            args: [a, b],
+        } => bf_known_zero(dfg, *a, budget) | bf_known_zero(dfg, *b, budget),
+        InstructionData::Binary {
+            opcode: Opcode::Bor | Opcode::Bxor,
+            args: [a, b],
+        } => bf_known_zero(dfg, *a, budget) & bf_known_zero(dfg, *b, budget),
+        InstructionData::Binary {
+            opcode: Opcode::Ishl,
+            args: [a, k],
+        } => {
+            let Some(k) = iconst_bits(dfg, *k) else {
+                return 0;
+            };
+            if k >= 64 {
+                return !0u64;
+            }
+            (bf_known_zero(dfg, *a, budget) << k) | ((1u64 << k) - 1)
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Ushr,
+            args: [a, k],
+        } => {
+            let Some(k) = iconst_bits(dfg, *k) else {
+                return 0;
+            };
+            let tz = ty.bits().min(64) as u64;
+            if k >= tz {
+                return !0u64;
+            }
+            (bf_known_zero(dfg, *a, budget) >> k) | (!0u64 << (tz - k))
+        }
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => {
+            let from = dfg.value_type(*arg).bits() as u64;
+            if from >= 64 {
+                return 0;
+            }
+            (!0u64 << from) | (bf_known_zero(dfg, *arg, budget) & ((1u64 << from) - 1))
+        }
+        // Load width, not result width: `uload8.i64` leaves 56 clean
+        // high bits.
+        InstructionData::Load {
+            opcode: Opcode::Uload8,
+            ..
+        } => !0u64 << 8,
+        InstructionData::Load {
+            opcode: Opcode::Uload16,
+            ..
+        } => !0u64 << 16,
+        InstructionData::Load {
+            opcode: Opcode::Uload32,
+            ..
+        } => !0u64 << 32,
+        InstructionData::IntCompare { .. } | InstructionData::FloatCompare { .. } => !1u64,
+        InstructionData::Unary {
+            opcode: Opcode::Ireduce | Opcode::BlackBox,
+            arg,
+        } => bf_known_zero(dfg, *arg, budget),
+        _ => 0,
+    }
+}
+
+/// PLIRON: bits of `v`'s register above `bits` are all zero — the wide
+/// operand of a narrow `ireduce` that needs no `uxtb`/`uxth` of its own
+/// (`PLIRON_NARROWEXT` bit 64). `narrow_uext_clean` answers this at the
+/// value's own i8/i16 width; this answers it for the wider (i16/i32/i64)
+/// sources. `budget` bounds the walk; running out answers "dirty".
+pub(crate) fn wide_uext_clean(
+    dfg: &crate::ir::DataFlowGraph,
+    v: Value,
+    bits: u32,
+    budget: &mut u32,
+) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    if dfg.value_type(v).bits() <= bits {
+        return false;
+    }
+    let Some(inst) = dfg.value_def(v).inst() else {
+        return false;
+    };
+    match &dfg.insts[inst] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => (imm.bits() as u64) >> bits == 0,
+        InstructionData::IntCompare { .. } | InstructionData::FloatCompare { .. } => true,
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => {
+            dfg.value_type(*arg).bits() <= bits
+                || wide_uext_clean(dfg, *arg, bits, budget)
+        }
+        // A narrow `ireduce`/`black_box` materializes `uxtb`/`uxth`, so the
+        // register is clean at the value's own width; clean above a smaller
+        // `bits` only when the source already is.
+        InstructionData::Unary {
+            opcode: Opcode::Ireduce | Opcode::BlackBox,
+            arg,
+        } => wide_uext_clean(dfg, *arg, bits, budget),
+        InstructionData::Binary {
+            opcode: Opcode::Band,
+            args,
+        } => {
+            let [a, b] = *args;
+            wide_uext_clean(dfg, a, bits, budget) || wide_uext_clean(dfg, b, bits, budget)
+        }
+        InstructionData::Binary {
+            opcode: Opcode::Bor | Opcode::Bxor,
+            args,
+        } => {
+            let [a, b] = *args;
+            wide_uext_clean(dfg, a, bits, budget) && wide_uext_clean(dfg, b, bits, budget)
+        }
+        // `x >> k` with a constant `k` leaves `ty_bits - k` live bits; the
+        // whole register is clean when that fits under `bits`.
+        InstructionData::Binary {
+            opcode: Opcode::Ushr,
+            args,
+        } => {
+            let [x, k] = *args;
+            let _ = x;
+            let Some(k) = iconst_bits(dfg, k) else {
+                return false;
+            };
+            let ty_bits = dfg.value_type(v).bits() as u64;
+            k < ty_bits && ty_bits - k <= bits as u64
+        }
+        InstructionData::Ternary {
+            opcode: Opcode::Select | Opcode::SelectSpectreGuard,
+            args,
+        } => {
+            let [_, a, b] = *args;
+            wide_uext_clean(dfg, a, bits, budget) && wide_uext_clean(dfg, b, bits, budget)
+        }
+        _ => false,
+    }
+}
+
+fn iconst_bits(dfg: &crate::ir::DataFlowGraph, v: Value) -> Option<u64> {
+    let inst = dfg.value_def(v).inst()?;
+    if let InstructionData::UnaryImm {
+        opcode: Opcode::Iconst,
+        imm,
+    } = &dfg.insts[inst]
+    {
+        Some(imm.bits() as u64)
+    } else {
+        None
+    }
+}
+
+/// `(1<<w)-1` → `w`, when `1 <= w < bits`.
+fn bf_low_w(bits: u32, m: u64) -> Option<u32> {
+    let w = m.checked_add(1)?.trailing_zeros();
+    (w >= 1 && w < bits && (1u64 << w) - 1 == m).then_some(w)
+}
+
+/// `((1<<w)-1) << k` → `w`, when `k >= 1`.
+fn bf_field_w(bits: u32, m: u64, k: u64) -> Option<u32> {
+    if k == 0 || k >= bits as u64 {
+        return None;
+    }
+    let mm = m >> k;
+    if mm.checked_shl(k as u32)? != m {
+        return None;
+    }
+    bf_low_w(bits, mm)
+}
+
+/// PLIRON: does `cond` hold under the NZCV bit pattern `bits`
+/// (n<<3|z<<2|c<<1|v)? Used by `nzcv_for_cond` to pick the `ccmp`
+/// constant-NZCV operand.
+fn eval_cond(cond: Cond, bits: u32) -> bool {
+    let (n, z, c, v) = (bits & 8 != 0, bits & 4 != 0, bits & 2 != 0, bits & 1 != 0);
+    match cond {
+        Cond::Eq => z,
+        Cond::Ne => !z,
+        Cond::Hs => c,
+        Cond::Lo => !c,
+        Cond::Mi => n,
+        Cond::Pl => !n,
+        Cond::Vs => v,
+        Cond::Vc => !v,
+        Cond::Hi => c && !z,
+        Cond::Ls => !c || z,
+        Cond::Ge => n == v,
+        Cond::Lt => n != v,
+        Cond::Gt => !z && n == v,
+        Cond::Le => z || n != v,
+        Cond::Al => true,
+        Cond::Nv => false,
+    }
+}
+
+/// PLIRON (`PLIRON_CCMP`, default on): fuse integer-compare bool
+/// combinations into `cmp; ccmp` flag chains — see the `ccmp_*`
+/// comment block in inst.isle.
+fn ccmp_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_CCMP").as_deref() != Ok("0"))
+}
+
+/// An NZCV constant that makes `cond` evaluate to `value` — the
+/// `ccmp` immediate forcing the fused result when the primary
+/// comparison's condition didn't hold. `None` when no flag state
+/// yields `value` (`al` forced false / `nv` forced true).
+fn nzcv_for_cond(cond: &Cond, value: bool) -> Option<NZCV> {
+    (0..16)
+        .map(|bits| NZCV::new(bits & 8 != 0, bits & 4 != 0, bits & 2 != 0, bits & 1 != 0))
+        .find(|nzcv| eval_cond(*cond, nzcv.bits()) == value)
+}
+
+/// Try the two compares in both primary/secondary orders — `band`
+/// and `bor` operands have no canonical order, and the secondary's
+/// operands must be 32/64-bit (`ccmp` reg/reg form).
+fn ccmp_pair(
+    ctx: &mut IsleContext<'_, '_, MInst, AArch64Backend>,
+    mode: u8,
+    cc_a: &IntCC,
+    x: Value,
+    y: Value,
+    cc_b: &IntCC,
+    u: Value,
+    v: Value,
+) -> Option<CondResult> {
+    let cr_a = generated_code::constructor_emit_icmp(ctx, cc_a, x, y);
+    if let Some(cr) = ccmp_chain(ctx, mode, &cr_a, cc_b, u, v) {
+        return Some(cr);
+    }
+    let cr_b = generated_code::constructor_emit_icmp(ctx, cc_b, u, v);
+    ccmp_chain(ctx, mode, &cr_b, cc_a, x, y)
+}
+
+/// Build `cmp_primary; ccmp u,v,#nzcv,guard` as one flag chain whose
+/// final condition is the secondary compare's. Declines when the
+/// primary isn't a single flag-producing instruction (the
+/// `ProducesFlags` enum can't express chains longer than two) or the
+/// secondary operands aren't 32/64-bit.
+fn ccmp_chain(
+    ctx: &mut IsleContext<'_, '_, MInst, AArch64Backend>,
+    mode: u8,
+    cr: &CondResult,
+    cc_b: &IntCC,
+    u: Value,
+    v: Value,
+) -> Option<CondResult> {
+    let (flags_a, cond_a) = match cr {
+        CondResult::Cond {
+            flags: ProducesFlags::ProducesFlagsSideEffect { inst },
+            cond,
+        } => (inst.clone(), *cond),
+        _ => return None,
+    };
+    let size = match ctx.value_type(u) {
+        I32 => OperandSize::Size32,
+        I64 => OperandSize::Size64,
+        _ => return None,
+    };
+    let cond_b = ctx.cond_code(cc_b);
+    let nzcv = nzcv_for_cond(&cond_b, mode & 2 != 0)?;
+    let guard = if mode & 1 != 0 {
+        cond_a.invert()
+    } else {
+        cond_a
+    };
+    Some(CondResult::Cond {
+        flags: ProducesFlags::ProducesFlagsTwiceSideEffect {
+            inst1: flags_a,
+            inst2: MInst::CCmp {
+                size,
+                rn: ctx.put_in_reg(u),
+                rm: ctx.put_in_reg(v),
+                nzcv,
+                cond: guard,
+            },
+        },
+        cond: cond_b,
+    })
 }
 
 pub struct ExtendedValue {
@@ -272,6 +821,36 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         if shiftee_bits <= u8::MAX as usize {
             let shiftimm = shiftimm.mask(shiftee_bits as u8);
             Some(ShiftOpAndAmt::new(ShiftOp::ASR, shiftimm))
+        } else {
+            None
+        }
+    }
+
+    // PLIRON: `imul` by `2^n + 1` / `2^n - 1` strength reduction — the shift
+    // amount `n` when `c` has that form and the shift fits the operand's
+    // register width (`bits < 32` ops run as 32-bit regs).
+    fn imul_pow2p1_shamt(&mut self, ty: Type, c: u64) -> Option<u8> {
+        let bits = ty_bits(ty);
+        let c = if bits < 64 { c & ((1u64 << bits) - 1) } else { c };
+        let n = c.checked_sub(1)?.trailing_zeros();
+        (n > 0 && n < bits.max(32) as u32 && (1u64 << n) + 1 == c).then_some(n as u8)
+    }
+
+    fn imul_pow2m1_shamt(&mut self, ty: Type, c: u64) -> Option<u8> {
+        let bits = ty_bits(ty);
+        let c = if bits < 64 { c & ((1u64 << bits) - 1) } else { c };
+        let n = c.checked_add(1)?.trailing_zeros();
+        (n > 1 && n < bits.max(32) as u32 && (1u64 << n).checked_sub(1) == Some(c))
+            .then_some(n as u8)
+    }
+
+    // PLIRON: ROR operand for the logical (shifted register) fold below.
+    fn rotr_from_u64(&mut self, ty: Type, n: u64) -> Option<ShiftOpAndAmt> {
+        let shiftimm = ShiftOpShiftImm::maybe_from_shift(n)?;
+        let shiftee_bits = ty_bits(ty);
+        if shiftee_bits <= u8::MAX as usize {
+            let shiftimm = shiftimm.mask(shiftee_bits as u8);
+            Some(ShiftOpAndAmt::new(ShiftOp::ROR, shiftimm))
         } else {
             None
         }
@@ -765,6 +1344,21 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         }
     }
 
+    fn vec_rotate_imm4_from_immediate(&mut self, imm: Immediate) -> Option<u8> {
+        let bytes = self.lower_ctx.get_immediate_data(imm).as_slice();
+        let n = bytes[0];
+        if n < 16
+            && bytes
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == (n.wrapping_add(i as u8)) % 16)
+        {
+            Some(n)
+        } else {
+            None
+        }
+    }
+
     fn shuffle_dup8_from_imm(&mut self, imm: Immediate) -> Option<u8> {
         let bytes = self.lower_ctx.get_immediate_data(imm).as_slice();
         if bytes.iter().all(|b| *b == bytes[0]) && bytes[0] < 16 {
@@ -830,6 +1424,16 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         SImm9::maybe_from_i64(val)
     }
 
+    /// PLIRON: see `amode_fold_ok` in `inst.isle`. `PLIRON_BIGOFF=0` disables.
+    fn amode_fold_ok(&mut self, ty: Type, off: i32) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("PLIRON_BIGOFF").as_deref() != Ok("0")) {
+            return true;
+        }
+        let off = i64::from(off);
+        SImm9::maybe_from_i64(off).is_some() || UImm12Scaled::maybe_from_i64(off, ty).is_some()
+    }
+
     fn uimm12_scaled_from_i64(&mut self, val: i64, ty: Type) -> Option<UImm12Scaled> {
         UImm12Scaled::maybe_from_i64(val, ty)
     }
@@ -841,6 +1445,396 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             return None;
         }
         UImm12Scaled::maybe_from_i64(val, ty)
+    }
+
+    /// PLIRON: may a multi-use `iadd` load/store base stay whole in the amode
+    /// instead of being decomposed into reg+reg? Free when the sum is needed
+    /// as a value anyway; bounded for small all-address fanout under a
+    /// block-pressure cutoff (see `Lower::amode_shareable`).
+    /// `PLIRON_AMODESHARE=0` disables.
+    fn amode_share_ok(&mut self, val: Value) -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("PLIRON_AMODESHARE").as_deref() != Ok("0"))
+            && self.lower_ctx.amode_shareable(val)
+    }
+
+    /// PLIRON: `PLIRON_CARRYCINC` (default on), see `lower.isle`.
+    fn carry_cinc_on(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_CARRYCINC").as_deref() != Ok("0"))
+    }
+
+    /// PLIRON (`PLIRON_CINC`, opt-in): `x + (a cc b ? 1 : 0)` —
+    /// `cmp a, b; csinc x, x, !cc` (LLVM's `cinc`) instead of
+    /// `cmp; cset; add`. Declines to the plain `add` when off, when
+    /// the `icmp` has other uses (its `cset` still materializes
+    /// there, so the fused `cmp` is a second compare for nothing),
+    /// or when the compare didn't produce a single flag-setting
+    /// inst.
+    fn iadd_cinc_for(
+        &mut self,
+        ty: Type,
+        x: Value,
+        y: Value,
+        cc: &IntCC,
+        a: Value,
+        b: Value,
+    ) -> InstOutput {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var("PLIRON_CINC").as_deref() == Ok("1"))
+            && !self.lower_ctx.value_has_multiple_uses(y)
+            && let CondResult::Cond {
+                flags: ProducesFlags::ProducesFlagsSideEffect { inst },
+                cond,
+            } = generated_code::constructor_emit_icmp(self, cc, a, b)
+        {
+            self.lower_ctx.emit(inst);
+            let rx = self.put_in_reg(x);
+            let dst = self.lower_ctx.alloc_tmp(I64).only_reg().unwrap();
+            // `csinc c, x, x` is `c ? x : x+1`, so inverting `cond`
+            // gives `cc ? x+1 : x`.
+            self.lower_ctx.emit(MInst::CSInc {
+                rd: dst,
+                cond: cond.invert(),
+                rn: rx,
+                rm: rx,
+            });
+            return generated_code::constructor_output_reg(self, dst.to_reg());
+        }
+        let rx = self.put_in_reg(x);
+        let ry = self.put_in_reg(y);
+        let r = generated_code::constructor_add(self, ty, rx, ry);
+        generated_code::constructor_output_reg(self, r)
+    }
+
+    /// PLIRON: may a constant rotate be folded into a logic op's shifted
+    /// operand? Only when it has a single use (see `rot_fold_ok` in
+    /// `lower.isle`); `PLIRON_RORFOLD_MULTI=1` folds multi-use rotates too.
+    fn rot_fold_ok(&mut self, val: Value) -> bool {
+        static MULTI: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *MULTI.get_or_init(|| std::env::var("PLIRON_RORFOLD_MULTI").as_deref() == Ok("1"))
+            || !self.lower_ctx.value_has_multiple_uses(val)
+    }
+
+    /// PLIRON: `PLIRON_TBNZ_IREDUCE=0` off (default on), see `lower.isle`.
+    fn tbnz_ireduce_on(&mut self, _bit: u64) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_TBNZ_IREDUCE").as_deref() != Ok("0"))
+    }
+
+    fn narrowext_on(&mut self, bit: u64) -> bool {
+        narrowext_part(bit)
+    }
+
+    /// PLIRON (`PLIRON_NARROWEXT` bit 1024): a narrow `icmp` of
+    /// `isub c, j` / `iadd c, j` (iconst `j`) against iconst `k` can often
+    /// drop the operand's `uxtb`/`uxth`, because the wrapped and
+    /// unwrapped 32-bit results order identically against `k`. Returns:
+    ///   `C`   — compare `c` itself against the rolled constant `k2`
+    ///           (eq/ne: `(c ∓ j) mod W == k  ⟺  c == (k ± j) mod W`);
+    ///           `put_in_reg_ext32_maybe` covers a dirty `c`.
+    ///   `Sub` — compare the `isub` result itself: unmasked `c-j` ∈
+    ///           [-j, W-1-j] orders the same as the masked result
+    ///           against `k` iff `j + k' ≤ W` (`k'` = k for lt/ge,
+    ///           k+1 for le/gt) — wrapped negatives are unsigned-huge
+    ///           and the masked range [W-j, W) must all fail.
+    ///   `Rewrite` — `iadd c, j` with j ≥ W/2 is `isub c, W-j` in the
+    ///           masked type: emit `sub c, s` (`s` = W-j) and compare
+    ///           unmasked; needs `k' ≤ j` so the no-wrap masked range
+    ///           [j, W) all fails the compare.
+    /// `put_in_reg_uext_narrow_maybe` widens a dirty `c` before the
+    /// sub/cmp, so the bounds are checked against `c & mask` either
+    /// way — no cleanliness precondition.
+    fn narrow_addsub_cmp(
+        &mut self,
+        op: u64,
+        cc: &IntCC,
+        ty: Type,
+        _c: Value,
+        j: u64,
+        k: u64,
+    ) -> Option<generated_code::NarrowAddsubCmp> {
+        use crate::ir::condcodes::IntCC::*;
+        use generated_code::NarrowAddsubCmp as R;
+        if !narrowext_part(1024) || ty.bits() > 16 {
+            return None;
+        }
+        let w = 1u64 << ty.bits();
+        let mask = w - 1;
+        // Narrow `iconst`s store sign-extended bits (`iconst.i8 -9`);
+        // the modular arithmetic wants the truncated value.
+        let j = j & mask;
+        let k = k & mask;
+        // Everything emitted is an imm12.
+        if k > 0xfff {
+            return None;
+        }
+        match (op, cc) {
+            (0, Equal) | (0, NotEqual) => {
+                let k2 = k.wrapping_add(j) & mask;
+                (k2 <= 0xfff).then_some(R::C { k2 })
+            }
+            (1, Equal) | (1, NotEqual) => {
+                let k2 = k.wrapping_sub(j) & mask;
+                (k2 <= 0xfff).then_some(R::C { k2 })
+            }
+            (0, UnsignedLessThan) | (0, UnsignedGreaterThanOrEqual) if j + k <= w => {
+                (j <= 0xfff).then_some(R::Sub { j, k2: k })
+            }
+            (0, UnsignedLessThanOrEqual) | (0, UnsignedGreaterThan) if j + k + 1 <= w => {
+                (j <= 0xfff).then_some(R::Sub { j, k2: k })
+            }
+            (1, UnsignedLessThan) | (1, UnsignedGreaterThanOrEqual) if j >= w / 2 && k <= j => {
+                (w - j <= 0xfff).then_some(R::Rewrite { s: w - j, k2: k })
+            }
+            (1, UnsignedLessThanOrEqual) | (1, UnsignedGreaterThan)
+                if j >= w / 2 && k + 1 <= j =>
+            {
+                (w - j <= 0xfff).then_some(R::Rewrite { s: w - j, k2: k })
+            }
+            _ => None,
+        }
+    }
+
+    /// PLIRON (`PLIRON_NARROWEXT` bit 1024): the `br_table` bounds
+    /// check `uextend((c - s) mod W) <u N` partitions identically to
+    /// the unmasked `sub w, c, s` unsigned compare when `s + N <= W` —
+    /// no-wrap cases compare equal, wrapped cases produce masked values
+    /// in `[W-s, W)` (all `>= N`) while the unmasked result is
+    /// unsigned-huge (also `>= N`), and the surviving index is the
+    /// correct `c - s`. `op` 0 = `isub c, j` (`s` = j); 1 =
+    /// `iadd c, j`, accepted only when `j` is a negative narrow
+    /// constant (`s` = W-j) — a positive `iadd` wraps masked indices
+    /// back below `N` and cannot fold. Returns `s`, or none when the
+    /// bound fails, `s` overflows imm12, or `s` is 0 (`iadd c, 0`).
+    fn btsub_imm(&mut self, op: u64, ty: Type, j: u64, n: u64) -> Option<u64> {
+        if !narrowext_part(1024) || ty.bits() > 16 {
+            return None;
+        }
+        let w = 1u64 << ty.bits();
+        let j = j & (w - 1);
+        let s = match op {
+            0 => j,
+            1 if j >= w / 2 => w - j,
+            _ => return None,
+        };
+        if s == 0 || s > 0xfff || s + n > w {
+            return None;
+        }
+        Some(s)
+    }
+
+    /// PLIRON (`PLIRON_NARROWEXT` bit 8): the mask for a `tst` of a
+    /// narrow zero-test — `(v mod W) & k` reads identically on the
+    /// unmasked source register. `val` is the narrow value (its own
+    /// type gives `W`); returns `k & (W-1)`, or none when the value
+    /// isn't narrow or the masked constant is 0.
+    fn narrowext_tst_mask(&mut self, val: Value, k: u64) -> Option<u64> {
+        if !narrowext_part(8) {
+            return None;
+        }
+        let ty = self.lower_ctx.dfg().value_type(val);
+        if ty.bits() > 16 {
+            return None;
+        }
+        let m = k & ((1u64 << ty.bits()) - 1);
+        (m != 0).then_some(m)
+    }
+
+    fn narrowext_clean(&mut self, val: Value) -> bool {
+        let mut budget = 16;
+        if !narrowext_part(1) {
+            return false;
+        }
+        // Bit 2048: blockparam cleanliness from incoming edge args.
+        static EMPTY: std::sync::OnceLock<FxHashSet<Value>> = std::sync::OnceLock::new();
+        let rc;
+        let params: &FxHashSet<Value> = if narrowext_part(2048) {
+            rc = self.lower_ctx.clean_blockparams(build_clean_blockparams);
+            &rc
+        } else {
+            EMPTY.get_or_init(FxHashSet::default)
+        };
+        narrow_uext_clean(self.lower_ctx, val, &mut budget, params)
+    }
+
+    /// PLIRON (`PLIRON_NARROWEXT` bit 64): `val`'s register is already zero
+    /// above `bits`, so a narrow `ireduce` of it needs no `uxtb`/`uxth`.
+    fn wide_clean(&mut self, bits: u64, val: Value) -> bool {
+        let mut budget = 16;
+        let Ok(bits) = u32::try_from(bits) else {
+            return false;
+        };
+        narrowext_part(64) && wide_uext_clean(self.lower_ctx.dfg(), val, bits, &mut budget)
+    }
+
+    /// PLIRON (`PLIRON_CMN`, default on): `cmp x, -c` -> `cmn x, c`.
+    fn cmn_on(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_CMN").as_deref() != Ok("0"))
+    }
+
+    /// PLIRON (`PLIRON_CCMP`, default on): `band`/`bor` of two integer
+    /// compares consumed as a condition → `cmp; ccmp` flag chain
+    /// (`a && b` / `a || b`). `mode`: bit0 inverts the primary guard,
+    /// bit1 makes the constant NZCV satisfy (not falsify) the secondary
+    /// cond — 0 = `A && B`, 3 = `A || B`. Declines to `is_nonzero` of
+    /// the whole combination value, the generic catch-all's result.
+    fn ccmp_band_cond(
+        &mut self,
+        mode: u8,
+        val: Value,
+        cc_a: &IntCC,
+        x: Value,
+        y: Value,
+        cc_b: &IntCC,
+        u: Value,
+        v: Value,
+    ) -> CondResult {
+        if ccmp_on() {
+            if let Some(cr) = ccmp_pair(self, mode, cc_a, x, y, cc_b, u, v) {
+                return cr;
+            }
+        }
+        generated_code::constructor_is_nonzero(self, val)
+    }
+
+    /// PLIRON: `select` of a compare against a constant arm is a bool op
+    /// on the select's own condition — `sel(A,B,0)` = 0 `A&&B`,
+    /// `sel(A,0,B)` = 1 `!A&&B`, `sel(A,B,1)` = 2 `!A||B`,
+    /// `sel(A,1,B)` = 3 `A||B`. Same `is_nonzero` decline as above.
+    fn ccmp_sel_cond(
+        &mut self,
+        mode: u8,
+        val: Value,
+        cond: Value,
+        cc_b: &IntCC,
+        u: Value,
+        v: Value,
+    ) -> CondResult {
+        if ccmp_on() {
+            let cr = generated_code::constructor_is_nonzero_cmp(self, cond);
+            if let Some(cr) = ccmp_chain(self, mode, &cr, cc_b, u, v) {
+                return cr;
+            }
+        }
+        generated_code::constructor_is_nonzero(self, val)
+    }
+
+    /// PLIRON: `band`/`bor` of two compares produced as a *value* —
+    /// fused is `cmp; ccmp; cset` (3) vs `cmp; cset; cmp; cset; op` (5).
+    /// Declines to the base `and`/`orr` on the bound arm values.
+    fn ccmp_band_out(
+        &mut self,
+        mode: u8,
+        ty: Type,
+        a0: Value,
+        cc_a: &IntCC,
+        x: Value,
+        y: Value,
+        a1: Value,
+        cc_b: &IntCC,
+        u: Value,
+        v: Value,
+    ) -> InstOutput {
+        if ccmp_on() {
+            if let Some(cr) = ccmp_pair(self, mode, cc_a, x, y, cc_b, u, v) {
+                let reg = generated_code::constructor_lower_cond_result_bool(self, &cr);
+                return generated_code::constructor_output_reg(self, reg);
+            }
+        }
+        let op = if mode & 2 != 0 {
+            ALUOp::Orr
+        } else {
+            ALUOp::And
+        };
+        let reg =
+            generated_code::constructor_alu_rs_imm_logic_commutative(self, &op, ty, a0, a1);
+        generated_code::constructor_output_reg(self, reg)
+    }
+
+    /// PLIRON: `select` of a compare against a constant arm produced as
+    /// a value — same fusion, declining to `lower_select`.
+    fn ccmp_sel_out(
+        &mut self,
+        mode: u8,
+        ty: Type,
+        cond: Value,
+        rn: Value,
+        rm: Value,
+        cc_b: &IntCC,
+        u: Value,
+        v: Value,
+    ) -> InstOutput {
+        let cr = generated_code::constructor_is_nonzero_cmp(self, cond);
+        if ccmp_on() {
+            if let Some(cr) = ccmp_chain(self, mode, &cr, cc_b, u, v) {
+                let reg = generated_code::constructor_lower_cond_result_bool(self, &cr);
+                return generated_code::constructor_output_reg(self, reg);
+            }
+        }
+        let regs = generated_code::constructor_lower_select(self, ty, &cr, rn, rm);
+        self.output(regs)
+    }
+
+    /// PLIRON bitfield fusion (`PLIRON_BFUSE`, default on): `(x>>k)&m`,
+    /// `(x&m)<<k`, `y|((x&m)<<k)`, `y|((x<<k)&m')` → `ubfx`/`ubfiz`/`bfi`.
+    /// The externs compute UBFM immediates; `bf_disjoint*` proves `y`'s
+    /// field bits zero with a bounded known-bits walk.
+    fn bfuse_on(&mut self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_BFUSE").as_deref() != Ok("0"))
+    }
+
+    /// `0 < k < bits` for UBFM.
+    fn bf_imm_u8(&mut self, k: u64) -> Option<u8> {
+        (k >= 1 && k < 64).then_some(k as u8)
+    }
+
+    /// `(x>>k)&m` → `ubfx`: `m = (1<<w)-1`, `k+w <= bits`; imms = k+w-1.
+    fn bf_ubfx_imms(&mut self, ty: Type, m: u64, k: u64) -> Option<u8> {
+        let bits = ty.bits();
+        let w = bf_low_w(bits, m)?;
+        (k + w as u64 <= bits as u64).then_some((k + w as u64 - 1) as u8)
+    }
+
+    /// `(x<<k)&m` → `ubfiz`: `m = ((1<<w)-1)<<k`; imms = k+w-1.
+    fn bf_field_imms(&mut self, ty: Type, m: u64, k: u64) -> Option<u8> {
+        let bits = ty.bits();
+        let w = bf_field_w(bits, m, k)?;
+        Some((k + w as u64 - 1) as u8)
+    }
+
+    /// `ubfiz` with lsb `k`: immr = bits - k.
+    fn bf_ubfiz_immr(&mut self, ty: Type, k: u64) -> Option<u8> {
+        let bits = ty.bits();
+        (k >= 1 && k < bits as u64).then_some((bits as u64 - k) as u8)
+    }
+
+    /// `(x&m)<<k` → `ubfiz`: imms = w-1.
+    fn bf_ubfiz_imms(&mut self, ty: Type, m: u64, k: u64) -> Option<u8> {
+        let w = bf_low_w(ty.bits(), m)?;
+        (k + w as u64 <= ty.bits() as u64).then_some((w - 1) as u8)
+    }
+
+    /// `(x<<k)&m` as `ubfiz` mask form: imms = w-1.
+    fn bf_field_ubfiz_imms(&mut self, ty: Type, m: u64, k: u64) -> Option<u8> {
+        let w = bf_field_w(ty.bits(), m, k)?;
+        Some((w - 1) as u8)
+    }
+
+    /// `bfi`: `y`'s bits inside `((1<<w)-1)<<k` all provably zero.
+    fn bf_disjoint_lowfield(&mut self, y: Value, m: u64, k: u64) -> bool {
+        let mut budget = 16;
+        let z = bf_known_zero(self.lower_ctx.dfg(), y, &mut budget);
+        k < 64 && (m << k) & z == (m << k)
+    }
+
+    /// `bfi`: `y`'s bits inside mask `m` all provably zero.
+    fn bf_disjoint_mask(&mut self, y: Value, m: u64) -> bool {
+        let mut budget = 16;
+        let z = bf_known_zero(self.lower_ctx.dfg(), y, &mut budget);
+        m & z == m
     }
 
     fn test_and_compare_bit_const(&mut self, ty: Type, n: u64) -> Option<u8> {

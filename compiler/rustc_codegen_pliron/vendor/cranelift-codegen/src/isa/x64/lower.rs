@@ -4,7 +4,7 @@
 pub(super) mod isle;
 
 use crate::ir::{
-    Endianness, ExternalName, Inst as IRInst, InstructionData, LibCall, Opcode, Type, types,
+    Endianness, ExternalName, Inst as IRInst, InstructionData, LibCall, Opcode, Type, Value, types,
 };
 use crate::isa::x64::abi::*;
 use crate::isa::x64::inst::args::*;
@@ -178,7 +178,7 @@ fn emit_vm_call(
     }
     let sig = ctx.sigs().abi_sig_for_signature(&sig);
 
-    let uses = ctx.gen_call_args(sig, inputs);
+    let uses = ctx.gen_call_args(sig, inputs, &[]);
     let defs = ctx.gen_call_rets(sig, &outputs);
 
     let stack_ret_space = ctx.sigs()[sig].sized_stack_ret_space();
@@ -334,5 +334,25 @@ impl LowerBackend for X64Backend {
 
     fn maybe_pinned_reg(&self) -> Option<Reg> {
         Some(regs::pinned_reg())
+    }
+
+    /// PLIRON (`PLIRON_ARGUEXT=1`, opt-in): let `narrow_arg_uext_clean`
+    /// be consulted for i32 call operands too (the shared default caps
+    /// the query at i8/i16).
+    fn arg_uext_skip_bits(&self) -> u32 {
+        if isle::arguext_enabled() {
+            32
+        } else {
+            16
+        }
+    }
+
+    /// PLIRON (`PLIRON_ARGUEXT=1`): an i32 call operand whose register
+    /// already holds the zero-extended form needs no `movl` into the
+    /// ABI's arg register — every x64 32-bit-write producer
+    /// zero-extends for free. i8/i16 operands answer `false` here and
+    /// keep the stock `movz` extension (unchanged scope).
+    fn narrow_arg_uext_clean(&self, ctx: &mut Lower<Self::MInst>, val: Value) -> bool {
+        isle::arg_uext_clean32(ctx, val)
     }
 }

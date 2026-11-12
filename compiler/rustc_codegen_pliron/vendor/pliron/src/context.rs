@@ -47,6 +47,19 @@ impl Display for ArenaIndex {
     }
 }
 
+impl ArenaIndex {
+    /// PLIRON: raw key bits (`Key::data().as_ffi()`) in one inlinable
+    /// hop — the `new_key_type!`-generated `data()` carries no
+    /// `#[inline]`, so `Ptr<T>` methods monomorphized into dependent
+    /// crates were paying a real call per decode. Version low bit is
+    /// always set (`slotmap` ORs 1 into it), so 0 works as a vacant
+    /// tag sentinel for the dense side tables.
+    #[inline]
+    pub(crate) fn ffi(self) -> u64 {
+        self.0.as_ffi()
+    }
+}
+
 /// An arena allocation pool for IR objects.
 pub type Arena<T> = SlotMap<ArenaIndex, RefCell<T>>;
 
@@ -55,28 +68,134 @@ pub struct Context {
     /// A unique number for each `Value` in the context.
     /// Serves as a generation counter against accessing invalid `Value`s.
     pub(crate) value_counter: Cell<u64>,
-    /// A unique number for each `Use` in the context.
-    /// Serves as a generation counter against accessing invalid `Use`s.
-    pub(crate) use_counter: Cell<u64>,
+    /// PLIRON: Context-wide arena of use slots backing every
+    /// [crate::value::DefNode]'s intrusive use list (replaces the
+    /// per-def `SmallSet<Use>` hash sets). A use's uid encodes
+    /// `(slot_gen << 32) | slot_index` so a stale `Use` can never
+    /// alias a recycled slot.
+    pub(crate) use_links: RefCell<crate::value::UseLinks>,
     /// Allocation pool for [Operation]s.
     pub(crate) operations: Arena<Operation>,
     /// Allocation pool for [BasicBlock]s.
     pub(crate) basic_blocks: Arena<BasicBlock>,
     /// Allocation pool for [Region]s.
     pub(crate) regions: Arena<Region>,
+    /// PLIRON: dense next/prev tables for the intrusive linked lists —
+    /// one entry per node, indexed by the `ArenaIndex` index component.
+    /// List iteration reads these instead of dereferencing nodes.
+    /// See [crate::linked_list::NodeLinks].
+    pub(crate) op_links: RefCell<Vec<crate::linked_list::NodeLinks<Operation>>>,
+    pub(crate) block_links: RefCell<Vec<crate::linked_list::NodeLinks<BasicBlock>>>,
+    /// PLIRON: dense dispatch table for [Operation] — `concrete_op`
+    /// mirrored here indexed by the op's `ArenaIndex` index component,
+    /// so `is_op`/`get_op_dyn` check a ~32-byte contiguous entry instead
+    /// of a `RefCell` borrow + deref of the ~250-byte node. The tag is
+    /// the slot's `ArenaIndex::ffi()` bits (0 = vacant); a stale pointer
+    /// reads a mismatched or cleared tag and panics like a dangling
+    /// `deref`.
+    pub(crate) op_kind:
+        RefCell<Vec<(u64, crate::op::ConcreteOpInfo)>>,
+    /// PLIRON: global pool of region ids owned by [Operation]s — each op
+    /// stores an [`crate::operation::OpSpan`] into this Vec instead of an
+    /// inline list (DoD step 5). Length changes append a new span and
+    /// orphan the old one; CGU-scoped lifetimes keep the garbage bounded.
+    pub(crate) op_region_pool: RefCell<Vec<Ptr<Region>>>,
+    /// PLIRON: flat pool of op successor operand nodes (DoD step 5).
+    pub(crate) op_successor_pool:
+        RefCell<Vec<crate::operation::Operand<Ptr<BasicBlock>>>>,
+    /// PLIRON: flat pool of op result nodes (DoD step 5).
+    pub(crate) op_result_pool: RefCell<Vec<crate::operation::OpResult>>,
+    /// PLIRON: flat pool of op operand nodes (DoD step 5).
+    pub(crate) op_operand_pool:
+        RefCell<Vec<crate::operation::Operand<crate::value::Value>>>,
+    /// PLIRON: flat pool of block-argument nodes (DoD step 5).
+    pub(crate) block_arg_pool:
+        RefCell<Vec<crate::basic_block::BlockArgument>>,
     /// Registered [Dialect]s.
     pub(crate) dialects: HMap<DialectName, Dialect>,
     /// Storage for uniqued [TypeObj]s.
     pub(crate) type_store: UniqueStore<TypeObj>,
     /// Storage for other uniqued objects.
     pub(crate) uniqued_any_store: UniqueStore<UniquedAny>,
+    /// PLIRON: storage for interned [crate::attribute::AttrObj]s.
+    /// `AttributeDict` maps [Identifier] keys to `AttrInstId` indices
+    /// into this store instead of owning a `Box<dyn Attribute>` per
+    /// entry; the store deduplicates via `hash_attr`/`eq_attr`, so
+    /// identical attributes are shared across ops and dict clones are
+    /// shallow index copies.
+    pub(crate) attr_store: UniqueStore<crate::attribute::AttrEntry>,
     /// Arbitrary data storage. Use [Self::aux_data_map] for dictionary access.
     pub aux_data: SlotMap<AuxDataIndex, Box<dyn Any + Send>>,
     /// A dictionary with keys mapping to an index in [Self::aux_data].
     pub aux_data_map: HMap<Identifier, AuxDataIndex>,
+    /// PLIRON: memo for IR-level type layout queries. [TypeHandle] indices
+    /// are Context-scoped and types are immutable once interned (a
+    /// `deref_mut` mutation may not change hash/layout-relevant contents),
+    /// so the result is exact for the Context's lifetime.
+    pub ty_size_align: RefCell<HMap<crate::r#type::TypeHandle, (u64, u64)>>,
+    /// PLIRON: debug-info notes on values (`-g` when optimizing): opaque
+    /// ids the owner attaches to a [crate::value::Value]. They are not
+    /// uses — no pass sees them — but [crate::value::Value::replace_all_uses_with]
+    /// moves a value's notes onto its replacement, so a note follows the
+    /// value through rewrites (LLVM's `ValueAsMetadata` RAUW). Uids are
+    /// never reused, so notes left on erased values are inert.
+    pub dbg_notes: RefCell<rustc_hash::FxHashMap<crate::value::Value, smallvec::SmallVec<[u32; 2]>>>,
 }
 
 impl Context {
+    /// PLIRON: (live operations, live blocks, values ever allocated) —
+    /// for memory accounting (`PLIRON_MEM_MARK`).
+    pub fn ir_stats(&self) -> (usize, usize, u64) {
+        (self.operations.len(), self.basic_blocks.len(), self.value_counter.get())
+    }
+
+    /// PLIRON: bytes reserved by each big container (capacity x element
+    /// size), and live element counts for the pools — `PLIRON_MEM_MARK`.
+    /// PLIRON: same accounting as [`Self::mem_report`], as one number —
+    /// reserved bytes across the big containers. Used by the cgupool's
+    /// `PLIRON_CGU_MEMCAP` growth estimate.
+    pub fn approx_bytes(&self) -> u64 {
+        use core::mem::size_of;
+        fn v<T>(x: &Vec<T>) -> u64 {
+            (x.capacity() * size_of::<T>()) as u64
+        }
+        (self.operations.capacity() * (size_of::<core::cell::RefCell<Operation>>() + 8)
+            + self.basic_blocks.capacity()
+                * (size_of::<core::cell::RefCell<BasicBlock>>() + 8)) as u64
+            + v(&self.use_links.borrow().arena)
+            + v(&self.op_links.borrow())
+            + v(&self.block_links.borrow())
+            + v(&self.op_kind.borrow())
+            + v(&self.op_operand_pool.borrow())
+            + v(&self.op_result_pool.borrow())
+            + v(&self.op_successor_pool.borrow())
+            + v(&self.block_arg_pool.borrow())
+            + v(&self.op_region_pool.borrow())
+    }
+
+    pub fn mem_report(&self) -> alloc::string::String {
+        use core::mem::size_of;
+        fn v<T>(name: &str, x: &Vec<T>) -> alloc::string::String {
+            format!("{name}={}MB/{}", (x.capacity() * size_of::<T>()) >> 20, x.len())
+        }
+        let ops = self.operations.capacity() * (size_of::<core::cell::RefCell<Operation>>() + 8);
+        let blks = self.basic_blocks.capacity() * (size_of::<core::cell::RefCell<BasicBlock>>() + 8);
+        [
+            format!("ops={}MB/{}", ops >> 20, self.operations.len()),
+            format!("blocks={}MB/{}", blks >> 20, self.basic_blocks.len()),
+            v("use_links", &self.use_links.borrow().arena),
+            v("op_links", &self.op_links.borrow()),
+            v("block_links", &self.block_links.borrow()),
+            v("op_kind", &self.op_kind.borrow()),
+            v("operands", &self.op_operand_pool.borrow()),
+            v("results", &self.op_result_pool.borrow()),
+            v("succs", &self.op_successor_pool.borrow()),
+            v("bargs", &self.block_arg_pool.borrow()),
+            v("regions", &self.op_region_pool.borrow()),
+        ]
+        .join(" ")
+    }
+
     pub fn new() -> Context {
         Self::default()
     }
@@ -95,27 +214,35 @@ impl Context {
         uid
     }
 
-    /// Get a unique number for a new use.
-    pub(crate) fn get_new_use_uid(&self) -> u64 {
-        let uid = self.use_counter.get();
-        self.use_counter.set(uid + 1);
-        uid
-    }
+    // PLIRON: `get_new_use_uid`/`use_counter` removed — use uids now
+    // come from the `use_links` slot index + generation
+    // (see [crate::value::UseLinks]).
 }
 
 impl Default for Context {
     fn default() -> Self {
         let mut ctx = Context {
             value_counter: Cell::new(0),
-            use_counter: Cell::new(0),
+            use_links: RefCell::new(crate::value::UseLinks::new()),
             operations: Arena::default(),
             basic_blocks: Arena::default(),
             regions: Arena::default(),
+            op_links: RefCell::new(Vec::new()),
+            block_links: RefCell::new(Vec::new()),
+            op_kind: RefCell::new(Vec::new()),
+            op_region_pool: RefCell::new(Vec::new()),
+            op_successor_pool: RefCell::new(Vec::new()),
+            op_result_pool: RefCell::new(Vec::new()),
+            op_operand_pool: RefCell::new(Vec::new()),
+            block_arg_pool: RefCell::new(Vec::new()),
             dialects: HMap::default(),
             type_store: UniqueStore::default(),
             uniqued_any_store: UniqueStore::default(),
+            attr_store: UniqueStore::default(),
             aux_data: SlotMap::with_key(),
             aux_data_map: HMap::default(),
+            ty_size_align: RefCell::new(HMap::default()),
+            dbg_notes: RefCell::new(Default::default()),
         };
 
         // Verify that all dictionary keys are unique.
@@ -197,6 +324,14 @@ impl<T: ArenaObj> core::fmt::Debug for Ptr<T> {
 #[error("Attempt to dereference a dangling Ptr")]
 pub struct DanglingPtrDerefError;
 
+impl<T: ArenaObj> Ptr<T> {
+    /// PLIRON: whether the object this points to still exists (same slot
+    /// and version) — false after it was erased, even if the slot was reused.
+    pub fn is_live(&self, ctx: &Context) -> bool {
+        T::get_arena(ctx).contains_key(self.idx)
+    }
+}
+
 impl<'a, T: ArenaObj> Ptr<T> {
     /// Borrow the inner [RefCell] and return a [Ref] to the pointee.
     /// The borrow is live as long as the returned [Ref] lives.
@@ -246,6 +381,16 @@ impl<'a, T: ArenaObj> Ptr<T> {
             .ok_or_else(|| arg_error_noloc!(DanglingPtrDerefError))?
             .try_borrow_mut()
             .map_err(|err| arg_error_noloc!(err))
+    }
+
+    /// PLIRON: dense arena slot ordinal (`ArenaIndex` index component,
+    /// low 32 of `as_ffi`) — indexes the columnar side tables
+    /// (`pliron_ir_opt::state::ColMap`/`ColSet`). Includes no version
+    /// bits: callers storing the `Ptr` itself (as column entries do)
+    /// detect stale slots by key equality.
+    #[inline]
+    pub fn ord(&self) -> usize {
+        self.idx.ffi() as u32 as usize
     }
 
     /// Create a unique (to the arena) name based on the arena index.

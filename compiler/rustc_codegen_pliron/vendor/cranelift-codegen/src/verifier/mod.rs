@@ -628,6 +628,8 @@ impl<'a> Verifier<'a> {
             UnaryGlobalValue { global_value, .. } => {
                 self.verify_global_value(inst, global_value, errors)?;
             }
+            // PLIRON: scatter has only fixed value args; nothing extra to check.
+            Scatter { .. } => {}
             NullAry {
                 opcode: Opcode::GetPinnedReg,
             }
@@ -1928,12 +1930,20 @@ impl<'a> Verifier<'a> {
         } = inst_data
         {
             let ctrl_typevar = self.func.dfg.ctrl_typevar(inst);
+            // PLIRON: report rather than panic so the per-step verifier
+            // names the pass that emitted the bad iconst.
             let bounds_mask = match ctrl_typevar {
                 types::I8 => u8::MAX.into(),
                 types::I16 => u16::MAX.into(),
                 types::I32 => u32::MAX.into(),
                 types::I64 => u64::MAX,
-                _ => unreachable!(),
+                t => {
+                    return errors.fatal((
+                        inst,
+                        self.context(inst),
+                        format!("iconst with invalid type {t}"),
+                    ));
+                }
             };
 
             let value = imm.bits() as u64;

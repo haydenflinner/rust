@@ -21,6 +21,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[inline(never)]
 pub extern "C" fn pliron_hot_anchor() {}
 
+fn exe_path() -> Result<std::path::PathBuf, String> {
+    #[cfg(target_os = "macos")]
+    #[allow(deprecated)]
+    unsafe {
+        let p = libc::_dyld_get_image_name(0);
+        if !p.is_null() {
+            return Ok(std::path::PathBuf::from(
+                std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned(),
+            ));
+        }
+    }
+    Ok(std::path::PathBuf::from("/proc/self/exe"))
+}
+
 struct BaseSym {
     addr: usize,
     writable: bool,
@@ -35,7 +49,8 @@ pub struct Base {
 
 impl Base {
     pub fn load() -> Result<Base, String> {
-        let bytes = std::fs::read("/proc/self/exe").map_err(|e| e.to_string())?;
+        let path = exe_path()?;
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
         let f = object::File::parse(&*bytes).map_err(|e| e.to_string())?;
         let mut raw = HashMap::new();
         for s in f.symbols() {
@@ -53,7 +68,11 @@ impl Base {
                 *e = (s.address() as usize, writable, true, e.3);
             }
         }
-        let anchor = raw.get("pliron_hot_anchor").ok_or("executable has no symbol table")?.0;
+        let anchor = raw
+            .get("pliron_hot_anchor")
+            .or_else(|| raw.get("_pliron_hot_anchor"))
+            .ok_or("executable has no symbol table")?
+            .0;
         let slide = (pliron_hot_anchor as *const () as usize).wrapping_sub(anchor);
         let end = f.segments().map(|s| (s.address() + s.size()) as usize).max().unwrap_or(0).wrapping_add(slide);
         let syms = raw
@@ -67,6 +86,9 @@ impl Base {
         if let Some(s) = self.syms.get(name) {
             return Some(s.addr);
         }
+        // dlsym wants the C spelling: Mach-O file names carry one extra `_`.
+        #[cfg(target_os = "macos")]
+        let name = name.strip_prefix('_').unwrap_or(name);
         let c = std::ffi::CString::new(name).ok()?;
         let p = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
         (!p.is_null()).then_some(p as usize)
@@ -74,7 +96,9 @@ impl Base {
 }
 
 fn is_mangled(n: &str) -> bool {
-    n.starts_with("_R") || n.starts_with("_ZN")
+    // ELF spells Rust names `_R*`/`_ZN*`; Mach-O adds one more leading `_`.
+    let t = n.strip_prefix('_').unwrap_or(n);
+    n.starts_with("_R") || n.starts_with("_ZN") || t.starts_with("_R") || t.starts_with("_ZN")
 }
 
 fn align(x: usize, a: usize) -> usize {
@@ -86,6 +110,7 @@ fn map_near(end: usize, len: usize) -> Result<usize, String> {
     let len = align(len, 4096);
     let mut hint = align(end, 1 << 21) + (64 << 20);
     for _ in 0..24 {
+        #[cfg(target_os = "linux")]
         let p = unsafe {
             libc::mmap(
                 hint as *mut _,
@@ -95,6 +120,29 @@ fn map_near(end: usize, len: usize) -> Result<usize, String> {
                 -1,
                 0,
             )
+        };
+        // Darwin has no MAP_FIXED_NOREPLACE: map at the hint, then unmap and
+        // advance when the kernel picked a spot beyond PC32 reach.
+        #[cfg(not(target_os = "linux"))]
+        let p = {
+            // Darwin arm64 rejects plain RWX maps; MAP_JIT pages may be
+            // written and executed on unsigned binaries.
+            let p = unsafe {
+                libc::mmap(
+                    hint as *mut _,
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_JIT,
+                    -1,
+                    0,
+                )
+            };
+            if p != libc::MAP_FAILED && (p as i64 - end as i64).unsigned_abs() >= (1 << 31) {
+                unsafe { libc::munmap(p, len) };
+                libc::MAP_FAILED
+            } else {
+                p
+            }
         };
         if p != libc::MAP_FAILED {
             return Ok(p as usize);
@@ -108,50 +156,248 @@ fn map_near(end: usize, len: usize) -> Result<usize, String> {
 /// targets (`__rcg_alloc.N` counters differ between builds) hash by content.
 pub type Prints = HashMap<String, u64>;
 
-pub fn fingerprints(f: &object::File) -> Prints {
-    fn sec_key(f: &object::File, si: SectionIndex, h: &mut DefaultHasher, deep: bool) {
-        let Ok(s) = f.section_by_index(si) else { return };
-        s.data().unwrap_or(&[]).hash(h);
-        for (o, r) in s.relocations() {
-            o.hash(h);
+/// Pre-parsed symbol: `symbol_by_index` re-decodes the nlist/symtab entry on
+/// every call, which dominates `fingerprints` on leaf crates with tens of
+/// thousands of relocations. Decode once into a table.
+struct Sym<'a> {
+    name: &'a str,
+    kind: SymbolKind,
+    sec: Option<SectionIndex>,
+    addr: u64,
+    size: u64,
+    def: bool,
+    undef: bool,
+    weak: bool,
+}
+
+/// Symbols of `f` indexed by `SymbolIndex`.
+fn symtab<'d, 'f>(f: &'f object::File<'d, &'d [u8]>) -> Vec<Option<Sym<'d>>> {
+    let mut v: Vec<Option<Sym<'d>>> = Vec::new();
+    for s in f.symbols() {
+        let i = s.index().0;
+        if i >= v.len() {
+            v.resize_with(i + 1, || None);
+        }
+        v[i] = Some(Sym {
+            name: s.name().unwrap_or(""),
+            kind: s.kind(),
+            sec: s.section_index(),
+            addr: s.address(),
+            size: s.size(),
+            def: s.is_definition(),
+            undef: s.is_undefined(),
+            weak: s.is_weak(),
+        });
+    }
+    v
+}
+
+/// Pre-parsed section.
+struct Sec<'d> {
+    data: &'d [u8],
+    size: u64,
+    align: u64,
+    kind: SectionKind,
+}
+
+/// One parse of a patch object, shared by `fingerprints` and the loaders:
+/// decoding the symtab and bucketing relocs once instead of per caller
+/// roughly halves apply time on large leaf crates.
+struct Parsed<'d> {
+    syms: Vec<Option<Sym<'d>>>,
+    secs: HashMap<SectionIndex, Sec<'d>>,
+    /// Relocations per section, sorted by offset.
+    relocs: HashMap<SectionIndex, Vec<(u64, object::Relocation)>>,
+    /// Sorted defined-symbol addresses per section (function extents).
+    by_sec: HashMap<SectionIndex, Vec<u64>>,
+}
+
+impl<'d> Parsed<'d> {
+    fn load(f: &object::File<'d, &'d [u8]>) -> Self {
+        // Symtab decode and section/reloc collection are independent —
+        // they are the two halves of parse time on large leaf crates.
+        let (mut p, sec_parts) = std::thread::scope(|sc| {
+            let sym_h = sc.spawn(|| symtab(f));
+            let sec_h = sc.spawn(|| {
+                let mut secs = HashMap::new();
+                let mut relocs = HashMap::new();
+                for s in f.sections() {
+                    secs.insert(
+                        s.index(),
+                        Sec {
+                            data: s.data().unwrap_or(&[]),
+                            size: s.size(),
+                            align: s.align(),
+                            kind: s.kind(),
+                        },
+                    );
+                    let mut rs: Vec<_> = s.relocations().collect();
+                    rs.sort_unstable_by_key(|&(o, _)| o);
+                    relocs.insert(s.index(), rs);
+                }
+                (secs, relocs)
+            });
+            (
+                Parsed {
+                    syms: sym_h.join().unwrap(),
+                    secs: HashMap::new(),
+                    relocs: HashMap::new(),
+                    by_sec: HashMap::new(),
+                },
+                sec_h.join().unwrap(),
+            )
+        });
+        let (secs, relocs) = sec_parts;
+        p.secs = secs;
+        p.relocs = relocs;
+        for s in p.syms.iter().flatten() {
+            if let (Some(si), true) = (s.sec, s.def) {
+                p.by_sec.entry(si).or_default().push(s.addr);
+            }
+        }
+        for v in p.by_sec.values_mut() {
+            v.sort_unstable();
+        }
+        p
+    }
+
+    /// A symbol's byte range inside its section: explicit size, else up to
+    /// the next symbol in the same section (Mach-O nlist symbols carry no
+    /// size).
+    fn extent(&self, si: SectionIndex, a: u64, size: u64) -> (u64, u64) {
+        if size > 0 {
+            return (a, a + size);
+        }
+        let next = self
+            .by_sec
+            .get(&si)
+            .map(|v| v.partition_point(|&x| x <= a))
+            .and_then(|i| self.by_sec[&si].get(i).copied())
+            .unwrap_or_else(|| self.secs.get(&si).map(|s| s.size).unwrap_or(a));
+        (a, next.max(a))
+    }
+
+    /// Hash a function's byte range plus the relocations inside it. `deep`
+    /// follows data-section targets one level (per-function string/const
+    /// blobs) — relocatable objects keep symbol values and reloc offsets
+    /// section-relative, so `lo`/`hi` index `sec_data` directly.
+    fn hash_range(&self, si: SectionIndex, lo: u64, hi: u64, h: &mut DefaultHasher, deep: bool) {
+        if let Some(d) = self.secs.get(&si).map(|s| s.data) {
+            let (i0, i1) = (lo as usize, hi as usize);
+            if i1 <= d.len() && i0 <= i1 {
+                d[i0..i1].hash(h);
+            }
+        }
+        let Some(rs) = self.relocs.get(&si) else { return };
+        let i0 = rs.partition_point(|&(o, _)| o < lo);
+        for &(o, ref r) in &rs[i0..] {
+            if o >= hi {
+                break;
+            }
+            // Hash the offset relative to the function start: a function
+            // that moved because a neighbour grew keeps its fingerprint,
+            // avoiding spurious repoints of identical code.
+            (o - lo).hash(h);
             r.addend().hash(h);
-            if let RelocationFlags::Elf { r_type } = r.flags() {
-                r_type.hash(h);
+            match r.flags() {
+                RelocationFlags::Elf { r_type } => r_type.hash(h),
+                RelocationFlags::MachO { r_type, r_pcrel, r_length } => {
+                    (r_type, r_pcrel, r_length).hash(h)
+                }
+                _ => {}
             }
             match r.target() {
                 RelocationTarget::Symbol(i) => {
-                    let Ok(t) = f.symbol_by_index(i) else { continue };
-                    let name = t.name().unwrap_or("");
-                    if t.is_undefined() || t.kind() == SymbolKind::Text || is_mangled(name) {
-                        name.hash(h);
-                    } else if let (Some(ti), true) = (t.section_index(), deep) {
-                        t.address().hash(h);
-                        sec_key(f, ti, h, false);
+                    let Some(Some(t)) = self.syms.get(i.0) else { continue };
+                    if t.undef || t.kind == SymbolKind::Text || is_mangled(t.name) {
+                        t.name.hash(h);
+                    } else if let (Some(ti), true) = (t.sec, deep) {
+                        t.addr.hash(h);
+                        let (tlo, thi) = self.extent(ti, t.addr, t.size);
+                        self.hash_range(ti, tlo, thi, h, false);
                     }
                 }
-                RelocationTarget::Section(ti) if deep => sec_key(f, ti, h, false),
+                RelocationTarget::Section(ti) if deep => {
+                    let end = self.secs.get(&ti).map(|s| s.size).unwrap_or(0);
+                    self.hash_range(ti, 0, end, h, false);
+                }
                 _ => {}
             }
         }
     }
-    let mut out = HashMap::new();
-    for sym in f.symbols() {
-        if sym.kind() != SymbolKind::Text || !sym.is_definition() {
-            continue;
+}
+
+pub fn fingerprints(f: &object::File) -> Prints {
+    fingerprints_of(&Parsed::load(f))
+}
+
+/// Fingerprints over an already-parsed object. Each function's extent is its
+/// explicit size or up to the next symbol in its section; the hash covers its
+/// code bytes and the relocations inside it (anonymous targets by content —
+/// `__rcg_alloc.N` counters differ between builds). Work is split across
+/// threads since hashing dominates on large leaf crates.
+fn fingerprints_of(t: &Parsed) -> Prints {
+    let mut texts = Vec::new();
+    for (i, s) in t.syms.iter().enumerate() {
+        let Some(s) = s else { continue };
+        if s.def && s.kind == SymbolKind::Text && s.sec.is_some() {
+            texts.push((i, s.sec.unwrap()));
         }
-        let (Ok(name), Some(si)) = (sym.name(), sym.section_index()) else { continue };
-        let mut h = DefaultHasher::new();
-        sec_key(f, si, &mut h, true);
-        out.insert(name.to_string(), h.finish());
+    }
+
+    let mut out = HashMap::new();
+    let hash_fns = |chunk: &[(usize, SectionIndex)]| -> Vec<(String, u64)> {
+        let mut v = Vec::with_capacity(chunk.len());
+        for &(i, si) in chunk {
+            let s = t.syms[i].as_ref().unwrap();
+            let (lo, hi) = t.extent(si, s.addr, s.size);
+            let mut h = DefaultHasher::new();
+            t.hash_range(si, lo, hi, &mut h, true);
+            v.push((s.name.to_string(), h.finish()));
+        }
+        v
+    };
+    let nthreads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    if texts.len() < 512 || nthreads == 1 {
+        out.extend(hash_fns(&texts));
+    } else {
+        let chunk = texts.len().div_ceil(nthreads);
+        let mut results: Vec<Vec<(String, u64)>> = Vec::new();
+        std::thread::scope(|sc| {
+            let mut hs = Vec::new();
+            for c in texts.chunks(chunk) {
+                hs.push(sc.spawn(|| hash_fns(c)));
+            }
+            for h in hs {
+                results.push(h.join().unwrap());
+            }
+        });
+        out.extend(results.into_iter().flatten());
     }
     out
 }
 
+/// A successfully applied patch: its fingerprints, the mapping it occupies
+/// (for `PLIRON_HOT_FREE` reclamation) and the slots it repointed.
+pub struct Applied {
+    /// Functions whose slots were repointed.
+    pub n: usize,
+    /// Fingerprints of this object — diff base for the next patch.
+    pub prints: Prints,
+    /// Functions repointed by name, and the mapping's extent.
+    fns: Vec<String>,
+    mem: usize,
+    len: usize,
+}
+
 /// Load one patch object, repointing the slots of functions that differ from
-/// `prev`. Returns how many were repointed and this object's fingerprints.
-pub fn apply(base: &Base, path: &Path, prev: Option<&Prints>) -> Result<(usize, Prints), String> {
+/// `prev`. Returns what was repointed and this object's fingerprints.
+pub fn apply(base: &Base, path: &Path, prev: Option<&Prints>) -> Result<Applied, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let f = object::File::parse(&*bytes).map_err(|e| e.to_string())?;
+    if matches!(f, object::File::MachO64(_)) {
+        return apply_macho(base, &f, prev);
+    }
     let prints = fingerprints(&f);
     let changed = |n: &str| prev.is_none_or(|p| p.get(n) != prints.get(n));
 
@@ -278,7 +524,7 @@ pub fn apply(base: &Base, path: &Path, prev: Option<&Prints>) -> Result<(usize, 
             reg((mem + eh) as *const u8);
         }
     }
-    let mut n = 0;
+    let mut fns = Vec::new();
     for sym in f.symbols() {
         if sym.kind() != SymbolKind::Text || !sym.is_definition() {
             continue;
@@ -290,10 +536,505 @@ pub fn apply(base: &Base, path: &Path, prev: Option<&Prints>) -> Result<(usize, 
         if let Some(slot) = base.syms.get(&format!("__hot_slot.{name}")) {
             let new = mem + place[&sym.section_index().unwrap()] + sym.address() as usize;
             unsafe { (*(slot.addr as *const AtomicUsize)).store(new, Ordering::Release) };
-            n += 1;
+            fns.push(name.to_string());
         }
     }
-    Ok((n, prints))
+    let n = fns.len();
+    Ok(Applied { n, prints, fns, mem, len: plt0 + 8 * nrel })
+}
+
+// Darwin arm64: MAP_JIT pages obey a per-thread write/execute toggle and
+// code writes must be made visible to the instruction cache.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn pthread_jit_write_protect_np(enabled: i32);
+    fn sys_icache_invalidate(start: *const u8, size: usize);
+}
+
+#[cfg(target_os = "macos")]
+fn jit_writeable<T>(len: usize, mem: usize, f: impl FnOnce() -> T) -> T {
+    unsafe { pthread_jit_write_protect_np(0) };
+    let r = f();
+    unsafe {
+        sys_icache_invalidate(mem as *const u8, len);
+        pthread_jit_write_protect_np(1);
+    }
+    r
+}
+
+#[cfg(not(target_os = "macos"))]
+fn jit_writeable<T>(_len: usize, _mem: usize, f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+/// Mach-O arm64 relocation types (mach-o/reloc.h).
+mod a64 {
+    pub const UNSIGNED: u8 = 0;
+    pub const SUBTRACTOR: u8 = 1;
+    pub const BRANCH26: u8 = 2;
+    pub const PAGE21: u8 = 3;
+    pub const PAGEOFF12: u8 = 4;
+    pub const GOT_LOAD_PAGE21: u8 = 5;
+    pub const GOT_LOAD_PAGEOFF12: u8 = 6;
+    pub const POINTER_TO_GOT: u8 = 7;
+    pub const TLV_PAGE21: u8 = 8;
+    pub const TLV_PAGEOFF12: u8 = 9;
+}
+
+/// imm12 scale for an unsigned-immediate load/store: access size is in
+/// insn[31:30] for GPR/FP, `ldr q` takes 16 bytes, `add` takes raw bytes.
+fn imm12_shift(insn: u32) -> u32 {
+    if insn & 0x3b00_0000 == 0x3d00_0000 {
+        4
+    } else if insn & 0x3b00_0000 == 0x3900_0000 {
+        insn >> 30
+    } else {
+        0
+    }
+}
+
+/// Patch in a Mach-O object: copy changed functions and non-code sections
+/// into one RWX mapping, apply the relocations inside those regions only,
+/// repoint the `__hot_slot.*` of changed functions. Unchanged patch functions
+/// are never mapped — references to them resolve to the live executable's
+/// thunk (which forwards through the live slot), so apply cost and memory
+/// grow with the size of the edit, not the crate.
+fn apply_macho<'d>(
+    base: &Base,
+    f: &object::File<'d, &'d [u8]>,
+    prev: Option<&Prints>,
+) -> Result<Applied, String> {
+    let dbg = std::env::var_os("PLIRON_HOT_DEBUG").is_some();
+    let t0 = std::time::Instant::now();
+    let p = Parsed::load(f);
+    let tparse = t0.elapsed();
+    let prints = fingerprints_of(&p);
+    if dbg {
+        eprintln!("[hot] parse {:?} fingerprints {:?}", tparse, t0.elapsed());
+    }
+    let changed = |n: &str| prev.is_none_or(|q| q.get(n) != prints.get(n));
+
+    let syms = &p.syms;
+    let relocs = &p.relocs;
+    // Sections the loader must not map (debug/unwind metadata is not needed —
+    // Mach-O compact unwind cannot be registered post-load).
+    let mut skip: HashSet<SectionIndex> = HashSet::new();
+    for s in f.sections() {
+        let name = s.name().unwrap_or("");
+        let seg = s.segment_name().unwrap_or(None).unwrap_or("");
+        if name.starts_with("__thread") {
+            return Err("patch defines thread-locals; restart needed".into());
+        }
+        if seg == "__DWARF" || seg == "__LD" || name == "__unwind_info" || name == "__eh_frame"
+            || s.size() == 0
+        {
+            skip.insert(s.index());
+        }
+    }
+    let mut place: HashMap<SectionIndex, usize> = HashMap::new();
+    let mut text_secs: HashSet<SectionIndex> = HashSet::new();
+    for (&si, s) in &p.secs {
+        if skip.contains(&si) {
+            continue;
+        }
+        if s.kind == SectionKind::Text {
+            text_secs.insert(si);
+        } else {
+            place.insert(si, usize::MAX); // non-code sections: assigned below
+        }
+    }
+
+    let extent = |si: SectionIndex, a: u64, size: u64| p.extent(si, a, size);
+
+    // Live set: changed functions, plus the transitive closure of
+    // patch-defined text symbols they reference that the base cannot
+    // resolve (a live thunk forwards those that it can).
+    let mut live: HashMap<usize, (u64, u64)> = HashMap::new(); // symidx -> (lo,hi)
+    let mut wl: Vec<usize> = Vec::new();
+    let want = |live: &mut HashMap<usize, (u64, u64)>, wl: &mut Vec<usize>, t: &Sym, ti: usize| {
+        if t.def
+            && t.kind == SymbolKind::Text
+            && !live.contains_key(&ti)
+            && !base.syms.contains_key(t.name)
+        {
+            let (tlo, thi) = extent(t.sec.unwrap(), t.addr, t.size);
+            live.insert(ti, (tlo, thi));
+            wl.push(ti);
+        }
+    };
+    for (i, s) in syms.iter().enumerate() {
+        let Some(s) = s else { continue };
+        if s.def && s.kind == SymbolKind::Text && changed(s.name) {
+            let (lo, hi) = extent(s.sec.unwrap(), s.addr, s.size);
+            live.insert(i, (lo, hi));
+            wl.push(i);
+        }
+    }
+    // Only data reachable from live functions is copied: a probe-only patch
+    // skips the crate's whole `__const` tables and their relocations. Data
+    // sections may in turn reference patch-local functions (`__const`
+    // fn-pointer tables) and other data, so the worklist covers both.
+    let mut dsec: HashSet<SectionIndex> = HashSet::new();
+    let mut dwl: Vec<SectionIndex> = Vec::new();
+    loop {
+        if let Some(i) = wl.pop() {
+            let s = syms[i].as_ref().unwrap();
+            let si = s.sec.unwrap();
+            let (lo, hi) = live[&i];
+            if let Some(rs) = relocs.get(&si) {
+                let i0 = rs.partition_point(|&(o, _)| o < lo);
+                for &(o, ref r) in &rs[i0..] {
+                    if o >= hi {
+                        break;
+                    }
+                    match r.target() {
+                        RelocationTarget::Symbol(ti) => {
+                            if let Some(Some(t)) = syms.get(ti.0) {
+                                if t.kind == SymbolKind::Text {
+                                    want(&mut live, &mut wl, t, ti.0);
+                                } else if let Some(ti) = t.sec {
+                                    if place.contains_key(&ti) && dsec.insert(ti) {
+                                        dwl.push(ti);
+                                    }
+                                }
+                            }
+                        }
+                        RelocationTarget::Section(ti) => {
+                            if place.contains_key(&ti) && dsec.insert(ti) {
+                                dwl.push(ti);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else if let Some(di) = dwl.pop() {
+            if let Some(rs) = relocs.get(&di) {
+                for (_, r) in rs {
+                    match r.target() {
+                        RelocationTarget::Symbol(ti) => {
+                            if let Some(Some(t)) = syms.get(ti.0) {
+                                if t.kind == SymbolKind::Text {
+                                    want(&mut live, &mut wl, t, ti.0);
+                                } else if let Some(ti) = t.sec {
+                                    if place.contains_key(&ti) && dsec.insert(ti) {
+                                        dwl.push(ti);
+                                    }
+                                }
+                            }
+                        }
+                        RelocationTarget::Section(ti) => {
+                            if place.contains_key(&ti) && dsec.insert(ti) {
+                                dwl.push(ti);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Layout: [live fn ranges, packed][non-code sections][GOT][stubs].
+    let mut fndst: HashMap<usize, usize> = HashMap::new(); // symidx -> mem offset
+    let (mut off, mut nrel) = (0usize, 0usize);
+    let mut livev: Vec<(usize, u64, u64)> = live.iter().map(|(&i, &r)| (i, r.0, r.1)).collect();
+    livev.sort_unstable();
+    for &(i, lo, hi) in &livev {
+        off = align(off, 16);
+        fndst.insert(i, off);
+        off += (hi - lo) as usize;
+    }
+    for &si in &dsec {
+        let s = &p.secs[&si];
+        off = align(off, s.align.max(1) as usize);
+        place.insert(si, off);
+        off += s.size as usize;
+        nrel += relocs.get(&si).map_or(0, |r| r.len());
+    }
+    let got0 = align(off, 8);
+    let stub0 = got0 + 8 * (nrel + 64);
+    let t1 = std::time::Instant::now();
+    if dbg {
+        eprintln!("[hot] layout {:?}", t1.duration_since(t0));
+    }
+    let mem = map_near(base.end, stub0 + 16 * nrel)?;
+    if dbg {
+        eprintln!("[hot] map {:?}", t1.elapsed());
+    }
+    jit_writeable(stub0 + 16 * nrel, mem, || -> Result<(), String> {
+        for &(i, lo, hi) in &livev {
+            let s = &syms[i].as_ref().unwrap();
+            let d = p.secs[&s.sec.unwrap()].data;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    d.as_ptr().add(lo as usize),
+                    (mem + fndst[&i]) as *mut u8,
+                    (hi - lo) as usize,
+                )
+            };
+        }
+        for &si in &dsec {
+            let s = &p.secs[&si];
+            let o = place[&si];
+            if s.kind == SectionKind::UninitializedData {
+                continue;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(s.data.as_ptr(), (mem + o) as *mut u8, s.data.len())
+            };
+        }
+        if dbg {
+            eprintln!("[hot] copy {:?}", t1.elapsed());
+        }
+
+    let mut missing = Vec::new();
+    let resolve = |i: usize, s: &Sym, missing: &mut Vec<String>| -> usize {
+        match s.kind {
+            SymbolKind::Section => s
+                .sec
+                .and_then(|si| place.get(&si))
+                .filter(|&&o| o != usize::MAX)
+                .map(|&o| mem + o + s.addr as usize)
+                .unwrap_or_else(|| {
+                    missing.push("<anonymous section symbol>".to_string());
+                    0
+                }),
+            SymbolKind::Text if fndst.contains_key(&i) => mem + fndst[&i],
+            _ => {
+                let b = base.syms.get(s.name);
+                match (s.kind, b) {
+                    (SymbolKind::Text, Some(b)) => b.addr,
+                    (SymbolKind::Data, Some(b)) if b.writable && b.unique && is_mangled(s.name) => {
+                        b.addr
+                    }
+                    (_, Some(b)) if s.sec.is_none() => b.addr,
+                    _ => s
+                        .sec
+                        .and_then(|si| place.get(&si))
+                        .filter(|&&o| o != usize::MAX)
+                        .map(|o| mem + o + s.addr as usize)
+                        .unwrap_or_else(|| {
+                            base.lookup(s.name).unwrap_or_else(|| {
+                                if !s.weak {
+                                    missing.push(s.name.to_string());
+                                }
+                                0
+                            })
+                        }),
+                }
+            }
+        }
+    };
+    let mut got: HashMap<usize, usize> = Default::default();
+    let mut got_slot = |s: usize| -> usize {
+        let n = got.len();
+        *got.entry(s).or_insert_with(|| {
+            let g = mem + got0 + 8 * n;
+            unsafe { (g as *mut usize).write(s) };
+            g
+        })
+    };
+    let mut nstub = 0usize;
+    let mut stub = |tgt: usize| -> usize {
+        // ldr x16, [pc, #8]; br x16; .quad tgt — 16 bytes, reaches anywhere
+        let a = mem + stub0 + 16 * nstub;
+        nstub += 1;
+        unsafe {
+            (a as *mut u32).write(0x5800_0050); // ldr x16, #8
+            ((a + 4) as *mut u32).write(0xd61f_0200); // br x16
+            ((a + 8) as *mut u64).write_unaligned(tgt as u64);
+        }
+        a
+    };
+
+    let apply_relocs = |si: SectionIndex,
+                            lo: u64,
+                            hi: u64,
+                            base_addr: usize,
+                            missing: &mut Vec<String>,
+                            got_slot: &mut dyn FnMut(usize) -> usize,
+                            stub: &mut dyn FnMut(usize) -> usize|
+     -> Result<(), String> {
+        let Some(rs) = relocs.get(&si) else { return Ok(()) };
+        let i0 = rs.partition_point(|&(o, _)| o < lo);
+        let mut napp = 0usize;
+        for &(o, ref r) in &rs[i0..] {
+            if o >= hi {
+                break;
+            }
+            napp += 1;
+            let p = base_addr + (o - lo) as usize;
+            let mut tgt = match r.target() {
+                RelocationTarget::Symbol(i) => match syms.get(i.0) {
+                    Some(Some(sy)) => resolve(i.0, sy, missing),
+                    _ => continue,
+                },
+                RelocationTarget::Section(i) => match place.get(&i).filter(|&&x| x != usize::MAX) {
+                    Some(&x) => mem + x,
+                    None => {
+                        return Err(format!(
+                            "section-target reloc into unmapped section {i:?}; restart needed"
+                        ))
+                    }
+                },
+                _ => continue,
+            };
+            let a = r.addend();
+            let RelocationFlags::MachO { r_type, r_length, .. } = r.flags() else {
+                continue;
+            };
+            match r_type {
+                a64::UNSIGNED => match r_length {
+                    3 => unsafe {
+                        (p as *mut u64).write_unaligned(tgt.wrapping_add(a as usize) as u64)
+                    },
+                    2 => unsafe {
+                        (p as *mut u32).write_unaligned(tgt.wrapping_add(a as usize) as u32)
+                    },
+                    _ => {}
+                },
+                a64::SUBTRACTOR => {
+                    // `minuend - subtrahend`: the subtrahend is the paired
+                    // UNSIGNED reloc object folds in as `subtractor()`.
+                    let sub = r
+                        .subtractor()
+                        .and_then(|i| syms.get(i.0).and_then(|o| o.as_ref()).map(|s| (i.0, s)))
+                        .map(|(si, sy)| resolve(si, sy, missing))
+                        .unwrap_or(0);
+                    tgt = tgt.wrapping_sub(sub).wrapping_add(a as usize);
+                    match r_length {
+                        3 => unsafe { (p as *mut u64).write_unaligned(tgt as u64) },
+                        2 => unsafe { (p as *mut u32).write_unaligned(tgt as u32) },
+                        _ => {}
+                    }
+                }
+                a64::BRANCH26 => {
+                    let a = (tgt as i64).wrapping_add(a).wrapping_sub(p as i64);
+                    let t = if (-(1 << 27)..(1 << 27)).contains(&(a >> 2)) {
+                        tgt
+                    } else {
+                        stub(tgt)
+                    };
+                    let a = (t as i64).wrapping_add(0).wrapping_sub(p as i64);
+                    if (a & 3) != 0 || !(-(1 << 27)..(1 << 27)).contains(&(a >> 2)) {
+                        return Err("BRANCH26 out of range".into());
+                    }
+                    unsafe {
+                        let w = p as *mut u32;
+                        *w = (*w & !0x03ff_ffff) | (((a >> 2) as u32) & 0x03ff_ffff);
+                    }
+                }
+                a64::PAGE21 => {
+                    let v = (((tgt as i64) + a) >> 12) - (p as i64 >> 12);
+                    unsafe {
+                        let w = p as *mut u32;
+                        *w = (*w & !0x60ff_ffe0)
+                            | (((v as u32) & 3) << 29)
+                            | ((((v >> 2) as u32) & 0x7ffff) << 5);
+                    }
+                }
+                a64::PAGEOFF12 => {
+                    let off = (tgt as u64).wrapping_add(a as u64) & 0xfff;
+                    unsafe {
+                        let w = p as *mut u32;
+                        let insn = *w;
+                        // Unsigned-imm loads scale imm12 by the access size
+                        // in insn[31:30]; `add`-style targets take raw bytes.
+                        let shift = imm12_shift(insn);
+                        *w = (insn & !0x003f_fc00) | (((off >> shift) as u32) << 10);
+                    }
+                }
+                a64::GOT_LOAD_PAGE21 => {
+                    let g = got_slot(tgt);
+                    let v = ((g as i64) >> 12) - (p as i64 >> 12);
+                    unsafe {
+                        let w = p as *mut u32;
+                        *w = (*w & !0x60ff_ffe0)
+                            | (((v as u32) & 3) << 29)
+                            | ((((v >> 2) as u32) & 0x7ffff) << 5);
+                    }
+                }
+                a64::GOT_LOAD_PAGEOFF12 => {
+                    let g = got_slot(tgt);
+                    let off = g as u64 & 0xfff;
+                    unsafe {
+                        let w = p as *mut u32;
+                        let insn = *w;
+                        let shift = imm12_shift(insn);
+                        *w = (insn & !0x003f_fc00) | (((off >> shift) as u32) << 10);
+                    }
+                }
+                a64::POINTER_TO_GOT => {
+                    let g = got_slot(tgt);
+                    let v = g as i64 - p as i64;
+                    let v = i32::try_from(v).map_err(|_| "POINTER_TO_GOT out of range")?;
+                    unsafe { (p as *mut i32).write_unaligned(v) };
+                }
+                a64::TLV_PAGE21 | a64::TLV_PAGEOFF12 => {
+                    return Err("patch uses thread-locals; restart needed".into())
+                }
+                t => return Err(format!("unsupported arm64 relocation type {t}")),
+            }
+        }
+        if dbg {
+            eprintln!("[hot]   range {si:?} lo={lo:#x} hi={hi:#x} applied {napp}");
+        }
+        Ok(())
+    };
+    for &(i, lo, hi) in &livev {
+        apply_relocs(
+            syms[i].as_ref().unwrap().sec.unwrap(),
+            lo,
+            hi,
+            mem + fndst[&i],
+            &mut missing,
+            &mut got_slot,
+            &mut stub,
+        )?;
+    }
+        let tapp = t1.elapsed();
+    for &si in &dsec {
+        let o = place[&si];
+        let end = p.secs.get(&si).map(|s| s.size).unwrap_or(0);
+        apply_relocs(si, 0, end, mem + o, &mut missing, &mut got_slot, &mut stub)?;
+    }
+        if dbg {
+            eprintln!(
+                "[hot] apply {:?} (fns {} data {} relocs {tapp:?})",
+                t1.elapsed(),
+                livev.len(),
+                dsec.len()
+            );
+        }
+        if !missing.is_empty() {
+            missing.sort();
+            missing.dedup();
+            return Err(format!("{} symbols not in the running binary, e.g. {:?}", missing.len(), &missing[..missing.len().min(5)]));
+        }
+        Ok(())
+    })?;
+    if dbg {
+        eprintln!("[hot] relocs {:?}", t0.elapsed());
+    }
+    let mut fns = Vec::new();
+    for (i, s) in syms.iter().enumerate() {
+        let Some(s) = s else { continue };
+        if s.kind != SymbolKind::Text || !s.def || !changed(s.name) {
+            continue;
+        }
+        if let Some(slot) = base.syms.get(&format!("__hot_slot.{}", s.name)) {
+            unsafe { (*(slot.addr as *const AtomicUsize)).store(mem + fndst[&i], Ordering::Release) };
+            if dbg {
+                eprintln!("[hot] repoint {}", s.name);
+            }
+            fns.push(s.name.to_string());
+        }
+    }
+    let n = fns.len();
+    Ok(Applied { n, prints, fns, mem, len: stub0 + 16 * nrel })
 }
 
 /// If `PLIRON_HOT_DIR` is set, apply every `*.o` that appears in it, in name order.
@@ -307,21 +1048,49 @@ pub fn start() {
             Err(e) => return eprintln!("[hot] disabled: {e}"),
         };
         let mut seen = HashSet::new();
+        let free = std::env::var_os("PLIRON_HOT_FREE").is_some();
+        let grace: usize = std::env::var("PLIRON_HOT_GRACE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let mut gnr = 0usize;
+        let mut applied: Vec<(usize, usize, HashSet<String>, usize)> = Vec::new();
+        let mut provider: HashMap<String, usize> = HashMap::new();
         loop {
             let mut new: Vec<_> = std::fs::read_dir(&dir)
                 .into_iter()
                 .flatten()
                 .flatten()
                 .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "o") && !seen.contains(p))
+                .filter(|p| {
+                    let n = p.file_name().unwrap_or_default().to_string_lossy();
+                    p.extension().is_some_and(|x| x == "o")
+                        && !n.contains(".rcgu.")
+                        && !seen.contains(p)
+                })
                 .collect();
             new.sort();
             for p in new {
                 let t = std::time::Instant::now();
                 match apply(&base, &p, prev.as_ref()) {
-                    Ok((n, prints)) => {
-                        prev = Some(prints);
-                        eprintln!("[hot] {}: {n} functions patched in {:?}", p.display(), t.elapsed())
+                    Ok(ap) => {
+                        gnr += 1;
+                        for name in &ap.fns {
+                            provider.insert(name.clone(), gnr);
+                        }
+                        eprintln!("[hot] {}: {} functions patched in {:?}", p.display(), ap.n, t.elapsed());
+                        prev = Some(ap.prints);
+                        applied.push((ap.mem, ap.len, ap.fns.iter().cloned().collect(), gnr));
+                        if free {
+                            applied.retain(|&(mem, len, ref fns, g)| {
+                                let keep = g + grace > gnr
+                                    || !fns.iter().all(|n| provider.get(n).is_some_and(|&pg| pg > g));
+                                if !keep {
+                                    unsafe { libc::munmap(mem as *mut _, len) };
+                                }
+                                keep
+                            });
+                        }
                     }
                     Err(e) => eprintln!("[hot] {}: {e}", p.display()),
                 }

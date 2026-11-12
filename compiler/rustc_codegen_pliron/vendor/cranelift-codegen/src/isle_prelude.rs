@@ -344,7 +344,10 @@ macro_rules! isle_common_prelude_methods {
         #[inline]
         fn ty_bits(&mut self, ty: Type) -> u8 {
             use core::convert::TryInto;
-            ty.bits().try_into().unwrap()
+            // PLIRON: 256/512-bit vectors exist in wide mode; saturate rather
+            // than panic — every width guard (`eq`/`le` against ≤128) still
+            // evaluates correctly for a >255-bit type.
+            ty.bits().try_into().unwrap_or(u8::MAX)
         }
 
         #[inline]
@@ -418,7 +421,7 @@ macro_rules! isle_common_prelude_methods {
         }
 
         fn fits_in_16(&mut self, ty: Type) -> Option<Type> {
-            if ty.bits() <= 16 && !ty.is_dynamic_vector() {
+            if ty.bits() <= 16 && !ty.is_vector() && !ty.is_dynamic_vector() {
                 Some(ty)
             } else {
                 None
@@ -427,7 +430,7 @@ macro_rules! isle_common_prelude_methods {
 
         #[inline]
         fn fits_in_32(&mut self, ty: Type) -> Option<Type> {
-            if ty.bits() <= 32 && !ty.is_dynamic_vector() {
+            if ty.bits() <= 32 && !ty.is_vector() && !ty.is_dynamic_vector() {
                 Some(ty)
             } else {
                 None
@@ -447,6 +450,20 @@ macro_rules! isle_common_prelude_methods {
 
         #[inline]
         fn fits_in_64(&mut self, ty: Type) -> Option<Type> {
+            // Fixed vectors share these bit widths (i8x8 = 64 bits) but
+            // must route to SIMD lanes, not scalar GPR constructors.
+            if ty.bits() <= 64 && !ty.is_vector() && !ty.is_dynamic_vector() {
+                Some(ty)
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        fn fits_in_64_allow_vec(&mut self, ty: Type) -> Option<Type> {
+            // The SIMD&FP -> GPR `bitcast` rule genuinely wants <=64-bit
+            // vectors (i8x8, i32x2, f32x2); `fits_in_64` itself excludes
+            // them so scalar-only rules can't pick up a vector operand.
             if ty.bits() <= 64 && !ty.is_dynamic_vector() {
                 Some(ty)
             } else {
@@ -490,7 +507,9 @@ macro_rules! isle_common_prelude_methods {
 
         #[inline]
         fn ty_32_or_64(&mut self, ty: Type) -> Option<Type> {
-            if ty.bits() == 32 || ty.bits() == 64 {
+            // Vectors can be 32/64 bits wide too (i8x4, i16x4, i8x8,
+            // i32x2, ...) but these rules all emit scalar GPR code.
+            if (ty.bits() == 32 || ty.bits() == 64) && !ty.is_vector() {
                 Some(ty)
             } else {
                 None
@@ -499,7 +518,8 @@ macro_rules! isle_common_prelude_methods {
 
         #[inline]
         fn ty_8_or_16(&mut self, ty: Type) -> Option<Type> {
-            if ty.bits() == 8 || ty.bits() == 16 {
+            // Same scalar-vs-vector trap as ty_32_or_64 (i8x2 is 16 bits).
+            if (ty.bits() == 8 || ty.bits() == 16) && !ty.is_vector() {
                 Some(ty)
             } else {
                 None
@@ -610,6 +630,25 @@ macro_rules! isle_common_prelude_methods {
         #[inline]
         fn ty_vec128(&mut self, ty: Type) -> Option<Type> {
             if ty.is_vector() && ty.bits() == 128 {
+                Some(ty)
+            } else {
+                None
+            }
+        }
+
+        // PLIRON: wide-vector type extractors.
+        #[inline]
+        fn ty_vec256(&mut self, ty: Type) -> Option<Type> {
+            if ty.is_vector() && ty.bits() == 256 {
+                Some(ty)
+            } else {
+                None
+            }
+        }
+
+        #[inline]
+        fn ty_vec512(&mut self, ty: Type) -> Option<Type> {
+            if ty.is_vector() && ty.bits() == 512 {
                 Some(ty)
             } else {
                 None

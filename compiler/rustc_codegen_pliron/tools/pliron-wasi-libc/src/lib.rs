@@ -1,5 +1,6 @@
 //! The slice of wasi-libc that std's `wasm32-wasip1` backend links against,
 //! written in Rust on top of the `wasip1` syscall bindings. Single-threaded.
+// r[impl wasm.libc.pure]
 #![no_std]
 #![allow(clippy::missing_safety_doc, static_mut_refs, non_upper_case_globals)]
 
@@ -46,6 +47,7 @@ unsafe extern "C" {
     fn __main_void() -> c_int;
 }
 
+// r[impl wasm.libc.start]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() {
     unsafe { __wasm_call_ctors() };
@@ -1058,6 +1060,51 @@ pub unsafe extern "C" fn pthread_attr_setstacksize(_: *mut c_void, _: size_t) ->
     0
 }
 
+// TLS keys (std's wasi errno/sys TLS): one thread, so a flat key -> value
+// table suffices. Destructors are recorded for the key's validity but
+// never run — there is no thread exit.
+const PTHREAD_KEYS_MAX: usize = 128;
+static mut TLS_VALS: [*mut c_void; PTHREAD_KEYS_MAX] = [const { null_mut() }; PTHREAD_KEYS_MAX];
+static mut TLS_NKEYS: usize = 0;
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_key_create(
+    key: *mut u32,
+    _dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+) -> c_int {
+    unsafe {
+        if key.is_null() || TLS_NKEYS >= PTHREAD_KEYS_MAX {
+            return libc::EAGAIN;
+        }
+        *key = TLS_NKEYS as u32;
+        TLS_NKEYS += 1;
+    }
+    0
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_key_delete(key: u32) -> c_int {
+    if key as usize >= unsafe { TLS_NKEYS } {
+        return libc::EINVAL;
+    }
+    unsafe { TLS_VALS[key as usize] = null_mut() };
+    0
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_setspecific(key: u32, val: *const c_void) -> c_int {
+    if key as usize >= unsafe { TLS_NKEYS } {
+        return libc::EINVAL;
+    }
+    unsafe { TLS_VALS[key as usize] = val as *mut c_void };
+    0
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_getspecific(key: u32) -> *mut c_void {
+    if key as usize >= unsafe { TLS_NKEYS } {
+        return null_mut();
+    }
+    unsafe { TLS_VALS[key as usize] }
+}
+
 // ---- misc posix used by rustc ----
 
 #[unsafe(no_mangle)]
@@ -1250,6 +1297,7 @@ unsafe extern "C" {
     static __pliron_eh: u64;
 }
 
+// r[impl wasm.eh.libc]
 unsafe fn eh_raise(exn: *mut u8) {
     let p = &raw const __pliron_eh as *mut u8;
     unsafe {

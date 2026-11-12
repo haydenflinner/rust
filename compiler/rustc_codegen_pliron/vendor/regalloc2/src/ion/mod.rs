@@ -128,7 +128,12 @@ pub fn run<F: Function>(
         env.dump_results();
     }
 
+    ctx.output.edit_vregs = edits.take_vregs();
     ctx.output.edits.extend(edits.drain_edits());
+
+    // PLIRON: repack spillslot word indices so consecutive same-direction
+    // memory edits get adjacent slots (`PLIRON_RA2_SLOTPAIR=1`).
+    spill::slot_pair_layout(func, ctx);
 
     Ok(())
 }

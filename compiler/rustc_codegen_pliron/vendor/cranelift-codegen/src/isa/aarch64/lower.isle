@@ -121,6 +121,17 @@
       (if-let amt (lshl_from_imm64 ty k))
       (add_shift ty y x amt))
 
+;; Same for a logical right shift by a constant. i32/i64 only: an i8/i16
+;; value's register has unspecified bits above its width, which `lsr`
+;; would shift into the result (`ushr` lowering zero-extends first).
+(rule iadd_ushr_right 20 (lower (iadd (ty_32_or_64 ty) x (ushr _ y (u8_from_iconst k))))
+      (if-let amt (lshr_from_u64 ty k))
+      (add_shift ty x y amt))
+
+(rule iadd_ushr_left 21 (lower (iadd (ty_32_or_64 ty) (ushr _ x (u8_from_iconst k)) y))
+      (if-let amt (lshr_from_u64 ty k))
+      (add_shift ty y x amt))
+
 ;; Fold an `iadd` and `imul` combination into a `madd` instruction.
 (rule iadd_imul_right 7 (lower (iadd (ty_int_ref_scalar_64_extract ty) x (imul _ y z)))
       (madd ty y z x))
@@ -132,7 +143,31 @@
 (rule isub_imul (lower (isub (ty_int_ref_scalar_64_extract ty) x (imul _ y z)))
       (msub ty y z x))
 
+;; Fold `iadd` of a 64-bit product of widened 32-bit operands into
+;; `umaddl`/`smaddl`. Higher priority than the generic `madd` rules so the
+;; widen instructions are consumed; distinct priorities per operand order so
+;; the overlap checker can prove the symmetric rules disjoint.
+(rule 16 (lower (iadd $I64 (imul _ (uextend _ a @ (value_type $I32))
+                                  (uextend _ b @ (value_type $I32))) c))
+      (umaddl a b c))
+(rule 17 (lower (iadd $I64 c (imul _ (uextend _ a @ (value_type $I32))
+                                     (uextend _ b @ (value_type $I32)))))
+      (umaddl a b c))
+(rule 18 (lower (iadd $I64 (imul _ (sextend _ a @ (value_type $I32))
+                                  (sextend _ b @ (value_type $I32))) c))
+      (smaddl a b c))
+(rule 19 (lower (iadd $I64 c (imul _ (sextend _ a @ (value_type $I32))
+                                     (sextend _ b @ (value_type $I32)))))
+      (smaddl a b c))
+
 ;; vectors
+
+;; Fold a vector `iadd`/`imul` pair into `mla`; integer vectors only, and
+;; `mla` has no .2d form so i64x2 falls through to `mul`+`add`.
+(rule 10 (lower (iadd ty @ (and (multi_lane _ _) (not_i64x2)) (imul _ a b) c))
+      (mla ty c a b))
+(rule 11 (lower (iadd ty @ (and (multi_lane _ _) (not_i64x2)) c (imul _ a b)))
+      (mla ty c a b))
 
 (rule -2 (lower (iadd ty @ (multi_lane _ _) x y))
       (add_vec x y (vector_size ty)))
@@ -155,6 +190,44 @@
         (with_flags
           (add_with_flags_paired $I64 x_lo y_lo)
           (adc_paired $I64 x_hi y_hi))))
+
+;; PLIRON: an `iadd.i128` operand whose high half is provably zero —
+;; `uextend.i128` or `iconcat .., iconst 0` — rides `xzr` instead of
+;; materializing `mov xN, #0` per use (the sieve u128work loop spent
+;; dead `mov`s/iter on `v/7*7 + v%97`). Zero-hi-right outranks
+;; zero-hi-left so both-extend inputs resolve deterministically.
+(rule 41 (lower (iadd $I128 x (uextend _ y)))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg_zext64 y)))
+        (with_flags
+          (add_with_flags_paired $I64 x_lo y_lo)
+          (adc_paired $I64 x_hi (zero_reg)))))
+(rule 40 (lower (iadd $I128 (uextend _ y) x))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg_zext64 y)))
+        (with_flags
+          (add_with_flags_paired $I64 x_lo y_lo)
+          (adc_paired $I64 x_hi (zero_reg)))))
+(rule 41 (lower (iadd $I128 x (iconcat _ lo (iconst _ (u64_from_imm64 0)))))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg lo)))
+        (with_flags
+          (add_with_flags_paired $I64 x_lo y_lo)
+          (adc_paired $I64 x_hi (zero_reg)))))
+(rule 40 (lower (iadd $I128 (iconcat _ lo (iconst _ (u64_from_imm64 0))) x))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg lo)))
+        (with_flags
+          (add_with_flags_paired $I64 x_lo y_lo)
+          (adc_paired $I64 x_hi (zero_reg)))))
 
 ;;;; Rules for `shuffle` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -197,6 +270,36 @@
 ;; bytes.
 (decl vec_extract_imm4_from_immediate (u8) Immediate)
 (extern extractor vec_extract_imm4_from_immediate vec_extract_imm4_from_immediate)
+
+;; A rotation of a single vector by `n` bytes — `mask[i] = (n+i) mod 16` —
+;; is `ext a, a, n` (e.g. the lane swap of a two-lane vector).
+(rule 7 (lower (shuffle _ a _ (vec_rotate_imm4_from_immediate n)))
+      (vec_extract a a n))
+
+(decl vec_rotate_imm4_from_immediate (u8) Immediate)
+(extern extractor vec_rotate_imm4_from_immediate vec_rotate_imm4_from_immediate)
+
+;; Full lane reversals of a single vector decompose into `revXX` +
+;; `ext #8` — no `tbl` and no literal-pool mask. All indices < 16 so `b`
+;; is irrelevant.
+;;
+;; Byte reverse of i8x16: `rev64.16b` flips each 8-byte group, `ext #8`
+;; swaps the halves — [b15..b0].
+(rule 8 (lower (shuffle _ a _ (u128_from_immediate 0x0001_0203_0405_0607_0809_0a0b_0c0d_0e0f)))
+      (let ((r Reg (rev64 a (VectorSize.Size8x16))))
+        (vec_extract r r 8)))
+
+;; Lane reverse of i32x4: `rev64.4s` swaps the s lanes in each d —
+;; [b,a,d,c] — `ext #8` swaps the halves — [d,c,b,a].
+(rule 8 (lower (shuffle _ a _ (u128_from_immediate 0x0302_0100_0706_0504_0b0a_0908_0f0e_0d0c)))
+      (let ((r Reg (rev64 a (VectorSize.Size32x4))))
+        (vec_extract r r 8)))
+
+;; Lane reverse of i16x8: `rev64.8h` flips h lanes per d —
+;; [d,c,b,a|h,g,f,e] — `ext #8` swaps the halves.
+(rule 8 (lower (shuffle _ a _ (u128_from_immediate 0x0100_0302_0504_0706_0908_0b0a_0d0c_0f0e)))
+      (let ((r Reg (rev64 a (VectorSize.Size16x8))))
+        (vec_extract r r 8)))
 
 ;; Rules for the `uzp1` and `uzp2` instructions which gather even-numbered lanes
 ;; or odd-numbered lanes
@@ -410,7 +513,22 @@
                             (swiden_low _ hi @ (imul _ (swiden_high _ a) (swiden_high _ b)))
                             (swiden_high _ hi)))
                         c))))
-      (sdot c a b))
+      (a64_sdot c a b))
+
+;; Same tree with both operands widened unsigned: `udot` (also FEAT_DotProd).
+;; The u8*u8 products are unsigned, so they widen with `uwiden` too.
+(rule 8 (lower (and (use_dotprod)
+                    (has_type $I32X4
+                      (iadd _
+                        (iadd_pairwise _
+                          (iadd_pairwise _
+                            (uwiden_low _ lo @ (imul _ (uwiden_low _ a) (uwiden_low _ b)))
+                            (uwiden_high _ lo))
+                          (iadd_pairwise _
+                            (uwiden_low _ hi @ (imul _ (uwiden_high _ a) (uwiden_high _ b)))
+                            (uwiden_high _ hi)))
+                        c))))
+      (a64_udot c a b))
 
 ;; With FEAT_I8MM, fold the same tree in its mixed unsigned-by-signed form
 ;; into a single `usdot`. This is the shape quantized inference produces —
@@ -428,6 +546,210 @@
                             (swiden_high _ hi)))
                         c))))
       (usdot c a b))
+
+;; Widening multiply-accumulate (`smlal`/`umlal`) folds. Our loopvec emits
+;; `iadd(iadd_pairwise(imul(widen_lo a, widen_lo b), imul(widen_hi a, widen_hi b)),
+;;       acc)` for a widening dot product at widths where no dot instruction
+;; exists (i8→i16, i16→i32, i32→i64). Both halves accumulate into `acc`,
+;; which is exactly `smlal` + `smlal2`. At i64 lanes the pairwise merge is a
+;; plain `iadd` instead (`iadd_pairwise` is undefined there). Priority 12
+;; stays above the `sdot`-family and `mla` folds whose nested-opcode patterns
+;; the overlap checker cannot prove disjoint.
+(rule 12 (lower (has_type $I16X8
+                  (iadd _ (iadd _
+                            (imul _ (swiden_low _ a) (swiden_low _ b))
+                            (imul _ (swiden_high _ a) (swiden_high _ b)))
+                        c)))
+      (smlal8 (smlal8 c a b false) a b true))
+(rule 13 (lower (has_type $I16X8
+                  (iadd _ (iadd _
+                            (imul _ (uwiden_low _ a) (uwiden_low _ b))
+                            (imul _ (uwiden_high _ a) (uwiden_high _ b)))
+                        c)))
+      (umlal8 (umlal8 c a b false) a b true))
+(rule 12 (lower (has_type $I32X4
+                  (iadd _ (iadd _
+                            (imul _ (swiden_low _ a) (swiden_low _ b))
+                            (imul _ (swiden_high _ a) (swiden_high _ b)))
+                        c)))
+      (smlal16 (smlal16 c a b false) a b true))
+(rule 14 (lower (has_type $I32X4
+                  (iadd _ (iadd _
+                            (imul _ (uwiden_low _ a) (uwiden_low _ b))
+                            (imul _ (uwiden_high _ a) (uwiden_high _ b)))
+                        c)))
+      (umlal16 (umlal16 c a b false) a b true))
+(rule 12 (lower (has_type $I64X2
+                  (iadd _ (iadd _
+                            (imul _ (swiden_low _ a) (swiden_low _ b))
+                            (imul _ (swiden_high _ a) (swiden_high _ b)))
+                        c)))
+      (smlal32 (smlal32 c a b false) a b true))
+(rule 15 (lower (has_type $I64X2
+                  (iadd _ (iadd _
+                            (imul _ (uwiden_low _ a) (uwiden_low _ b))
+                            (imul _ (uwiden_high _ a) (uwiden_high _ b)))
+                        c)))
+      (umlal32 (umlal32 c a b false) a b true))
+
+;; PLIRON: Widening-add folds (`uaddw`/`saddw`): `iadd(acc, uwiden(x))` adds
+;; the extended lanes of `x` straight into the wide accumulator, skipping the
+;; `ushll` materialization — the widening-reduction shape loopvec emits.
+;; Priorities: 20/21 for the single-widen form in each operand order, 22 for
+;; `widen+widen` (`uaddl`/`saddl` — overlaps the single form on
+;; `iadd(uwiden,uwiden)`), 23/24 for the lo+hi pair into an accumulator in
+;; each operand order. Repeated `x` bindings are equality-checked, so the
+;; pair form only matches when both halves widen the same vector.
+(rule 20 (lower (has_type $I16X8 (iadd _ a (uwiden_low _ x))))
+      (uaddw8 a x false))
+(rule 21 (lower (has_type $I16X8 (iadd _ (uwiden_low _ x) a)))
+      (uaddw8 a x false))
+(rule 20 (lower (has_type $I16X8 (iadd _ a (uwiden_high _ x))))
+      (uaddw8 a x true))
+(rule 21 (lower (has_type $I16X8 (iadd _ (uwiden_high _ x) a)))
+      (uaddw8 a x true))
+(rule 20 (lower (has_type $I32X4 (iadd _ a (uwiden_low _ x))))
+      (uaddw16 a x false))
+(rule 21 (lower (has_type $I32X4 (iadd _ (uwiden_low _ x) a)))
+      (uaddw16 a x false))
+(rule 20 (lower (has_type $I32X4 (iadd _ a (uwiden_high _ x))))
+      (uaddw16 a x true))
+(rule 21 (lower (has_type $I32X4 (iadd _ (uwiden_high _ x) a)))
+      (uaddw16 a x true))
+(rule 20 (lower (has_type $I64X2 (iadd _ a (uwiden_low _ x))))
+      (uaddw32 a x false))
+(rule 21 (lower (has_type $I64X2 (iadd _ (uwiden_low _ x) a)))
+      (uaddw32 a x false))
+(rule 20 (lower (has_type $I64X2 (iadd _ a (uwiden_high _ x))))
+      (uaddw32 a x true))
+(rule 21 (lower (has_type $I64X2 (iadd _ (uwiden_high _ x) a)))
+      (uaddw32 a x true))
+(rule 20 (lower (has_type $I16X8 (iadd _ a (swiden_low _ x))))
+      (saddw8 a x false))
+(rule 21 (lower (has_type $I16X8 (iadd _ (swiden_low _ x) a)))
+      (saddw8 a x false))
+(rule 20 (lower (has_type $I16X8 (iadd _ a (swiden_high _ x))))
+      (saddw8 a x true))
+(rule 21 (lower (has_type $I16X8 (iadd _ (swiden_high _ x) a)))
+      (saddw8 a x true))
+(rule 20 (lower (has_type $I32X4 (iadd _ a (swiden_low _ x))))
+      (saddw16 a x false))
+(rule 21 (lower (has_type $I32X4 (iadd _ (swiden_low _ x) a)))
+      (saddw16 a x false))
+(rule 20 (lower (has_type $I32X4 (iadd _ a (swiden_high _ x))))
+      (saddw16 a x true))
+(rule 21 (lower (has_type $I32X4 (iadd _ (swiden_high _ x) a)))
+      (saddw16 a x true))
+(rule 20 (lower (has_type $I64X2 (iadd _ a (swiden_low _ x))))
+      (saddw32 a x false))
+(rule 21 (lower (has_type $I64X2 (iadd _ (swiden_low _ x) a)))
+      (saddw32 a x false))
+(rule 20 (lower (has_type $I64X2 (iadd _ a (swiden_high _ x))))
+      (saddw32 a x true))
+(rule 21 (lower (has_type $I64X2 (iadd _ (swiden_high _ x) a)))
+      (saddw32 a x true))
+
+;; `iadd(uwiden_low a, uwiden_low b)` is `uaddl` — one instruction for two
+;; narrow operands widened and added.
+(rule 22 (lower (has_type $I16X8 (iadd _ (uwiden_low _ x) (uwiden_low _ y))))
+      (uaddl8 x y false))
+(rule 22 (lower (has_type $I16X8 (iadd _ (uwiden_high _ x) (uwiden_high _ y))))
+      (uaddl8 x y true))
+(rule 22 (lower (has_type $I32X4 (iadd _ (uwiden_low _ x) (uwiden_low _ y))))
+      (uaddl16 x y false))
+(rule 22 (lower (has_type $I32X4 (iadd _ (uwiden_high _ x) (uwiden_high _ y))))
+      (uaddl16 x y true))
+(rule 22 (lower (has_type $I64X2 (iadd _ (uwiden_low _ x) (uwiden_low _ y))))
+      (uaddl32 x y false))
+(rule 22 (lower (has_type $I64X2 (iadd _ (uwiden_high _ x) (uwiden_high _ y))))
+      (uaddl32 x y true))
+(rule 22 (lower (has_type $I16X8 (iadd _ (swiden_low _ x) (swiden_low _ y))))
+      (saddl8 x y false))
+(rule 22 (lower (has_type $I16X8 (iadd _ (swiden_high _ x) (swiden_high _ y))))
+      (saddl8 x y true))
+(rule 22 (lower (has_type $I32X4 (iadd _ (swiden_low _ x) (swiden_low _ y))))
+      (saddl16 x y false))
+(rule 22 (lower (has_type $I32X4 (iadd _ (swiden_high _ x) (swiden_high _ y))))
+      (saddl16 x y true))
+(rule 22 (lower (has_type $I64X2 (iadd _ (swiden_low _ x) (swiden_low _ y))))
+      (saddl32 x y false))
+(rule 22 (lower (has_type $I64X2 (iadd _ (swiden_high _ x) (swiden_high _ y))))
+      (saddl32 x y true))
+
+;; `iadd(acc, iadd(widen_lo x, widen_hi x))` — a whole vector widening into
+;; an accumulator — chains `uaddw`+`uaddw2` straight through `acc`.
+(rule 23 (lower (has_type $I16X8
+                  (iadd _ a (iadd _ (uwiden_low _ x) (uwiden_high _ x)))))
+      (uaddw8 (uaddw8 a x false) x true))
+(rule 23 (lower (has_type $I16X8
+                  (iadd _ a (iadd _ (uwiden_high _ x) (uwiden_low _ x)))))
+      (uaddw8 (uaddw8 a x false) x true))
+(rule 24 (lower (has_type $I16X8
+                  (iadd _ (iadd _ (uwiden_low _ x) (uwiden_high _ x)) a)))
+      (uaddw8 (uaddw8 a x false) x true))
+(rule 24 (lower (has_type $I16X8
+                  (iadd _ (iadd _ (uwiden_high _ x) (uwiden_low _ x)) a)))
+      (uaddw8 (uaddw8 a x false) x true))
+(rule 23 (lower (has_type $I32X4
+                  (iadd _ a (iadd _ (uwiden_low _ x) (uwiden_high _ x)))))
+      (uaddw16 (uaddw16 a x false) x true))
+(rule 23 (lower (has_type $I32X4
+                  (iadd _ a (iadd _ (uwiden_high _ x) (uwiden_low _ x)))))
+      (uaddw16 (uaddw16 a x false) x true))
+(rule 24 (lower (has_type $I32X4
+                  (iadd _ (iadd _ (uwiden_low _ x) (uwiden_high _ x)) a)))
+      (uaddw16 (uaddw16 a x false) x true))
+(rule 24 (lower (has_type $I32X4
+                  (iadd _ (iadd _ (uwiden_high _ x) (uwiden_low _ x)) a)))
+      (uaddw16 (uaddw16 a x false) x true))
+(rule 23 (lower (has_type $I64X2
+                  (iadd _ a (iadd _ (uwiden_low _ x) (uwiden_high _ x)))))
+      (uaddw32 (uaddw32 a x false) x true))
+(rule 23 (lower (has_type $I64X2
+                  (iadd _ a (iadd _ (uwiden_high _ x) (uwiden_low _ x)))))
+      (uaddw32 (uaddw32 a x false) x true))
+(rule 24 (lower (has_type $I64X2
+                  (iadd _ (iadd _ (uwiden_low _ x) (uwiden_high _ x)) a)))
+      (uaddw32 (uaddw32 a x false) x true))
+(rule 24 (lower (has_type $I64X2
+                  (iadd _ (iadd _ (uwiden_high _ x) (uwiden_low _ x)) a)))
+      (uaddw32 (uaddw32 a x false) x true))
+(rule 23 (lower (has_type $I16X8
+                  (iadd _ a (iadd _ (swiden_low _ x) (swiden_high _ x)))))
+      (saddw8 (saddw8 a x false) x true))
+(rule 23 (lower (has_type $I16X8
+                  (iadd _ a (iadd _ (swiden_high _ x) (swiden_low _ x)))))
+      (saddw8 (saddw8 a x false) x true))
+(rule 24 (lower (has_type $I16X8
+                  (iadd _ (iadd _ (swiden_low _ x) (swiden_high _ x)) a)))
+      (saddw8 (saddw8 a x false) x true))
+(rule 24 (lower (has_type $I16X8
+                  (iadd _ (iadd _ (swiden_high _ x) (swiden_low _ x)) a)))
+      (saddw8 (saddw8 a x false) x true))
+(rule 23 (lower (has_type $I32X4
+                  (iadd _ a (iadd _ (swiden_low _ x) (swiden_high _ x)))))
+      (saddw16 (saddw16 a x false) x true))
+(rule 23 (lower (has_type $I32X4
+                  (iadd _ a (iadd _ (swiden_high _ x) (swiden_low _ x)))))
+      (saddw16 (saddw16 a x false) x true))
+(rule 24 (lower (has_type $I32X4
+                  (iadd _ (iadd _ (swiden_low _ x) (swiden_high _ x)) a)))
+      (saddw16 (saddw16 a x false) x true))
+(rule 24 (lower (has_type $I32X4
+                  (iadd _ (iadd _ (swiden_high _ x) (swiden_low _ x)) a)))
+      (saddw16 (saddw16 a x false) x true))
+(rule 23 (lower (has_type $I64X2
+                  (iadd _ a (iadd _ (swiden_low _ x) (swiden_high _ x)))))
+      (saddw32 (saddw32 a x false) x true))
+(rule 23 (lower (has_type $I64X2
+                  (iadd _ a (iadd _ (swiden_high _ x) (swiden_low _ x)))))
+      (saddw32 (saddw32 a x false) x true))
+(rule 24 (lower (has_type $I64X2
+                  (iadd _ (iadd _ (swiden_low _ x) (swiden_high _ x)) a)))
+      (saddw32 (saddw32 a x false) x true))
+(rule 24 (lower (has_type $I64X2
+                  (iadd _ (iadd _ (swiden_high _ x) (swiden_low _ x)) a)))
+      (saddw32 (saddw32 a x false) x true))
 
 ;;;; Rules for `iabs` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -554,10 +876,18 @@
 (rule (lower (fpromote $F64 x))
       (fpu_rr (FPUOp1.Cvt32To64) x (ScalarSize.Size32)))
 
+;; PLIRON: f16 -> f32 is `fcvt s, h`.
+(rule (lower (fpromote $F32 x))
+      (fpu_rr (FPUOp1.Cvt16To32) x (ScalarSize.Size16)))
+
 ;;;; Rules for `fdemote` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (fdemote $F32 x))
       (fpu_rr (FPUOp1.Cvt64To32) x (ScalarSize.Size64)))
+
+;; PLIRON: f32 -> f16 is `fcvt h, s`.
+(rule (lower (fdemote $F16 x))
+      (fpu_rr (FPUOp1.Cvt32To16) x (ScalarSize.Size32)))
 
 ;;;; Rules for `ceil` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -823,6 +1153,12 @@
       (sub_shift ty x y amt))
 
 ;; vectors
+
+;; Fold vector `isub`/`imul` into `mls`; `isub` is not commutative so only
+;; the product-as-subtrahend form folds. No .2d form (i64x2 falls through).
+(rule 10 (lower (isub ty @ (and (multi_lane _ _) (not_i64x2)) c (imul _ a b)))
+      (mls ty c a b))
+
 (rule -2 (lower (isub ty @ (multi_lane _ _) x y))
       (sub_vec x y (vector_size ty)))
 
@@ -830,6 +1166,41 @@
 (attr rule isub_i128 (tag i128))
 (rule isub_i128 -1 (lower (isub $I128 x y))
       (sub_i128 x y))
+
+;; PLIRON: same zero-high-half trick for `isub.i128`; on the left the
+;; whole borrow resolves through `sbc xzr, x_hi` (`ngc`).
+(rule 41 (lower (isub $I128 x (uextend _ y)))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg_zext64 y)))
+        (with_flags
+          (sub_with_flags_paired $I64 x_lo y_lo)
+          (sbc_paired $I64 x_hi (zero_reg)))))
+(rule 41 (lower (isub $I128 x (iconcat _ lo (iconst _ (u64_from_imm64 0)))))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg lo)))
+        (with_flags
+          (sub_with_flags_paired $I64 x_lo y_lo)
+          (sbc_paired $I64 x_hi (zero_reg)))))
+(rule 40 (lower (isub $I128 (uextend _ y) x))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg_zext64 y)))
+        (with_flags
+          (sub_with_flags_paired $I64 y_lo x_lo)
+          (sbc_paired $I64 (zero_reg) x_hi))))
+(rule 40 (lower (isub $I128 (iconcat _ lo (iconst _ (u64_from_imm64 0))) x))
+      (let ((x_regs ValueRegs x)
+            (x_lo Reg (value_regs_get x_regs 0))
+            (x_hi Reg (value_regs_get x_regs 1))
+            (y_lo Reg (put_in_reg lo)))
+        (with_flags
+          (sub_with_flags_paired $I64 y_lo x_lo)
+          (sbc_paired $I64 (zero_reg) x_hi))))
 
 ;;;; Rules for `uadd_sat` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -870,6 +1241,32 @@
 ;; `i64` and smaller.
 (rule imul_base_case -3 (lower (imul (ty_int_ref_scalar_64_extract ty) x y))
       (madd ty x y (zero_reg)))
+
+;; PLIRON: `imul x, 2^n + 1` lowers to a single `add x, x, lsl #n`; the
+;; `movz` for the constant and the `madd`'s 3-cycle latency both disappear.
+(rule 4 (lower (imul (ty_int_ref_scalar_64_extract ty) x (iconst _ (u64_from_imm64 c))))
+      (if-let n (imul_pow2p1_shamt ty c))
+      (let ((xx Reg (put_in_reg x)))
+        (add_shift ty xx xx (lshl_from_u64 ty (u8_into_u64 n)))))
+
+;; PLIRON: `imul x, 2^n - 1` is `(x << n) - x` — `lsl` + `sub`.
+(rule 2 (lower (imul (ty_int_ref_scalar_64_extract ty) x (iconst _ (u64_from_imm64 c))))
+      (if-let n (imul_pow2m1_shamt ty c))
+      (let ((xx Reg (put_in_reg x))
+            (sh Reg (alu_rr_imm_shift (ALUOp.Lsl) ty xx (imm_shift_from_u8 n))))
+        (sub ty sh xx)))
+
+;; PLIRON: same folds with the constant on the left.
+(rule 3 (lower (imul (ty_int_ref_scalar_64_extract ty) (iconst _ (u64_from_imm64 c)) x))
+      (if-let n (imul_pow2p1_shamt ty c))
+      (let ((xx Reg (put_in_reg x)))
+        (add_shift ty xx xx (lshl_from_u64 ty (u8_into_u64 n)))))
+
+(rule 1 (lower (imul (ty_int_ref_scalar_64_extract ty) (iconst _ (u64_from_imm64 c)) x))
+      (if-let n (imul_pow2m1_shamt ty c))
+      (let ((xx Reg (put_in_reg x))
+            (sh Reg (alu_rr_imm_shift (ALUOp.Lsl) ty xx (imm_shift_from_u8 n))))
+        (sub ty sh xx)))
 
 ;; `i128`.
 (attr rule imul_i128 (tag i128))
@@ -1277,8 +1674,23 @@
 
 ;; General rule for extending input to an output which fits in a single
 ;; register.
-(rule uextend -2 (lower (uextend (fits_in_64 out) x @ (value_type in)))
+(rule uextend -3 (lower (uextend (fits_in_64 out) x @ (value_type in)))
       (extend x false (ty_bits in) (ty_bits out)))
+
+;; PLIRON: `icmp`/`fcmp` materialize as `cset`/`fcset`, which already write a
+;; full-width 0/1 — re-extending that result is a dead instruction.
+(rule uextend_icmp 0 (lower (uextend (fits_in_64 _) x @ (icmp _ _ _ _)))
+      (put_in_reg x))
+(rule uextend_fcmp 0 (lower (uextend (fits_in_64 _) x @ (fcmp _ _ _ _)))
+      (put_in_reg x))
+
+;; PLIRON (`PLIRON_NARROWEXT=1`): any i8/i16 whose register is already
+;; zero-extended (`val_already_extended`) needs no `uxtb`/`uxth`. Below the
+;; load-fusing rules, which already fold the extension into `ldrb`/`ldrh`.
+(rule uextend_clean -2 (lower (uextend (fits_in_64 _) x @ (value_type (fits_in_16 _))))
+      (if-let true (narrowext_on 4))
+      (if-let true (val_already_extended (ArgumentExtension.Uext) x))
+      (put_in_reg x))
 
 ;; Extraction of a vector lane automatically extends as necessary, so we can
 ;; skip an explicit extending instruction.
@@ -1323,6 +1735,13 @@
 ;; register.
 (rule sextend -4 (lower (sextend (fits_in_64 out) x @ (value_type in)))
       (extend x true (ty_bits in) (ty_bits out)))
+
+;; PLIRON: as for `uextend` above — a `cset` result is already 0/1 at full
+;; width, so sign-extending it is a no-op.
+(rule -1 (lower (sextend (fits_in_64 _) x @ (icmp _ _ _ _)))
+      (put_in_reg x))
+(rule -1 (lower (sextend (fits_in_64 _) x @ (fcmp _ _ _ _)))
+      (put_in_reg x))
 
 ;; Extraction of a vector lane automatically extends as necessary, so we can
 ;; skip an explicit extending instruction.
@@ -1421,6 +1840,27 @@
 (rule band_fits_in_64 -5 (lower (band (fits_in_64 (ty_int ty)) x y))
       (alu_rs_imm_logic_commutative (ALUOp.And) ty x y))
 
+;; PLIRON (`PLIRON_NARROWEXT=1`): `band (ireduce x) k` with a canonical
+;; narrow `k` masks `x`'s register directly — the `uxtb`/`uxth` the
+;; `ireduce` would materialize is dead under the mask. The result is still
+;; clean (bits above `k` are zero), as `narrow_uext_clean` assumes.
+;;
+;; `x` goes in as a plain register: `alu_rs_imm_logic_commutative` would
+;; fold an `ishl y, s` defining `x` into a shifted operand with `s` masked
+;; by the narrow `ty` (mod 8/16), not by `x`'s own width — `(y << 10) as u8
+;; & k` became `(y << 2) & k` (rustlantis seed 12309).
+(rule band_ireduce_imm 30 (lower (band (fits_in_16 ty) (ireduce _ x @ (value_type (fits_in_64 _)))
+                                      (iconst _ k @ (u64_from_imm64 kk))))
+      (if-let true (narrowext_on 16))
+      (if-let true (u64_lt_eq kk (ty_mask ty)))
+      (if-let imm (imm_logic_from_imm64 ty k))
+      (alu_rr_imm_logic (ALUOp.And) ty (put_in_reg x) imm))
+(rule band_ireduce_reg 29 (lower (band (fits_in_16 ty) (ireduce _ x @ (value_type (fits_in_64 _)))
+                                      y @ (iconst _ (u64_from_imm64 kk))))
+      (if-let true (narrowext_on 16))
+      (if-let true (u64_lt_eq kk (ty_mask ty)))
+      (alu_rrr (ALUOp.And) ty (put_in_reg x) (put_in_reg y)))
+
 (rule -4 (lower (band (fits_in_64 (ty_scalar_float ty)) x y))
       (and_vec x y (float_vector_size_in_64 ty)))
 
@@ -1431,6 +1871,17 @@
       (and_vec x y (vector_size ty)))
 
 (rule (lower (band $I128 x y)) (i128_alu_bitop (ALUOp.And) $I64 x y))
+
+;; PLIRON (`PLIRON_CCMP`, default on): a `band`/`bor` of two integer
+;; compares whose result is consumed as a value is `cmp; ccmp; cset`
+;; (3) instead of `cmp; cset; cmp; cset; and` (5) — `ccmp_band_out`
+;; emits the fused chain or, declining, the base `and`/`orr` on the
+;; bound arm values. `fits_in_32` covers the i8 (`icmp` result) and
+;; i32 (uextend'd bool) shapes.
+(rule 55 (lower (band (fits_in_64 (ty_int ty))
+                      a0 @ (maybe_uextend (icmp _ cc0 x0 y0))
+                      a1 @ (maybe_uextend (icmp _ cc1 x1 y1))))
+      (ccmp_band_out 0 ty a0 cc0 x0 y0 a1 cc1 x1 y1))
 
 ;; Specialized lowerings for `(band x (bnot y))` which is additionally produced
 ;; by Cranelift's `band_not` builder method, which emits the simpler
@@ -1457,6 +1908,13 @@
 
 (rule bor_fits_in_64 -4 (lower (bor (fits_in_64 (ty_int ty)) x y))
       (alu_rs_imm_logic_commutative (ALUOp.Orr) ty x y))
+
+;; PLIRON (`PLIRON_CCMP`, default on): `bor` of two compares as a
+;; value — `cmp; ccmp; cset` (3) vs `cmp; cset; cmp; cset; orr` (5).
+(rule 55 (lower (bor (fits_in_64 (ty_int ty))
+                     a0 @ (maybe_uextend (icmp _ cc0 x0 y0))
+                     a1 @ (maybe_uextend (icmp _ cc1 x1 y1))))
+      (ccmp_band_out 3 ty a0 cc0 x0 y0 a1 cc1 x1 y1))
 
 (rule -3 (lower (bor (fits_in_64 (ty_scalar_float ty)) x y))
       (orr_vec x y (float_vector_size_in_64 ty)))
@@ -1548,6 +2006,273 @@
 (rule 3 (lower (bxor $I128 x (bnot _ y))) (i128_alu_bitop (ALUOp.EorNot) $I64 x y))
 (rule 4 (lower (bxor $I128 (bnot _ y) x)) (i128_alu_bitop (ALUOp.EorNot) $I64 x y))
 
+;; PLIRON: fuse a constant shifted/rotated operand into scalar logical ops
+;; (`eor x, y, z, ror #k` and friends, as LLVM emits for e.g. SipHash
+;; rounds). The logical (shifted register) encoding supports all four
+;; shift kinds including ROR (the add/sub encoding does not). `rotl x, k`
+;; becomes `ror x, bits-k`. Restricted to i32/i64: the shifted-register
+;; forms operate on full registers.
+
+(rule band_lsl_op 40 (lower (band (ty_32_or_64 ty) x (ishl _ y (u8_from_iconst k))))
+      (if-let shift (lshl_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.And) ty x y shift))
+(rule band_lsl_op_l 45 (lower (band (ty_32_or_64 ty) (ishl _ x (u8_from_iconst k)) y))
+      (if-let shift (lshl_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.And) ty y x shift))
+(rule band_lsr_op 41 (lower (band (ty_32_or_64 ty) x (ushr _ y (u8_from_iconst k))))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.And) ty x y shift))
+(rule band_lsr_op_l 46 (lower (band (ty_32_or_64 ty) (ushr _ x (u8_from_iconst k)) y))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.And) ty y x shift))
+(rule band_asr_op 42 (lower (band (ty_32_or_64 ty) x (sshr _ y (u8_from_iconst k))))
+      (if-let shift (ashr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.And) ty x y shift))
+(rule band_asr_op_l 47 (lower (band (ty_32_or_64 ty) (sshr _ x (u8_from_iconst k)) y))
+      (if-let shift (ashr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.And) ty y x shift))
+(rule band_ror_op 43 (lower (band (ty_32_or_64 ty) x r @ (rotr _ y (u8_from_iconst k))))
+      (if-let true (rot_fold_ok r))
+      (if-let shift (rotr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.And) ty x y shift))
+(rule band_ror_op_l 48 (lower (band (ty_32_or_64 ty) r @ (rotr _ x (u8_from_iconst k)) y))
+      (if-let true (rot_fold_ok r))
+      (if-let shift (rotr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.And) ty y x shift))
+(rule band_rol_op 44 (lower (band (ty_32_or_64 ty) x r @ (rotl _ y (u8_from_iconst k))))
+      (if-let true (rot_fold_ok r))
+      (if-let shift (rotr_from_u64 ty (u64_wrapping_sub (ty_bits ty) k)))
+      (alu_rrr_shift (ALUOp.And) ty x y shift))
+(rule band_rol_op_l 49 (lower (band (ty_32_or_64 ty) r @ (rotl _ x (u8_from_iconst k)) y))
+      (if-let true (rot_fold_ok r))
+      (if-let shift (rotr_from_u64 ty (u64_wrapping_sub (ty_bits ty) k)))
+      (alu_rrr_shift (ALUOp.And) ty y x shift))
+
+(rule bxor_lsl_op 50 (lower (bxor (ty_32_or_64 ty) x (ishl _ y (u8_from_iconst k))))
+      (if-let shift (lshl_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Eor) ty x y shift))
+(rule bxor_lsl_op_l 55 (lower (bxor (ty_32_or_64 ty) (ishl _ x (u8_from_iconst k)) y))
+      (if-let shift (lshl_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Eor) ty y x shift))
+(rule bxor_lsr_op 51 (lower (bxor (ty_32_or_64 ty) x (ushr _ y (u8_from_iconst k))))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Eor) ty x y shift))
+(rule bxor_lsr_op_l 56 (lower (bxor (ty_32_or_64 ty) (ushr _ x (u8_from_iconst k)) y))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Eor) ty y x shift))
+(rule bxor_asr_op 52 (lower (bxor (ty_32_or_64 ty) x (sshr _ y (u8_from_iconst k))))
+      (if-let shift (ashr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Eor) ty x y shift))
+(rule bxor_asr_op_l 57 (lower (bxor (ty_32_or_64 ty) (sshr _ x (u8_from_iconst k)) y))
+      (if-let shift (ashr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Eor) ty y x shift))
+(rule bxor_ror_op 53 (lower (bxor (ty_32_or_64 ty) x r @ (rotr _ y (u8_from_iconst k))))
+      (if-let true (rot_fold_ok r))
+      (if-let shift (rotr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Eor) ty x y shift))
+(rule bxor_ror_op_l 58 (lower (bxor (ty_32_or_64 ty) r @ (rotr _ x (u8_from_iconst k)) y))
+      (if-let true (rot_fold_ok r))
+      (if-let shift (rotr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Eor) ty y x shift))
+(rule bxor_rol_op 54 (lower (bxor (ty_32_or_64 ty) x r @ (rotl _ y (u8_from_iconst k))))
+      (if-let true (rot_fold_ok r))
+      (if-let shift (rotr_from_u64 ty (u64_wrapping_sub (ty_bits ty) k)))
+      (alu_rrr_shift (ALUOp.Eor) ty x y shift))
+(rule bxor_rol_op_l 59 (lower (bxor (ty_32_or_64 ty) r @ (rotl _ x (u8_from_iconst k)) y))
+      (if-let true (rot_fold_ok r))
+      (if-let shift (rotr_from_u64 ty (u64_wrapping_sub (ty_bits ty) k)))
+      (alu_rrr_shift (ALUOp.Eor) ty y x shift))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 32): the shifted-operand fusion above,
+;; for i8/i16 logical ops. `ishl` operands need no rule — the generic
+;; `alu_rs_imm_logic` helpers already fold them at any width (`y lsl k`
+;; is exact below the narrow width). An `ushr` operand fuses only when
+;; `y`'s register is already narrow-clean (`narrowext_clean`), since
+;; `y lsr k`'s low bits must be `y`'s own, not the unspecified high bits.
+(rule bor_lsr_op_narrow 70 (lower (bor (fits_in_16 ty) x (ushr _ y (u8_from_iconst k))))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean y))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Orr) ty x y shift))
+(rule bor_lsr_op_narrow_l 71 (lower (bor (fits_in_16 ty) (ushr _ x (u8_from_iconst k)) y))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean x))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Orr) ty y x shift))
+(rule band_lsr_op_narrow 72 (lower (band (fits_in_16 ty) x (ushr _ y (u8_from_iconst k))))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean y))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.And) ty x y shift))
+(rule band_lsr_op_narrow_l 73 (lower (band (fits_in_16 ty) (ushr _ x (u8_from_iconst k)) y))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean x))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.And) ty y x shift))
+(rule bxor_lsr_op_narrow 74 (lower (bxor (fits_in_16 ty) x (ushr _ y (u8_from_iconst k))))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean y))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Eor) ty x y shift))
+(rule bxor_lsr_op_narrow_l 75 (lower (bxor (fits_in_16 ty) (ushr _ x (u8_from_iconst k)) y))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean x))
+      (if-let shift (lshr_from_u64 ty k))
+      (alu_rrr_shift (ALUOp.Eor) ty y x shift))
+
+;; PLIRON (`PLIRON_BFUSE`, default on): bitfield fusion — `(x>>k)&m` and
+;; `(x&m)<<k` are one `ubfm` (`ubfx`/`ubfiz`); `y|((x&m)<<k)` and
+;; `y|((x<<k)&m')` become `bfm` (`bfi`) when `bf_disjoint*` proves `y`'s
+;; field bits zero with a bounded known-bits walk — a miss keeps the
+;; `orr`. The `band (ushr..)`/`band (ishl..)` rules outrank
+;; `band_lsr_op_l`/`band_lsl_op_l` (45/46): `ubfx` encodes the mask in
+;; the instruction, so no constant materializes at all.
+(rule 60 (lower (band (fits_in_64 (ty_int ty))
+                      (ushr _ x (iconst _ (u64_from_imm64 k)))
+                      (iconst _ (u64_from_imm64 m))))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_imm_u8 k))
+      (if-let imms (bf_ubfx_imms ty m k))
+      (ubfm (operand_size ty) (put_in_reg x) immr imms))
+(rule 61 (lower (band (fits_in_64 (ty_int ty))
+                      (iconst _ (u64_from_imm64 m))
+                      (ushr _ x (iconst _ (u64_from_imm64 k)))))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_imm_u8 k))
+      (if-let imms (bf_ubfx_imms ty m k))
+      (ubfm (operand_size ty) (put_in_reg x) immr imms))
+(rule 62 (lower (band (fits_in_64 (ty_int ty))
+                      (ishl _ x (iconst _ (u64_from_imm64 k)))
+                      (iconst _ (u64_from_imm64 m))))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_ubfiz_immr ty k))
+      (if-let imms (bf_field_ubfiz_imms ty m k))
+      (ubfm (operand_size ty) (put_in_reg x) immr imms))
+(rule 63 (lower (band (fits_in_64 (ty_int ty))
+                      (iconst _ (u64_from_imm64 m))
+                      (ishl _ x (iconst _ (u64_from_imm64 k)))))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_ubfiz_immr ty k))
+      (if-let imms (bf_field_ubfiz_imms ty m k))
+      (ubfm (operand_size ty) (put_in_reg x) immr imms))
+
+;; `ishl (band x, lowmask(w)), k` and `ushr (band x, lowmask(w)<<k), k`
+;; — the field ops without an outer mask.
+(rule 64 (lower (ishl (fits_in_64 (ty_int ty))
+                      (band _ x (iconst _ (u64_from_imm64 m)))
+                      (iconst _ (u64_from_imm64 k))))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_ubfiz_immr ty k))
+      (if-let imms (bf_ubfiz_imms ty m k))
+      (ubfm (operand_size ty) (put_in_reg x) immr imms))
+(rule 65 (lower (ishl (fits_in_64 (ty_int ty))
+                      (band _ (iconst _ (u64_from_imm64 m)) x)
+                      (iconst _ (u64_from_imm64 k))))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_ubfiz_immr ty k))
+      (if-let imms (bf_ubfiz_imms ty m k))
+      (ubfm (operand_size ty) (put_in_reg x) immr imms))
+(rule 66 (lower (ushr (fits_in_64 (ty_int ty))
+                      (band _ x (iconst _ (u64_from_imm64 m)))
+                      (iconst _ (u64_from_imm64 k))))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_imm_u8 k))
+      (if-let imms (bf_field_imms ty m k))
+      (ubfm (operand_size ty) (put_in_reg x) immr imms))
+(rule 67 (lower (ushr (fits_in_64 (ty_int ty))
+                      (band _ (iconst _ (u64_from_imm64 m)) x)
+                      (iconst _ (u64_from_imm64 k))))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_imm_u8 k))
+      (if-let imms (bf_field_imms ty m k))
+      (ubfm (operand_size ty) (put_in_reg x) immr imms))
+
+;; `bfi`: these sit above `extr_32_or_64` (5) but can never steal a
+;; rotate: when `extr` applies the `ushr` operand's live bits are
+;; exactly the field, so `bf_disjoint*` fails and `extr` still gets it.
+(rule 10 (lower (bor (fits_in_64 (ty_int ty))
+                    y
+                    (ishl _ (band _ x (iconst _ (u64_from_imm64 m)))
+                            (iconst _ (u64_from_imm64 k)))))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_ubfiz_immr ty k))
+      (if-let imms (bf_ubfiz_imms ty m k))
+      (if-let true (bf_disjoint_lowfield y m k))
+      (bfm (operand_size ty) (put_in_reg x) (put_in_reg y) immr imms))
+(rule 11 (lower (bor (fits_in_64 (ty_int ty))
+                    y
+                    (ishl _ (band _ (iconst _ (u64_from_imm64 m)) x)
+                            (iconst _ (u64_from_imm64 k)))))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_ubfiz_immr ty k))
+      (if-let imms (bf_ubfiz_imms ty m k))
+      (if-let true (bf_disjoint_lowfield y m k))
+      (bfm (operand_size ty) (put_in_reg x) (put_in_reg y) immr imms))
+(rule 9 (lower (bor (fits_in_64 (ty_int ty))
+                    (ishl _ (band _ x (iconst _ (u64_from_imm64 m)))
+                            (iconst _ (u64_from_imm64 k)))
+                    y))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_ubfiz_immr ty k))
+      (if-let imms (bf_ubfiz_imms ty m k))
+      (if-let true (bf_disjoint_lowfield y m k))
+      (bfm (operand_size ty) (put_in_reg x) (put_in_reg y) immr imms))
+(rule 12 (lower (bor (fits_in_64 (ty_int ty))
+                    (ishl _ (band _ (iconst _ (u64_from_imm64 m)) x)
+                            (iconst _ (u64_from_imm64 k)))
+                    y))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_ubfiz_immr ty k))
+      (if-let imms (bf_ubfiz_imms ty m k))
+      (if-let true (bf_disjoint_lowfield y m k))
+      (bfm (operand_size ty) (put_in_reg x) (put_in_reg y) immr imms))
+(rule 10 (lower (bor (fits_in_64 (ty_int ty))
+                    y
+                    (band _ (ishl _ x (iconst _ (u64_from_imm64 k)))
+                            (iconst _ (u64_from_imm64 m)))))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_ubfiz_immr ty k))
+      (if-let imms (bf_field_ubfiz_imms ty m k))
+      (if-let true (bf_disjoint_mask y m))
+      (bfm (operand_size ty) (put_in_reg x) (put_in_reg y) immr imms))
+(rule 11 (lower (bor (fits_in_64 (ty_int ty))
+                    y
+                    (band _ (iconst _ (u64_from_imm64 m))
+                            (ishl _ x (iconst _ (u64_from_imm64 k))))))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_ubfiz_immr ty k))
+      (if-let imms (bf_field_ubfiz_imms ty m k))
+      (if-let true (bf_disjoint_mask y m))
+      (bfm (operand_size ty) (put_in_reg x) (put_in_reg y) immr imms))
+(rule 9 (lower (bor (fits_in_64 (ty_int ty))
+                    (band _ (ishl _ x (iconst _ (u64_from_imm64 k)))
+                            (iconst _ (u64_from_imm64 m)))
+                    y))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_ubfiz_immr ty k))
+      (if-let imms (bf_field_ubfiz_imms ty m k))
+      (if-let true (bf_disjoint_mask y m))
+      (bfm (operand_size ty) (put_in_reg x) (put_in_reg y) immr imms))
+(rule 12 (lower (bor (fits_in_64 (ty_int ty))
+                    (band _ (iconst _ (u64_from_imm64 m))
+                            (ishl _ x (iconst _ (u64_from_imm64 k))))
+                    y))
+      (if-let true (bfuse_on))
+      (if-let immr (bf_ubfiz_immr ty k))
+      (if-let imms (bf_field_ubfiz_imms ty m k))
+      (if-let true (bf_disjoint_mask y m))
+      (bfm (operand_size ty) (put_in_reg x) (put_in_reg y) immr imms))
+
+;; PLIRON: the `*_ror_op`/`*_rol_op` rules above fold a constant rotate
+;; into the logic op's shifted operand only when the rotate has one use
+;; (LLVM's `isWorthFoldingALU`). With other uses the rotate is
+;; materialized anyway, so the fold saves nothing and puts a shifted-operand
+;; op (2-cycle latency on Apple cores, 1 for the plain op) on the chain:
+;; blake3's mixing rounds ran 1.39x slower. `PLIRON_RORFOLD_MULTI=1`
+;; restores folding multi-use rotates.
+(decl pure rot_fold_ok (Value) bool)
+(extern constructor rot_fold_ok rot_fold_ok)
+
 ;;;; Rules for `ishl` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; Shift for i8/i16/i32.
@@ -1595,6 +2320,16 @@
             (shift Reg (vec_dup masked_shift_amt size)))
         (sshl x shift size)))
 (rule -2 (lower (ishl (ty_vec128 ty) x (iconst _ (u64_from_imm64 n))))
+        (ushl_vec_imm x (shift_masked_imm ty n) (vector_size ty)))
+;; PLIRON: 64-bit integer vectors (I8X8, I16X4, I32X2) take the same
+;; instructions on the `.8b/.4h/.2s` arrangements; upstream only matched
+;; 128-bit types and rejected zmij's `ushr.i32x2` outright.
+(rule -11 (lower (ishl (ty_vec64_int ty) x y))
+      (let ((size VectorSize (vector_size ty))
+            (masked_shift_amt Reg (and_imm $I32 (lo_reg y) (shift_mask ty)))
+            (shift Reg (vec_dup masked_shift_amt size)))
+        (sshl x shift size)))
+(rule -10 (lower (ishl (ty_vec64_int ty) x (iconst _ (u64_from_imm64 n))))
         (ushl_vec_imm x (shift_masked_imm ty n) (vector_size ty)))
 
 (decl pure shift_masked_imm (Type u64) u8)
@@ -1647,6 +2382,31 @@
 (rule ushr_fits_in_32 -1 (lower (ushr (fits_in_32 ty) x y))
       (do_shift (ALUOp.Lsr) ty (put_in_reg_zext32 x) y))
 
+;; PLIRON (`PLIRON_NARROWEXT` bit 32): a `ushr.i8/i16` on an already
+;; narrow-clean register (`narrowext_clean`) needs no `uxtb`/`uxth`
+;; first — `lsr` of narrow bits is exact, and its result is clean.
+(rule ushr_clean_narrow 64 (lower (ushr (fits_in_16 ty) x y))
+      (if-let true (narrowext_on 32))
+      (if-let true (narrowext_clean x))
+      (do_shift (ALUOp.Lsr) ty (put_in_reg x) y))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 256): `ushr` of a narrow `ireduce` by a
+;; constant is one `ubfm` (`ubfx x, #k, #width-k`) — the byte/halfword
+;; semantics are exactly "extract bits [k, width)" of the wide register,
+;; so the `uxtb`/`uxth` + `lsr` pair folds into the bitfield and the
+;; `ireduce`'s own extension dies with it when unused elsewhere. Must
+;; outrank `ushr_clean_narrow` (64): the `ireduce` registers as clean
+;; there, but the extract reads the wide source for the same cost as the
+;; `lsr` while also killing the `ireduce`'s `uxtb`/`uxth`.
+(rule ushr_ireduce_ubfm 65 (lower (ushr ty @ (fits_in_16 _)
+                                     (ireduce _ x @ (value_type (fits_in_64 s_ty)))
+                                     (iconst _ (u64_from_imm64 k))))
+      (if-let true (narrowext_on 256))
+      (if-let true (u64_lt k (ty_bits_u64 ty)))
+      (if-let immr (bf_imm_u8 k))
+      (if-let imms (bf_imm_u8 (u64_wrapping_sub (ty_bits_u64 ty) 1)))
+      (ubfm (operand_size s_ty) (put_in_reg x) immr imms))
+
 ;; Shift for i64.
 (rule ushr_64 (lower (ushr $I64 x y))
       (do_shift (ALUOp.Lsr) $I64 (put_in_reg_zext64 x) y))
@@ -1668,6 +2428,17 @@
 (rule -3 (lower (ushr (ty_vec128 ty) x (iconst _ (u64_from_imm64 n))))
          (ushr_vec_imm x (shift_masked_imm ty n) (vector_size ty)))
 (rule -2 (lower (ushr (ty_vec128 ty) x (iconst _ (u64_from_imm64 n))))
+          (if-let 0 (shift_masked_imm ty n))
+          x)
+;; PLIRON: 64-bit integer vectors, as for `ishl`.
+(rule -12 (lower (ushr (ty_vec64_int ty) x y))
+      (let ((size VectorSize (vector_size ty))
+            (masked_shift_amt Reg (and_imm $I32 (lo_reg y) (shift_mask ty)))
+            (shift Reg (vec_dup (sub $I64 (zero_reg) masked_shift_amt) size)))
+        (ushl x shift size)))
+(rule -11 (lower (ushr (ty_vec64_int ty) x (iconst _ (u64_from_imm64 n))))
+         (ushr_vec_imm x (shift_masked_imm ty n) (vector_size ty)))
+(rule -10 (lower (ushr (ty_vec64_int ty) x (iconst _ (u64_from_imm64 n))))
           (if-let 0 (shift_masked_imm ty n))
           x)
 
@@ -1726,6 +2497,17 @@
 (rule -2 (lower (sshr (ty_vec128 ty) x (iconst _ (u64_from_imm64 n))))
           (sshr_vec_imm x (shift_masked_imm ty n) (vector_size ty)))
 (rule -1 (lower (sshr (ty_vec128 ty) x (iconst _ (u64_from_imm64 n))))
+          (if-let 0 (shift_masked_imm ty n))
+          x)
+;; PLIRON: 64-bit integer vectors, as for `ishl`.
+(rule -12 (lower (sshr (ty_vec64_int ty) x y))
+      (let ((size VectorSize (vector_size ty))
+            (masked_shift_amt Reg (and_imm $I32 (lo_reg y) (shift_mask ty)))
+            (shift Reg (vec_dup (sub $I64 (zero_reg) masked_shift_amt) size)))
+        (sshl x shift size)))
+(rule -11 (lower (sshr (ty_vec64_int ty) x (iconst _ (u64_from_imm64 n))))
+          (sshr_vec_imm x (shift_masked_imm ty n) (vector_size ty)))
+(rule -10 (lower (sshr (ty_vec64_int ty) x (iconst _ (u64_from_imm64 n))))
           (if-let 0 (shift_masked_imm ty n))
           x)
 
@@ -2120,6 +2902,50 @@
     (if (ty_int_ref_scalar_64 ty))
     (value_regs_get src 0))
 
+;; PLIRON: ...except i8/i16 reductions, which we materialize as `uxtb`/`uxth`.
+;; A clean operand lets `emit_icmp` elide the standalone extension and put a
+;; dirty sibling in `cmp`'s fused extend slot (see `val_already_extended`);
+;; LLVM reaches the same state for free via `ldrb`/`ldrh`.
+(rule 1 (lower (ireduce ty @ (fits_in_16 _) src))
+    (extend (value_regs_get src 0) false (ty_bits ty) 32))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 64): ...unless the wide source's register
+;; is already zero above the narrow width (`wide_clean` — small-const
+;; `select` arms, narrower `uextend`s, masked `band`s, top-byte `ushr`s):
+;; the passthrough reg is already canonical.
+(rule 2 (lower (ireduce ty @ (fits_in_16 _) src))
+    (if-let true (wide_clean (ty_bits ty) src))
+    (value_regs_get src 0))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 128): `ireduce (ushr x, k)` is one `ubfm`
+;; (`ubfx`) instead of `lsr` + `uxtb`/`uxth`. A single-use shift's own `lsr`
+;; dies when its result goes unread; a shared shift trades the `uxtb` for
+;; the same `ubfm` count.
+(rule 3 (lower (ireduce ty @ (fits_in_16 _)
+               (ushr (fits_in_64 s_ty) x (iconst _ (u64_from_imm64 k)))))
+    (if-let true (narrowext_on 128))
+    (if-let true (u64_lt (u64_wrapping_add k (u64_wrapping_sub (ty_bits_u64 ty) 1))
+                        (ty_bits_u64 s_ty)))
+    (if-let immr (bf_imm_u8 k))
+    (if-let imms (bf_imm_u8 (u64_wrapping_sub (u64_wrapping_add k (ty_bits_u64 ty)) 1)))
+    (ubfm (operand_size s_ty) (put_in_reg x) immr imms))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 128): `ireduce (load)` read only here
+;; narrows to the matching `uload` — the wide load's `uxtb`/`uxth` dies.
+(rule 4 (lower (ireduce ty @ (fits_in_16 _)
+               l @ (load _ (little_or_native_endian flags) address offset)))
+    (if-let true (narrowext_on 128))
+    (if-let inst (is_sinkable_inst l))
+    (let ((_ Unit (sink_inst inst)))
+      (aarch64_uload ty (amode ty address offset) flags)))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 256): chained narrow reductions —
+;; `ireduce.i8 (ireduce.i16 x)` extends `x` once; the intermediate
+;; `uxth`/`uxtb` dies when the inner result goes unread elsewhere.
+(rule 5 (lower (ireduce ty @ (fits_in_16 _) (ireduce _ x)))
+    (if-let true (narrowext_on 256))
+    (extend (value_regs_get x 0) false (ty_bits ty) 32))
+
 ;;;; Rules for `fcmp` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule 4 (lower (fcmp ty @ (multi_lane _ _) (fcmp_zero_cond_not_eq cond) x y))
@@ -2234,6 +3060,47 @@
   (side_effect (trap_if_cond_result (is_nonzero_cmp val) trap_code)))
 
 ;;;; Rules for `select` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; PLIRON (`PLIRON_CCMP`, default on): `select` of a compare against a
+;; constant arm is the bool op `ccmp_sel_out` builds —
+;; `cmp; ccmp; cset` (3) vs `cmp; cset; cmp; csel`-plus-materialization;
+;; declining it emits the base `lower_select` on the bound arms.
+;; Modes per arm order: (B,0)=0 `A&&B`, (0,B)=1 `!A&&B`,
+;; (B,1)=2 `!A||B`, (1,B)=3 `A||B`.
+(rule 1 (lower (select (fits_in_64 (ty_int ty)) cond
+                       rn @ (maybe_uextend (icmp _ ccB u v))
+                       rm @ (u64_from_iconst 0)))
+      (ccmp_sel_out 0 ty cond rn rm ccB u v))
+(rule 2 (lower (select (fits_in_64 (ty_int ty)) cond
+                       rn @ (u64_from_iconst 0)
+                       rm @ (maybe_uextend (icmp _ ccB u v))))
+      (ccmp_sel_out 1 ty cond rn rm ccB u v))
+(rule 3 (lower (select (fits_in_64 (ty_int ty)) cond
+                       rn @ (maybe_uextend (icmp _ ccB u v))
+                       rm @ (u64_from_iconst 1)))
+      (ccmp_sel_out 2 ty cond rn rm ccB u v))
+(rule 4 (lower (select (fits_in_64 (ty_int ty)) cond
+                       rn @ (u64_from_iconst 1)
+                       rm @ (maybe_uextend (icmp _ ccB u v))))
+      (ccmp_sel_out 3 ty cond rn rm ccB u v))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 256): narrow `select` arms that are
+;; `ireduce`s select the wide registers directly — `csel` of the sources
+;; keeps the same low byte, the arm's `uxtb`/`uxth` dies when unused
+;; elsewhere, and the result is modelled dirty either way.
+(rule 5 (lower (select (fits_in_16 ty) cond
+                       (ireduce _ rn @ (value_type (fits_in_64 _))) rm))
+  (if-let true (narrowext_on 256))
+  (lower_select ty (is_nonzero_cmp cond) rn rm))
+(rule 6 (lower (select (fits_in_16 ty) cond rn
+                       (ireduce _ rm @ (value_type (fits_in_64 _)))))
+  (if-let true (narrowext_on 256))
+  (lower_select ty (is_nonzero_cmp cond) rn rm))
+(rule 7 (lower (select (fits_in_16 ty) cond
+                       (ireduce _ rn @ (value_type (fits_in_64 _)))
+                       (ireduce _ rm @ (value_type (fits_in_64 _)))))
+  (if-let true (narrowext_on 256))
+  (lower_select ty (is_nonzero_cmp cond) rn rm))
 
 (rule (lower (select ty cond rn rm))
   (lower_select ty (is_nonzero_cmp cond) rn rm))
@@ -2537,8 +3404,11 @@
 ;;;; Rules for `return` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; N.B.: the Ret itself is generated by the ABI.
+;; PLIRON: `put_in_regs_vec_ret` lets a narrow `ireduce` return operand
+;; yield its clean source's register instead of materialising `uxtb`.
 (rule (lower (return args))
-      (lower_return args))
+      (let ((_ Unit (gen_return (put_in_regs_vec_ret args))))
+        (output_none)))
 
 ;;;; Rules for `return_call` and `return_call_indirect` ;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -2693,10 +3563,78 @@
        (istore16 (little_or_native_endian flags) value address offset))
       (side_effect
        (aarch64_store16 (amode $I16 address offset) flags value)))
+
+;; PLIRON (`PLIRON_NARROWEXT` bit 128): a byte/halfword store of an
+;; `ireduce` reads only the low field — store the wide source's register
+;; directly; a single-use truncate's `uxtb`/`uxth` then dies with it.
+(rule 1 (lower
+       (store (little_or_native_endian flags)
+              (and (value_type $I8)
+                   (ireduce _ x @ (value_type (fits_in_64 _))))
+              address offset))
+      (if-let true (narrowext_on 128))
+      (side_effect
+       (aarch64_store8 (amode $I8 address offset) flags (put_in_reg x))))
+(rule 1 (lower
+       (store (little_or_native_endian flags)
+              (and (value_type $I16)
+                   (ireduce _ x @ (value_type (fits_in_64 _))))
+              address offset))
+      (if-let true (narrowext_on 128))
+      (side_effect
+       (aarch64_store16 (amode $I16 address offset) flags (put_in_reg x))))
+(rule 1 (lower
+       (istore8 (little_or_native_endian flags)
+                (ireduce _ x @ (value_type (fits_in_64 _))) address offset))
+      (if-let true (narrowext_on 128))
+      (side_effect
+       (aarch64_store8 (amode $I8 address offset) flags (put_in_reg x))))
+(rule 1 (lower
+       (istore16 (little_or_native_endian flags)
+                 (ireduce _ x @ (value_type (fits_in_64 _))) address offset))
+      (if-let true (narrowext_on 128))
+      (side_effect
+       (aarch64_store16 (amode $I16 address offset) flags (put_in_reg x))))
 (rule (lower
        (istore32 (little_or_native_endian flags) value address offset))
       (side_effect
        (aarch64_store32 (amode $I32 address offset) flags value)))
+
+;; Storing a constant zero can use `wzr`/`xzr` directly, avoiding a
+;; `mov` materialization per use (regalloc remats iconsts at each use,
+;; so a shared `iconst 0` still costs a `mov` every time it is stored).
+(rule store_i8_zero 1 (lower
+       (store (little_or_native_endian flags) (iconst $I8 (u64_from_imm64 0))
+              address offset))
+      (side_effect
+       (aarch64_store8 (amode $I8 address offset) flags (zero_reg))))
+(rule store_i16_zero 1 (lower
+       (store (little_or_native_endian flags) (iconst $I16 (u64_from_imm64 0))
+              address offset))
+      (side_effect
+       (aarch64_store16 (amode $I16 address offset) flags (zero_reg))))
+(rule store_i32_zero 1 (lower
+       (store (little_or_native_endian flags) (iconst $I32 (u64_from_imm64 0))
+              address offset))
+      (side_effect
+       (aarch64_store32 (amode $I32 address offset) flags (zero_reg))))
+(rule store_i64_zero 1 (lower
+       (store (little_or_native_endian flags) (iconst $I64 (u64_from_imm64 0))
+              address offset))
+      (side_effect
+       (aarch64_store64 (amode $I64 address offset) flags (zero_reg))))
+(rule istore8_zero 1 (lower
+       (istore8 (little_or_native_endian flags) (iconst _ (u64_from_imm64 0)) address offset))
+      (side_effect
+       (aarch64_store8 (amode $I8 address offset) flags (zero_reg))))
+(rule istore16_zero 1 (lower
+       (istore16 (little_or_native_endian flags) (iconst _ (u64_from_imm64 0)) address offset))
+      (side_effect
+       (aarch64_store16 (amode $I16 address offset) flags (zero_reg))))
+(rule istore32_zero 1 (lower
+       (istore32 (little_or_native_endian flags) (iconst _ (u64_from_imm64 0)) address offset))
+      (side_effect
+       (aarch64_store32 (amode $I32 address offset) flags (zero_reg))))
 
 (rule store_i128 (lower
        (store (little_or_native_endian flags) value @ (value_type $I128) address offset))
@@ -2741,6 +3679,16 @@
 
 ;;; Rules for `bitcast` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+;; PLIRON: the low 64 bits of a vector, as a 64-bit vector, are the same
+;; register: `bitcast.i8x8 (extractlane.i64 (bitcast.i64x2 v) 0)` was
+;; `mov x, v.d[0]; fmov d, x` (memchr's movemask, via pliron's `vtrunc`).
+(rule 8 (lower (bitcast (ty_vec64_int _) _ (extractlane $I64 (bitcast $I64X2 _ x @ (value_type (ty_vec128 _))) (u8_from_uimm8 0))))
+      x)
+;; ... and when that vector is an `unarrow`, only its low half is needed:
+;; one `sqxtun`, no `sqxtun2`.
+(rule 9 (lower (bitcast (ty_vec64_int _) _ (extractlane $I64 (bitcast $I64X2 _ (unarrow (ty_vec128_int nty) a _)) (u8_from_uimm8 0))))
+      (sqxtun a (lane_size nty)))
+
 ; SIMD&FP <=> SIMD&FP
 (rule 7 (lower (bitcast (ty_float_or_vec _) _ x @ (value_type (ty_float_or_vec _))))
       x)
@@ -2761,7 +3709,7 @@
       (mov_to_fpu x (scalar_size in_ty)))
 
 ; SIMD&FP => GPR
-(rule 3 (lower (bitcast out_ty _ x @ (value_type (fits_in_64 (ty_float_or_vec _)))))
+(rule 3 (lower (bitcast out_ty _ x @ (value_type (fits_in_64_allow_vec (ty_float_or_vec _)))))
       (if (ty_int_ref_scalar_64 out_ty))
       (mov_from_vec x 0 (scalar_size out_ty)))
 
@@ -2778,6 +3726,15 @@
 
 ;; extractlane with lane 0 can pass through the value unchanged; upper
 ;; bits are undefined when a narrower type is in a wider register.
+;; PLIRON: the 4-bits-per-byte movemask of a byte-compare mask `m`
+;; (`ushr.i16x8 m, 4`, keep the low byte of each lane, narrow, take the low
+;; 64 bits) is `shrn v.8b, m.8h, #4; fmov x, d` (pliron's `bytescan`).
+(rule 4 (lower (extractlane $I64 (bitcast $I64X2 _ (unarrow $I8X16 (band $I16X8 (ushr $I16X8 x (iconst _ (u64_from_imm64 4))) (splat $I16X8 (iconst _ (u64_from_imm64 255)))) _)) (u8_from_uimm8 0)))
+      (mov_from_vec (vec_shift_imm (VecShiftImmOp.Shrn) 4 x (VectorSize.Size8x8)) 0 (ScalarSize.Size64)))
+;; ... with the mask constant folded to a `vconst` by the egraph.
+(rule 4 (lower (extractlane $I64 (bitcast $I64X2 _ (unarrow $I8X16 (band $I16X8 (ushr $I16X8 x (iconst _ (u64_from_imm64 4))) (vconst $I16X8 (u128_from_constant 0x00ff_00ff_00ff_00ff_00ff_00ff_00ff_00ff))) _)) (u8_from_uimm8 0)))
+      (mov_from_vec (vec_shift_imm (VecShiftImmOp.Shrn) 4 x (VectorSize.Size8x8)) 0 (ScalarSize.Size64)))
+
 (rule 2 (lower (extractlane (ty_scalar_float _) val (u8_from_uimm8 0)))
       val)
 
@@ -2966,6 +3923,75 @@
             (multi_reg_to_pair_and_single result)))
 )
 
+;; PLIRON: the unsigned-carry idiom `x + (a + b <u a ? 1 : 0)` (`b` may
+;; stand for `a` too; the flag as a 1/0 `select` or a `uextend`) is
+;; `cmn a, b; cinc x, hs` -- LLVM's `adds`/`cinc` -- instead of
+;; `add; cmp; cset; add`. The sum itself is lowered by its own `iadd` for
+;; its other uses. In a multi-word add the carry is loop-carried
+;; (num-bigint-dig's `add_mul_vvw`): the chain drops from four dependent
+;; instructions to two. `PLIRON_CARRYCINC=0` disables.
+(decl cmn (OperandSize Reg Reg) ProducesFlags)
+(rule (cmn size src1 src2)
+      (ProducesFlags.ProducesFlagsSideEffect
+       (MInst.AluRRR (ALUOp.AddS) size (writable_zero_reg) src1 src2)))
+(decl pure carry_cinc_on () bool)
+(extern constructor carry_cinc_on carry_cinc_on)
+(decl carry_cinc (Type Value Value Value) InstOutput)
+(rule (carry_cinc ty x a b)
+      (let ((rx Reg (put_in_reg x)))
+        (output_reg (with_flags_reg (cmn (operand_size ty) (put_in_reg a) (put_in_reg b))
+                                    (csinc (Cond.Lo) rx rx)))))
+(rule iadd_carry_sel_a 77 (lower (iadd (ty_32_or_64 ty) x
+        (select _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) a) (u64_from_iconst 1) (u64_from_iconst 0))))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_sel_b 76 (lower (iadd (ty_32_or_64 ty) x
+        (select _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) b) (u64_from_iconst 1) (u64_from_iconst 0))))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_sel_a_l 75 (lower (iadd (ty_32_or_64 ty)
+        (select _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) a) (u64_from_iconst 1) (u64_from_iconst 0)) x))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_sel_b_l 74 (lower (iadd (ty_32_or_64 ty)
+        (select _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) b) (u64_from_iconst 1) (u64_from_iconst 0)) x))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_ext_a 73 (lower (iadd (ty_32_or_64 ty) x
+        (uextend _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) a))))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_ext_b 72 (lower (iadd (ty_32_or_64 ty) x
+        (uextend _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) b))))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_ext_a_l 71 (lower (iadd (ty_32_or_64 ty)
+        (uextend _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) a)) x))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+(rule iadd_carry_ext_b_l 70 (lower (iadd (ty_32_or_64 ty)
+        (uextend _ (icmp _ (IntCC.UnsignedLessThan) (iadd _ a b) b)) x))
+      (if-let true (carry_cinc_on))
+      (carry_cinc ty x a b))
+
+;; PLIRON (`PLIRON_CINC`, opt-in): `x + (a cc b ? 1 : 0)` —
+;; `cmp a, b; csinc x, x, !cc` (LLVM's `cinc`) instead of `cmp; cset; add`.
+;; `y` binds the `icmp` itself: when the compare has other uses its
+;; `cset` still materializes, so the fused `cmp` is declined there.
+;; These sit below the `carry_cinc` rules (70-77): the unsigned-carry
+;; shape `icmp ult (iadd a b) a` is a subset of this pattern, and the
+;; carry rules emit `cmn` against the existing add's operands. This
+;; extern's decline path emits a plain `add`, which would otherwise
+;; shadow them.
+(decl iadd_cinc_for (Type Value Value IntCC Value Value) InstOutput)
+(extern constructor iadd_cinc_for iadd_cinc_for)
+(rule iadd_cinc_r 69 (lower (iadd (ty_32_or_64 ty) x
+        (maybe_uextend y @ (icmp _ cc a b))))
+      (iadd_cinc_for ty x y cc a b))
+(rule iadd_cinc_l 68 (lower (iadd (ty_32_or_64 ty)
+        (maybe_uextend y @ (icmp _ cc a b)) x))
+      (iadd_cinc_for ty x y cc a b))
+
 ;;;; Rules for `uadd_overflow` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; For values smaller than a register, we do a normal `add` with both arguments
@@ -3150,6 +4176,30 @@
 (rule (lower (fvpromote_low _ val))
       (vec_rr_long (VecRRLongOp.Fcvtl32) val false))
 
+;;; PLIRON: packed-f16 <-> f32 vector casts (fvpromote_f16*/fvdemote_f16*) ;;;;;;;
+;; `fvpromote_f16`/`fvpromote_f16_lo`/`_hi` convert the low/high half of an
+;; f16 vector to f32x4 (fcvtl/fcvtl2); `fvdemote_f16_pair` packs two f32x4
+;; into one f16x8 (fcvtn + fcvtn2).
+
+(rule (lower (fvpromote_f16 $F32X4 x))
+      (vec_rr_long (VecRRLongOp.Fcvtl16) x false))
+
+(rule (lower (fvpromote_f16_lo $F32X4 x))
+      (vec_rr_long (VecRRLongOp.Fcvtl16) x false))
+
+(rule (lower (fvpromote_f16_hi $F32X4 x))
+      (vec_rr_long (VecRRLongOp.Fcvtl16) x true))
+
+;; One f32x4 -> f16x4 (a 64-bit leaf: CubeCL's 4-lane f16 lines). `fcvtn` writes
+;; the low 64 bits of the destination and zeroes the rest.
+(rule (lower (fvdemote_f16 (multi_lane 16 4) x))
+      (fcvtn x (ScalarSize.Size16)))
+
+(rule (lower (fvdemote_f16_pair $F16X8 x y))
+      (let ((low Reg (fcvtn x (ScalarSize.Size16)))
+            (result Reg (fcvtn2 low y (ScalarSize.Size16))))
+        result))
+
 ;;; Rules for `brif` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 ;; `brif` base case
@@ -3187,6 +4237,29 @@
   (if-let bit (test_and_compare_bit_const ty n))
   (emit_side_effect (tbz taken not_taken x bit)))
 
+;; PLIRON (`PLIRON_TBNZ_IREDUCE=0` off, default on): `brif (band (ireduce y), 2^k)` with
+;; k inside the narrow type tests bit k of `y`'s own register: the `uxtb`/`uxth`
+;; the `ireduce` rule materializes only clears bits `tbnz` never reads
+;; (`bl f; uxtb w3,w2; tbnz w3,#0` x149 in regex-syntax).
+(rule 2 (lower_branch (brif (band (fits_in_16 ty) (ireduce _ y @ (value_type (fits_in_64 _)))
+                                  (u64_from_iconst n)) _ _)
+                     (two_targets taken not_taken))
+  (if-let true (tbnz_ireduce_on 1))
+  (if-let bit (test_and_compare_bit_const ty n))
+  (emit_side_effect (tbnz taken not_taken y bit)))
+
+(rule 2 (lower_branch (brif (icmp _ (IntCC.Equal)
+                                  (band (fits_in_16 ty) (ireduce _ y @ (value_type (fits_in_64 _)))
+                                        (u64_from_iconst n))
+                                  (u64_from_iconst 0)) _ _)
+                     (two_targets taken not_taken))
+  (if-let true (tbnz_ireduce_on 1))
+  (if-let bit (test_and_compare_bit_const ty n))
+  (emit_side_effect (tbz taken not_taken y bit)))
+
+(decl pure tbnz_ireduce_on (u64) bool)
+(extern constructor tbnz_ireduce_on tbnz_ireduce_on)
+
 (decl pure partial test_and_compare_bit_const (Type u64) u8)
 (extern constructor test_and_compare_bit_const test_and_compare_bit_const)
 
@@ -3206,6 +4279,55 @@
             (ridx Reg (put_in_reg_zext32 idx)))
        (br_table_impl jt_size ridx default targets)))
 
+;; PLIRON (`PLIRON_NARROWEXT` bit 1024): `br_table` on a narrow
+;; `(c - s) mod W` index — `uextend (isub c, j)` or `uextend (iadd c, j)`
+;; with a negative `j` — bounds-checks `index <u jt_size`; `btsub_imm`
+;; proves the unmasked `sub w, c, #s` compare partitions identically, so
+;; the masked add/sub and its `uxtb`/`uxth` fold into one `sub`
+;; (`add+uxtb+cmp` -> `sub+cmp`). Both defs must be single-use or the
+;; still-emitted add/uextend makes this a loss. The dead-default rule
+;; above (no bounds check at all) stays strictly better when it applies.
+(decl pure partial btsub_imm (u64 Type u64 u64) u64)
+(extern constructor btsub_imm btsub_imm)
+(rule 2 (lower_branch (br_table idx @ (maybe_uextend inner @ (isub ty @ (fits_in_16 _) c (u64_from_iconst j)))
+                                    jt)
+                     (jump_table_targets default targets))
+  (if-let false (jump_table_default_dead jt))
+  (if-let false (value_has_multiple_uses idx))
+  (if-let false (value_has_multiple_uses inner))
+  (if-let (imm12_from_u64 s) (btsub_imm 0 ty j (jump_table_size targets)))
+  (let ((_ InstOutput (side_effect (emit_island (targets_jt_space targets))))
+        (ridx Reg (sub_imm $I32 (put_in_reg_uext_narrow_maybe c) s)))
+    (br_table_impl (jump_table_size targets) ridx default targets)))
+(rule 2 (lower_branch (br_table idx @ (maybe_uextend inner @ (iadd ty @ (fits_in_16 _) c (u64_from_iconst j)))
+                                    jt)
+                     (jump_table_targets default targets))
+  (if-let false (jump_table_default_dead jt))
+  (if-let false (value_has_multiple_uses idx))
+  (if-let false (value_has_multiple_uses inner))
+  (if-let (imm12_from_u64 s) (btsub_imm 1 ty j (jump_table_size targets)))
+  (let ((_ InstOutput (side_effect (emit_island (targets_jt_space targets))))
+        (ridx Reg (sub_imm $I32 (put_in_reg_uext_narrow_maybe c) s)))
+    (br_table_impl (jump_table_size targets) ridx default targets)))
+(rule 3 (lower_branch (br_table idx @ (maybe_uextend inner @ (iadd ty @ (fits_in_16 _) (u64_from_iconst j) c))
+                                    jt)
+                     (jump_table_targets default targets))
+  (if-let false (jump_table_default_dead jt))
+  (if-let false (value_has_multiple_uses idx))
+  (if-let false (value_has_multiple_uses inner))
+  (if-let (imm12_from_u64 s) (btsub_imm 1 ty j (jump_table_size targets)))
+  (let ((_ InstOutput (side_effect (emit_island (targets_jt_space targets))))
+        (ridx Reg (sub_imm $I32 (put_in_reg_uext_narrow_maybe c) s)))
+    (br_table_impl (jump_table_size targets) ridx default targets)))
+
+;; PLIRON: no bounds check when the default is unreachable (`PLIRON_SWITCH_KEEPDEAD`).
+(rule 1 (lower_branch (br_table idx jt) (jump_table_targets default targets))
+      (if-let true (jump_table_default_dead jt))
+      (let ((_ InstOutput (side_effect
+                  (emit_island (targets_jt_space targets))))
+            (ridx Reg (put_in_reg_zext32 idx)))
+       (emit_side_effect (jt_sequence_unchecked ridx default targets))))
+
 ;; Rules for `get_exception_handler_address` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (rule (lower (get_exception_handler_address _ block (u64_from_imm64 idx)))
@@ -3217,6 +4339,47 @@
 (rule (lower (sequence_point))
       (side_effect
        (a64_sequence_point)))
+
+;; PLIRON: `iadd x, (umulhi 0, 1)` is `x`. pliron's `coldargs`
+;; (`PLIRON_COLDCOPY=1`) uses it to rebind a cold call's argument to a new
+;; value that the egraph can't fold back into `x`. Lower it to a 64-bit `mov`
+;; into a fresh vreg. That is a real copy, so the call's fixed-register use
+;; stays at the cold site and does not pin `x`'s live range. The `umulhi` and
+;; its zeros then have no lowered uses and emit nothing. `emit` drops the
+;; `mov` when regalloc gives both sides the same register. A 64-bit copy is
+;; correct for every int type up to 64 bits: high bits above the type's width
+;; are undefined either way.
+(decl pliron_copy64 (Reg) Reg)
+(rule (pliron_copy64 x)
+      (let ((dst WritableReg (temp_writable_reg $I64))
+            (_ Unit (emit (MInst.Mov (OperandSize.Size64) dst x))))
+        dst))
+(rule iadd_coldcopy_right 30 (lower (iadd (ty_int_ref_scalar_64_extract _) x
+                                     (umulhi _ (u64_from_iconst 0) (u64_from_iconst 1))))
+      (pliron_copy64 x))
+(rule iadd_coldcopy_left 29 (lower (iadd (ty_int_ref_scalar_64_extract _)
+                                    (umulhi _ (u64_from_iconst 0) (u64_from_iconst 1)) x))
+      (pliron_copy64 x))
+;; PLIRON: ...and where a later CLIF pass folded the rebind away (an arg
+;; that was itself a zero: `iadd 0, z` -> `z`), the leftover `umulhi 0, 1` is
+;; a `mov #0`, not a `umulh` of two materialized constants. The `1` keeps both
+;; rules off the `umulhi x, 0` form that `coldargs` emits without the flag.
+(rule umulhi_zero 3 (lower (umulhi (fits_in_64 ty) (u64_from_iconst 0) (u64_from_iconst 1)))
+      (imm ty (ImmExtend.Zero) 0))
+
+;; PLIRON: `black_box` is a pure optimization barrier — alias the result vreg
+;; to the input's and emit no machine code (like a same-class `bitcast`).
+(rule (lower (black_box _ x))
+      x)
+
+;; PLIRON: ...except an i8/i16 barrier with dirty high bits pays one
+;; `uxtb`/`uxth` — the same extension LLVM gets for free from `ldrb`/`ldrh`.
+;; A clean result lets `emit_icmp` put a dirty sibling operand in `cmp`'s
+;; fused extend slot instead of emitting a standalone extension per compare
+;; (see `emit_icmp_narrow`/`val_already_extended`).
+(rule 1 (lower (black_box ty @ (fits_in_16 _) x))
+      (if-let false (val_already_extended (ArgumentExtension.Uext) x))
+      (extend (value_regs_get x 0) false (ty_bits ty) 32))
 
 ;;;; Additional verification terms ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 

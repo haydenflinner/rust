@@ -7,7 +7,8 @@
 //! Memory layout: [0, 1024) unused, then the stack (grows down to 1024),
 //! then data, then `__heap_base` up to `__heap_end` (end of initial memory).
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::FxHashSet as HashSet;
 use std::collections::hash_map::Entry;
 
 use wasm_encoder as we;
@@ -31,6 +32,8 @@ fn set_z_option(opt: &str) {
 }
 const GLOBAL: u8 = 1;
 const INIT_ARRAY: u8 = 4;
+/// `#[used(linker)]`: keep through GC even when unreferenced.
+const USED: u8 = 8;
 const CALL_CTORS: &str = "__wasm_call_ctors";
 
 struct DataObj {
@@ -53,6 +56,8 @@ struct Obj<'a> {
     bodies: Vec<wp::FunctionBody<'a>>,
     funcs: Vec<(String, u8)>,
     data: Vec<DataObj>,
+    /// Data-object name -> `data` index, built lazily for `local` lookups.
+    data_names: HashMap<String, usize>,
     /// Custom sections other than our own, concatenated by name into the output.
     customs: Vec<(String, &'a [u8])>,
     /// `+feature` names from the `target_features` section.
@@ -90,10 +95,11 @@ fn parse<'a>(name: String, bytes: &'a [u8]) -> wp::Result<Obj<'a>> {
         fimports: vec![],
         gimports: vec![],
         ftypes: vec![],
-        exports: HashMap::new(),
+        exports: HashMap::default(),
         bodies: vec![],
         funcs: vec![],
         data: vec![],
+        data_names: HashMap::default(),
         customs: vec![],
         features: vec![],
     };
@@ -168,6 +174,7 @@ fn parse<'a>(name: String, bytes: &'a [u8]) -> wp::Result<Obj<'a>> {
                             (off, func, sym, r.u32() as i32)
                         })
                         .collect();
+                    o.data_names.entry(name.clone()).or_insert(o.data.len());
                     o.data.push(DataObj {
                         name,
                         flags,
@@ -194,10 +201,7 @@ impl Obj<'_> {
         if let Some(&f) = self.exports.get(sym) {
             return Some(Def::Func(oi, f));
         }
-        self.data
-            .iter()
-            .position(|d| d.name == sym)
-            .map(|i| Def::Data(oi, i))
+        self.data_names.get(sym).map(|&i| Def::Data(oi, i))
     }
 
     fn globals(&self, oi: usize) -> impl Iterator<Item = (&str, Def)> {
@@ -234,10 +238,15 @@ impl Obj<'_> {
     }
 }
 
+// r[impl wasm.ld.got]
 struct Mapper<'m> {
     funcs: &'m [u32],
     globals: &'m [u32],
     types: &'m [u32],
+    /// Per global-import index: link-time constant for GOT.* imports
+    /// (data addresses and table slots) chosen for folding. Bodies read
+    /// them as `i32.const` instead of `global.get`.
+    gconsts: &'m [Option<i32>],
 }
 
 impl Reencode for Mapper<'_> {
@@ -257,6 +266,32 @@ impl Reencode for Mapper<'_> {
     fn memory_index(&mut self, _: u32) -> Result<u32, ReError<Self::Error>> {
         Ok(0)
     }
+    fn instruction<'a>(
+        &mut self,
+        arg: wp::Operator<'a>,
+    ) -> Result<we::Instruction<'a>, ReError<Self::Error>> {
+        // GOT globals hold link-time constants (data address, table
+        // slot); fold the read into an immediate like a static address.
+        if let wp::Operator::GlobalGet { global_index } = arg
+            && let Some(Some(v)) = self.gconsts.get(global_index as usize)
+        {
+            return Ok(we::Instruction::I32Const(*v));
+        }
+        wasm_encoder::reencode::utils::instruction(self, arg)
+    }
+}
+
+/// Length in bytes of `v` encoded as a signed LEB128.
+fn sleb_len(mut v: i32) -> u32 {
+    let mut n = 0;
+    loop {
+        n += 1;
+        let sign = v & 0x40 != 0;
+        v >>= 7;
+        if (v == 0 && !sign) || (v == -1 && sign) {
+            return n;
+        }
+    }
 }
 
 fn val_type(t: wp::ValType) -> we::ValType {
@@ -272,6 +307,7 @@ fn val_type(t: wp::ValType) -> we::ValType {
 
 /// Links with wasm-ld style `args` (without argv[0]). Also called in-process by rustc.wasm,
 /// which cannot spawn a linker.
+// r[impl wasm.ld.args]
 pub fn link(args: Vec<String>) -> Result<(), String> {
     STACK_SIZE.store(1 << 20, std::sync::atomic::Ordering::Relaxed);
     let mut out = None;
@@ -334,8 +370,9 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         objs.push(parse(n.clone(), b).map_err(|e| format!("{n}: {e}"))?);
     }
 
+    // r[impl wasm.ld.resolve]
     // Resolve: pull archive members until no undefined symbol can be satisfied.
-    let mut provider: HashMap<&str, usize> = HashMap::new();
+    let mut provider: HashMap<&str, usize> = HashMap::default();
     for (oi, o) in objs.iter().enumerate() {
         if blobs[oi].2 {
             for (n, _) in o.globals(oi) {
@@ -345,7 +382,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     }
     let mut included: Vec<usize> = (0..objs.len()).filter(|&i| !blobs[i].2).collect();
     let mut is_in = vec![false; objs.len()];
-    let mut defs: HashMap<String, Def> = HashMap::new();
+    let mut defs: HashMap<String, Def> = HashMap::default();
     let mut k = 0;
     for &i in &included {
         is_in[i] = true;
@@ -403,18 +440,369 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     }
     let resolve = |oi: usize, sym: &str| objs[oi].local(oi, sym).or_else(|| defs.get(sym).copied());
 
-    // Types.
-    let mut types: Vec<wp::FuncType> = Vec::new();
-    let mut tmaps: HashMap<usize, Vec<u32>> = HashMap::new();
+    // Mark-sweep GC at symbol granularity. Roots: the command-line exports
+    // (or every global function of a non-archive object when none are
+    // given, matching the default export list below), `_start`, every
+    // `.init_array` object, every `#[used(linker)]` datum, and
+    // `__pliron_prof_*` objects.
+    // Edges: a live function's *reachable* `call`/`ref.func`/`return_call`
+    // operands (imports resolve by symbol, defined functions by index) and
+    // its `global.get`/`global.set` of GOT.mem/GOT.func imports; a live
+    // data object's relocation targets. Everything unmarked is dropped
+    // from the function/code/data/table sections.
+    // r[impl wasm.ld.gc]
+    let mut live_f: HashSet<(usize, u32)> = HashSet::default();
+    let mut live_d: HashSet<(usize, usize)> = HashSet::default();
+    // Function imports touched by a live body's reachable code; only
+    // those need an entry in the output import section.
+    let mut used_imp: HashSet<(usize, u32)> = HashSet::default();
+    // Per-object GOT global-import use counts in live bodies; the
+    // fold-or-keep decision below compares immediate size against the
+    // cost of keeping a GOT global entry.
+    let mut got_uses: HashMap<(usize, u32), u32> = HashMap::default();
+    let mut wl: Vec<Def> = Vec::new();
+    // Type indices referenced per live body (`block`/`loop`/`if`/`try`
+    // blocktypes and `*_indirect` type operands): collected during the GC
+    // scan so live bodies are decoded once, not twice. Dedup losers are
+    // filtered out when the set is consumed below.
+    let mut trefs: HashMap<usize, Vec<(u32, Vec<u32>)>> = HashMap::default();
+    let roots: Vec<String> = if exports.is_empty() {
+        included
+            .iter()
+            .filter(|&&oi| !blobs[oi].2)
+            .flat_map(|&oi| {
+                objs[oi]
+                    .funcs
+                    .iter()
+                    .filter(|f| f.1 & GLOBAL != 0)
+                    .map(|f| f.0.clone())
+            })
+            .collect()
+    } else {
+        exports.clone()
+    };
+    for n in roots.iter().map(|s| &s[..]).chain(entry.then_some("_start")) {
+        if let Some(&d) = defs.get(n) {
+            wl.push(d);
+        }
+    }
     for &oi in &included {
-        let m = objs[oi]
+        for (di, d) in objs[oi].data.iter().enumerate() {
+            if d.flags & (INIT_ARRAY | USED) != 0 || d.name.starts_with("__pliron_prof_") {
+                wl.push(Def::Data(oi, di));
+            }
+        }
+    }
+    while let Some(d) = wl.pop() {
+        match d {
+            Def::Func(oi, f) => {
+                let o = &objs[oi];
+                let bi = f - o.fimports.len() as u32;
+                if !live_f.insert((oi, bi)) {
+                    continue;
+                }
+                let ops = o.bodies[bi as usize]
+                    .get_operators_reader()
+                    .map_err(|e| format!("{}: {e:?}", o.name))?;
+                // Only reachable instructions contribute edges: a call in
+                // code dominated by `unreachable`/`return`/`br` can never
+                // execute, so it must not pin its callee. `frames[i]` is
+                // true while the enclosing block is past an unconditional
+                // terminator; `else` starts a fresh arm. `dead` counts the
+                // true frames so reachability is O(1) per instruction.
+                // Seeded with the implicit function-body frame.
+                let mut frames: Vec<bool> = vec![false];
+                let mut dead = 0usize;
+                let mut uref = Vec::new();
+                for op in ops {
+                    let op = op.map_err(|e| format!("{}: {e:?}", o.name))?;
+                    let reachable = dead == 0;
+                    // Type indices must be marked even by dead code: the
+                    // bytes are emitted verbatim, so a `call_indirect` or
+                    // blocktype in unreachable code still names a type.
+                    match &op {
+                        wp::Operator::Block { blockty }
+                        | wp::Operator::Loop { blockty }
+                        | wp::Operator::If { blockty }
+                        | wp::Operator::Try { blockty } => {
+                            if let wp::BlockType::FuncType(t) = blockty {
+                                uref.push(*t);
+                            }
+                        }
+                        wp::Operator::TryTable { try_table } => {
+                            if let wp::BlockType::FuncType(t) = try_table.ty {
+                                uref.push(t);
+                            }
+                        }
+                        wp::Operator::CallIndirect { type_index, .. }
+                        | wp::Operator::ReturnCallIndirect { type_index, .. } => {
+                            uref.push(*type_index);
+                        }
+                        _ => {}
+                    }
+                    match op {
+                        wp::Operator::Block { .. }
+                        | wp::Operator::Loop { .. }
+                        | wp::Operator::If { .. }
+                        | wp::Operator::Try { .. }
+                        | wp::Operator::TryTable { .. } => frames.push(false),
+                        wp::Operator::Else
+                        | wp::Operator::Catch { .. }
+                        | wp::Operator::CatchAll => {
+                            if let Some(t) = frames.last_mut()
+                                && std::mem::replace(t, false)
+                            {
+                                dead -= 1;
+                            }
+                        }
+                        wp::Operator::End | wp::Operator::Delegate { .. } => {
+                            if frames.pop() == Some(true) {
+                                dead -= 1;
+                            }
+                        }
+                        _ => {
+                            if reachable {
+                                match op {
+                                    wp::Operator::Call { function_index: i }
+                                    | wp::Operator::RefFunc { function_index: i }
+                                    | wp::Operator::ReturnCall { function_index: i } => {
+                                        if (i as usize) < o.fimports.len() {
+                                            used_imp.insert((oi, i));
+                                            let (m, n, _) = &o.fimports[i as usize];
+                                            if m == "env"
+                                                && let Some(d) = resolve(oi, n)
+                                            {
+                                                wl.push(d);
+                                            }
+                                        } else {
+                                            wl.push(Def::Func(oi, i));
+                                        }
+                                    }
+                                    wp::Operator::GlobalGet { global_index: i }
+                                    | wp::Operator::GlobalSet { global_index: i } => {
+                                        if let Some((m, n)) = o.gimports.get(i as usize)
+                                            && (m == "GOT.mem" || m == "GOT.func")
+                                        {
+                                            *got_uses.entry((oi, i)).or_insert(0) += 1;
+                                            if let Some(d) = resolve(oi, n) {
+                                                wl.push(d);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            // Unconditional control-flow transfer: the rest
+                            // of this block is unreachable until its `end`.
+                            // (`return_call` etc. execute, so their edge was
+                            // recorded above.)
+                            match op {
+                                wp::Operator::Unreachable
+                                | wp::Operator::Br { .. }
+                                | wp::Operator::BrTable { .. }
+                                | wp::Operator::Return
+                                | wp::Operator::ReturnCall { .. }
+                                | wp::Operator::ReturnCallIndirect { .. }
+                                | wp::Operator::Throw { .. }
+                                | wp::Operator::Rethrow { .. } => {
+                                    if let Some(t) = frames.last_mut()
+                                        && !*t
+                                    {
+                                        *t = true;
+                                        dead += 1;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if !uref.is_empty() {
+                    trefs.entry(oi).or_default().push((bi, uref));
+                }
+            }
+            Def::Data(oi, di) => {
+                if !live_d.insert((oi, di)) {
+                    continue;
+                }
+                for (_, _, sym, _) in &objs[oi].data[di].relocs {
+                    if let Some(d) = resolve(oi, sym) {
+                        wl.push(d);
+                    }
+                }
+            }
+        }
+    }
+    // Cross-object duplicate bodies: the backend may emit the same
+    // instance in several objects (xcgu copies); each object's internal
+    // references point at its own copy, so every copy stays live.
+    // Identical mangled names denote the same instance — same semantics —
+    // so keep the smallest live body and redirect the losers' references
+    // (calls, table entries, GOT, data relocs) to it through `fout`.
+    // Restricted to rustc-mangled names with identical link flags and
+    // signatures so an `export_name`/weak collision can't merge distinct
+    // definitions. Loser bodies leave `live_f` before type/function
+    // numbering so their slots are never emitted; `alias_f` records the
+    // (oi, func-index) -> (oi, func-index) redirects. PLIRON_LDEDUP=0
+    // disables.
+    // r[impl wasm.ld.dedup]
+    let mut alias_f: HashMap<(usize, u32), (usize, u32)> = HashMap::default();
+    if std::env::var_os("PLIRON_LDEDUP").is_none_or(|v| v != "0") {
+        let mut by_name: HashMap<&str, Vec<(usize, u32)>> = HashMap::default();
+        for &oi in &included {
+            let o = &objs[oi];
+            let nimp = o.fimports.len() as u32;
+            for (n, &f) in &o.exports {
+                if f >= nimp && live_f.contains(&(oi, f - nimp)) {
+                    by_name.entry(n.as_str()).or_default().push((oi, f));
+                }
+            }
+        }
+        let info = |oi: usize, n: &str, f: u32| -> Option<(u8, Vec<wp::ValType>, Vec<wp::ValType>)> {
+            let o = &objs[oi];
+            let bi = (f - o.fimports.len() as u32) as usize;
+            let flags = o.funcs.iter().find(|(m, _)| m == n)?.1;
+            if flags & 2 != 0 {
+                return None;
+            }
+            let t = &o.types[o.ftypes[bi] as usize];
+            Some((
+                flags,
+                t.params().to_vec(),
+                t.results().to_vec(),
+            ))
+        };
+        for (n, mut copies) in by_name {
+            if copies.len() < 2
+                || !(n.starts_with("_R") || n.starts_with("_ZN") || n.starts_with("ZN"))
+            {
+                continue;
+            }
+            let Some(want) = info(copies[0].0, n, copies[0].1) else {
+                continue;
+            };
+            if copies
+                .iter()
+                .any(|&(oi, f)| info(oi, n, f).as_ref() != Some(&want))
+            {
+                continue;
+            }
+            // Smallest body wins; object order then index breaks ties.
+            copies.sort_by_key(|&(oi, f)| {
+                (
+                    objs[oi].bodies[(f - objs[oi].fimports.len() as u32) as usize]
+                        .range()
+                        .len(),
+                    oi,
+                    f,
+                )
+            });
+            let winner = copies[0];
+            for &(oi, f) in &copies[1..] {
+                live_f.remove(&(oi, f - objs[oi].fimports.len() as u32));
+                alias_f.insert((oi, f), winner);
+            }
+        }
+    }
+
+    // Is this definition emitted? Dedup losers count as live: their
+    // references redirect to the winner, which is emitted.
+    let is_live = |d: Def| match d {
+        Def::Func(oi, f) => {
+            let (oi, f) = alias_f.get(&(oi, f)).copied().unwrap_or((oi, f));
+            live_f.contains(&(oi, f - objs[oi].fimports.len() as u32))
+        }
+        Def::Data(oi, di) => live_d.contains(&(oi, di)),
+    };
+
+    // An import can also be needed by name, without a call edge: a live
+    // `GOT.func` global or a func relocation in live data resolves an
+    // undefined function symbol through the host-import table
+    // (`value_of` below). Mark every import carrying such a name.
+    let mut want: HashSet<&str> = HashSet::default();
+    for &oi in &included {
+        for (m, n) in &objs[oi].gimports {
+            if m == "GOT.func" && resolve(oi, n).is_none() {
+                want.insert(n);
+            }
+        }
+        for (di, d) in objs[oi].data.iter().enumerate() {
+            if live_d.contains(&(oi, di)) {
+                for (_, func, sym, _) in &d.relocs {
+                    if *func && resolve(oi, sym).is_none() {
+                        want.insert(sym);
+                    }
+                }
+            }
+        }
+    }
+    for &oi in &included {
+        for (i, (_, n, _)) in objs[oi].fimports.iter().enumerate() {
+            if want.contains(n.as_str()) {
+                used_imp.insert((oi, i as u32));
+            }
+        }
+    }
+    // Does the output still need this import? `env` imports that resolve
+    // to a definition (or `__wasm_call_ctors`) are linked, not imported.
+    // r[impl wasm.ld.imports]
+    let imp_used = |oi: usize, i: usize| -> bool {
+        let (m, n, _) = &objs[oi].fimports[i];
+        (used_imp.contains(&(oi, i as u32)))
+            && !(m == "env" && (resolve(oi, n).is_some() || n == CALL_CTORS))
+    };
+
+    // Types: only signatures a live function, needed import, or an
+    // instruction in a live body actually references.
+    let mut types: Vec<wp::FuncType> = Vec::new();
+    // (params, results) arity -> output indices, so dedup compares only
+    // inside a small bucket instead of scanning all types so far.
+    let mut tidx: HashMap<(usize, usize), Vec<u32>> = HashMap::default();
+    let mut tmaps: HashMap<usize, Vec<u32>> = HashMap::default();
+    for &oi in &included {
+        let o = &objs[oi];
+        let mut used = vec![false; o.types.len()];
+        for (i, t) in o.ftypes.iter().enumerate() {
+            if live_f.contains(&(oi, i as u32)) {
+                used[*t as usize] = true;
+            }
+        }
+        for i in 0..o.fimports.len() {
+            if imp_used(oi, i) {
+                used[o.fimports[i].2 as usize] = true;
+            }
+        }
+        // Body type references were collected during the GC scan; dedup
+        // losers have left `live_f` and contribute nothing.
+        if let Some(list) = trefs.get(&oi) {
+            for (bi, u) in list {
+                if live_f.contains(&(oi, *bi)) {
+                    for &t in u {
+                        used[t as usize] = true;
+                    }
+                }
+            }
+        }
+        let m = o
             .types
             .iter()
-            .map(|t| match types.iter().position(|x| x == t) {
-                Some(i) => i as u32,
-                None => {
-                    types.push(t.clone());
-                    types.len() as u32 - 1
+            .enumerate()
+            .map(|(i, t)| {
+                if !used[i] {
+                    // Dead: only live bodies/funcs are emitted, so this
+                    // index is never remapped.
+                    return u32::MAX;
+                }
+                let key = (t.params().len(), t.results().len());
+                let bucket = tidx.entry(key).or_default();
+                match bucket.iter().find(|&&i| types[i as usize] == *t) {
+                    Some(&i) => i,
+                    None => {
+                        types.push(t.clone());
+                        let i = types.len() as u32 - 1;
+                        bucket.push(i);
+                        i
+                    }
                 }
             })
             .collect();
@@ -425,57 +813,120 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     // Only `env` imports are link-time symbols; other modules (e.g.
     // `wasi_snapshot_preview1`) are always provided by the host.
     let mut host: Vec<(String, String, u32)> = Vec::new();
+    let mut host_idx: HashMap<(&str, &str), u32> = HashMap::default();
     for &oi in &included {
-        for (m, n, t) in &objs[oi].fimports {
-            let linked = m == "env" && (resolve(oi, n).is_some() || n == CALL_CTORS);
-            if !linked && !host.iter().any(|h| &h.0 == m && &h.1 == n) {
+        for (i, (m, n, t)) in objs[oi].fimports.iter().enumerate() {
+            if imp_used(oi, i) && !host_idx.contains_key(&(m.as_str(), n.as_str())) {
+                host_idx.insert((m.as_str(), n.as_str()), host.len() as u32);
                 host.push((m.clone(), n.clone(), tmaps[&oi][*t as usize]));
             }
         }
     }
-    let mut base: HashMap<usize, u32> = HashMap::new();
+    // Output function indices: host imports, then each object's live
+    // bodies in link order. Dead functions map to u32::MAX; dead-local
+    // references cannot occur in live bodies, so their slots are unused.
+    let mut fout: HashMap<usize, Vec<u32>> = HashMap::default();
     let mut next = host.len() as u32;
     for &oi in &included {
-        base.insert(oi, next);
-        next += objs[oi].bodies.len() as u32;
+        let mut v = vec![u32::MAX; objs[oi].bodies.len()];
+        for (i, f) in v.iter_mut().enumerate() {
+            if live_f.contains(&(oi, i as u32)) {
+                *f = next;
+                next += 1;
+            }
+        }
+        fout.insert(oi, v);
     }
     // `__wasm_call_ctors` is synthesized after every object's bodies.
     let ctors_fn = next;
     let func_out = |d: Def| -> Option<u32> {
         match d {
-            Def::Func(oi, f) => Some(base[&oi] + f - objs[oi].fimports.len() as u32),
+            Def::Func(oi, f) => {
+                let (oi, f) = alias_f.get(&(oi, f)).copied().unwrap_or((oi, f));
+                match fout[&oi][(f - objs[oi].fimports.len() as u32) as usize] {
+                    u32::MAX => None,
+                    x => Some(x),
+                }
+            }
             Def::Data(..) => None,
         }
     };
-    let mut fmaps: HashMap<usize, Vec<u32>> = HashMap::new();
+    let mut fmaps: HashMap<usize, Vec<u32>> = HashMap::default();
     for &oi in &included {
         let o = &objs[oi];
         let mut m = Vec::new();
         for (md, n, _) in &o.fimports {
             m.push(match resolve(oi, n).filter(|_| md == "env") {
-                Some(d) => func_out(d)
-                    .ok_or_else(|| format!("{}: {n} is data, called as a function", o.name))?,
+                Some(d @ Def::Func(..)) => func_out(d).unwrap_or(0),
+                Some(Def::Data(..)) => {
+                    return Err(format!("{}: {n} is data, called as a function", o.name));
+                }
                 None if md == "env" && n == CALL_CTORS => ctors_fn,
-                None => host.iter().position(|h| &h.0 == md && &h.1 == n).unwrap() as u32,
+                // Unused imports were dropped from `host`; a slot of 0 is
+                // only ever referenced from dead code.
+                None => host_idx
+                    .get(&(md.as_str(), n.as_str()))
+                    .copied()
+                    .unwrap_or(0),
             });
         }
-        let b = base[&oi];
-        m.extend((0..o.bodies.len() as u32).map(|i| b + i));
+        let nimp = o.fimports.len() as u32;
+        m.extend(fout[&oi].iter().enumerate().map(|(bi, &f)| {
+            if let Some(&(woi, wf)) = alias_f.get(&(oi, bi as u32 + nimp)) {
+                return fout[&woi][(wf - objs[woi].fimports.len() as u32) as usize];
+            }
+            if f == u32::MAX {
+                0
+            } else {
+                f
+            }
+        }));
         fmaps.insert(oi, m);
     }
 
-    // Data layout.
-    let mut addr: HashMap<(usize, usize), u32> = HashMap::new();
+    // r[impl wasm.ld.layout]
+    // Data layout: live objects only.
+    let mut addr: HashMap<(usize, usize), u32> = HashMap::default();
     let mut cur = 1024 + stack();
     for &oi in &included {
         for (di, d) in objs[oi].data.iter().enumerate() {
+            if !live_d.contains(&(oi, di)) {
+                continue;
+            }
             cur = cur.next_multiple_of(d.align.max(1));
             addr.insert((oi, di), cur);
             cur += d.bytes.len() as u32;
         }
     }
+    // `__pliron_prof_hdrs`: a synthesized `[count][u32 addrs...]` table of
+    // every live `__pliron_prof_hdr.*` data object, exported as an i32
+    // global — a PGO-instrumented wasm module has no runtime; the host
+    // reads this table + the counters out of linear memory after running
+    // (docs/pgo.md).
+    let prof_hdrs: Vec<u32> = included
+        .iter()
+        .flat_map(|&oi| {
+            objs[oi]
+                .data
+                .iter()
+                .enumerate()
+                .map(move |(di, d)| (oi, di, d))
+        })
+        .filter(|&(oi, di, d)| {
+            d.name.starts_with("__pliron_prof_hdr.") && live_d.contains(&(oi, di))
+        })
+        .map(|(oi, di, _)| addr[&(oi, di)])
+        .collect();
+    let prof_tab = if prof_hdrs.is_empty() {
+        0
+    } else {
+        let a = cur.next_multiple_of(4);
+        cur = a + 4 + 4 * prof_hdrs.len() as u32;
+        a
+    };
     // `__pliron_eh`: flag (+0) and exception pointer (+4) for the backend's
     // emulated unwinding; zero-initialized, so no segment is emitted.
+    // r[impl wasm.eh.word]
     let eh = cur.next_multiple_of(8);
     cur = eh + 8;
     let data_end = cur;
@@ -497,8 +948,15 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     let value_of =
         |oi: usize, sym: &str, func: bool, table: &mut Vec<u32>| -> Result<u32, String> {
             match (resolve(oi, sym), sym) {
-                (Some(Def::Data(o, d)), _) if !func => Ok(addr[&(o, d)]),
-                (Some(d @ Def::Func(..)), _) if func => Ok(slot(func_out(d).unwrap(), table)),
+                (Some(Def::Data(o, d)), _) if !func => addr
+                    .get(&(o, d))
+                    .copied()
+                    .ok_or_else(|| format!("{sym}: dead data referenced")),
+                (Some(d @ Def::Func(..)), _) if func => Ok(slot(
+                    func_out(d)
+                        .ok_or_else(|| format!("{sym}: dead function referenced"))?,
+                    table,
+                )),
                 (None, CALL_CTORS) if func => Ok(slot(ctors_fn, table)),
                 (None, "__heap_base") => Ok(heap_base),
                 (None, "__data_end") => Ok(data_end),
@@ -519,29 +977,67 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             }
         };
 
-    // Globals: 0 is the stack pointer; each GOT import becomes a constant.
+    // Globals: 0 is the stack pointer; synthetic mutable globals (e.g.
+    // PLIRON_WASM_TRIP's counter) come next, then each GOT import's
+    // constant. GOT base depends on how many synthetics exist.
+    let trip = included
+        .iter()
+        .flat_map(|&oi| &objs[oi].gimports)
+        .any(|(m, n)| m == "env" && n == "__pliron_trip");
+    let n_synth = trip as u32;
     let mut gvals: Vec<u32> = Vec::new();
-    let mut gmaps: HashMap<usize, Vec<u32>> = HashMap::new();
+    let mut gmaps: HashMap<usize, Vec<u32>> = HashMap::default();
+    let mut gconsts: HashMap<usize, Vec<Option<i32>>> = HashMap::default();
     for &oi in &included {
         let mut m = Vec::new();
-        for (module, n) in &objs[oi].gimports {
-            m.push(match (module.as_str(), n.as_str()) {
-                ("env", "__stack_pointer") => 0,
+        let mut gc = Vec::new();
+        for (gi, (module, n)) in objs[oi].gimports.iter().enumerate() {
+            let (g, c) = match (module.as_str(), n.as_str()) {
+                ("env", "__stack_pointer") => (0, None),
+                ("env", "__pliron_trip") => (1, None),
                 ("GOT.mem", s) | ("GOT.func", s) => {
-                    let v = value_of(oi, s, module == "GOT.func", &mut table)?;
-                    gvals.push(v);
-                    gvals.len() as u32
+                    // GOT entries are link-time constants, so bodies can
+                    // read them as i32.const (see Mapper::instruction)
+                    // instead of keeping an immutable GOT global around.
+                    // But a large address encodes wider than a small
+                    // global index: fold only when the immediate form is
+                    // no bigger overall than the global it replaces.
+                    // Dead targets are only consulted by dead bodies.
+                    let live = resolve(oi, s).is_none_or(|d| is_live(d));
+                    if !live {
+                        (0, None)
+                    } else {
+                        let v = value_of(oi, s, module == "GOT.func", &mut table)?;
+                        let uses = got_uses.get(&(oi, gi as u32)).copied().unwrap_or(0);
+                        if uses * (1 + sleb_len(v as i32)) <= 8 + uses * 3 {
+                            (0, Some(v as i32))
+                        } else {
+                            gvals.push(v);
+                            (n_synth + gvals.len() as u32, None)
+                        }
+                    }
                 }
-                (m, s) => return Err(format!("{}: unknown global import {m}.{s}", objs[oi].name)),
-            });
+                (m, s) => {
+                    return Err(format!(
+                        "{}: unknown global import {m}.{s}",
+                        objs[oi].name
+                    ));
+                }
+            };
+            m.push(g);
+            gc.push(c);
         }
         gmaps.insert(oi, m);
+        gconsts.insert(oi, gc);
     }
 
     // Data bytes with relocations applied.
     let mut segs: Vec<(u32, Vec<u8>)> = Vec::new();
     for &oi in &included {
         for (di, d) in objs[oi].data.iter().enumerate() {
+            if !live_d.contains(&(oi, di)) {
+                continue;
+            }
             let mut bytes = d.bytes.clone();
             for (off, func, sym, add) in &d.relocs {
                 let v = value_of(oi, sym, *func, &mut table)?.wrapping_add(*add as u32);
@@ -552,11 +1048,23 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             }
         }
     }
+    if !prof_hdrs.is_empty() {
+        let mut b = Vec::with_capacity(4 + 4 * prof_hdrs.len());
+        b.extend_from_slice(&(prof_hdrs.len() as u32).to_le_bytes());
+        for a in &prof_hdrs {
+            b.extend_from_slice(&a.to_le_bytes());
+        }
+        segs.push((prof_tab, b));
+    }
 
+    // r[impl wasm.ld.ctors]
     // Constructors: every pointer in an `.init_array` entry, in link order.
     let mut ctors: Vec<u32> = Vec::new();
     for &oi in &included {
-        for d in objs[oi].data.iter().filter(|d| d.flags & INIT_ARRAY != 0) {
+        for (di, d) in objs[oi].data.iter().enumerate() {
+            if d.flags & INIT_ARRAY == 0 || !live_d.contains(&(oi, di)) {
+                continue;
+            }
             for (_, func, sym, _) in &d.relocs {
                 let f = resolve(oi, sym)
                     .filter(|_| *func)
@@ -579,11 +1087,14 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
 
     // Like LLVM's FixFunctionBitcasts: a no-arg `main` gets a C `main(argc, argv)`
     // wrapper, which is the entry point wasm-bindgen and other hosts look for.
+    // r[impl wasm.ld.main]
     let main_void = match defs.get("main").copied() {
-        Some(d @ Def::Func(oi, f)) => {
-            let t = &types[tmaps[&oi][objs[oi].ftypes[(f - objs[oi].fimports.len() as u32) as usize] as usize] as usize];
-            (t.params().is_empty() && t.results() == [wp::ValType::I32]).then(|| func_out(d)).flatten()
-        }
+        Some(d @ Def::Func(oi, f)) => func_out(d).filter(|_| {
+            let t = &types[tmaps[&oi][objs[oi]
+                .ftypes[(f - objs[oi].fimports.len() as u32) as usize]
+                as usize] as usize];
+            t.params().is_empty() && t.results() == [wp::ValType::I32]
+        }),
         _ => None,
     };
     let argc_ty = main_void.map(|_| {
@@ -600,23 +1111,8 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
 
     // Exports.
     let mut ex: Vec<(String, u32)> = Vec::new();
-    let names: Vec<String> = if exports.is_empty() {
-        included
-            .iter()
-            .filter(|&&oi| !blobs[oi].2)
-            .flat_map(|&oi| {
-                objs[oi]
-                    .funcs
-                    .iter()
-                    .filter(|f| f.1 & GLOBAL != 0)
-                    .map(|f| f.0.clone())
-            })
-            .collect()
-    } else {
-        exports
-    };
     let start = (entry && defs.contains_key("_start")).then(|| "_start".to_string());
-    for n in names.into_iter().chain(start) {
+    for n in roots.into_iter().chain(start) {
         if let Some(f) = defs.get(&n).copied().and_then(func_out) {
             if !ex.iter().any(|e| e.0 == n) {
                 ex.push((n, f));
@@ -648,8 +1144,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
     module.section(&is);
     let mut fs = we::FunctionSection::new();
     for &oi in &included {
-        for t in &objs[oi].ftypes {
-            fs.function(tmaps[&oi][*t as usize]);
+        for (i, t) in objs[oi].ftypes.iter().enumerate() {
+            if live_f.contains(&(oi, i as u32)) {
+                fs.function(tmaps[&oi][*t as usize]);
+            }
         }
     }
     fs.function(void_ty);
@@ -685,6 +1183,16 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         },
         &we::ConstExpr::i32_const((1024 + stack()) as i32),
     );
+    if trip {
+        gs.global(
+            we::GlobalType {
+                val_type: we::ValType::I32,
+                mutable: true,
+                shared: false,
+            },
+            &we::ConstExpr::i32_const(0),
+        );
+    }
     for v in &gvals {
         gs.global(
             we::GlobalType {
@@ -695,9 +1203,27 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             &we::ConstExpr::i32_const(*v as i32),
         );
     }
+    if !prof_hdrs.is_empty() {
+        gs.global(
+            we::GlobalType {
+                val_type: we::ValType::I32,
+                mutable: false,
+                shared: false,
+            },
+            &we::ConstExpr::i32_const(prof_tab as i32),
+        );
+    }
     module.section(&gs);
     let mut es = we::ExportSection::new();
     es.export("memory", we::ExportKind::Memory, 0);
+    if !prof_hdrs.is_empty() {
+        // stack + trip + GOT values precede it in the global section.
+        es.export(
+            "__pliron_prof_hdrs",
+            we::ExportKind::Global,
+            n_synth + 1 + gvals.len() as u32,
+        );
+    }
     for (n, f) in &ex {
         es.export(n, we::ExportKind::Func, *f);
     }
@@ -708,6 +1234,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         &we::ConstExpr::i32_const(1),
         we::Elements::Functions(table.clone().into()),
     );
+    // A `ref.func`/`call` inside a dead region of a live body is remapped
+    // to function index 0; declare it so the instruction still validates
+    // (`ref.func` requires a declared function).
+    els.declared(we::Elements::Functions(vec![0].into()));
     module.section(&els);
     let mut code = we::CodeSection::new();
     for &oi in &included {
@@ -715,8 +1245,12 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             funcs: &fmaps[&oi],
             globals: &gmaps[&oi],
             types: &tmaps[&oi],
+            gconsts: &gconsts[&oi],
         };
-        for b in &objs[oi].bodies {
+        for (i, b) in objs[oi].bodies.iter().enumerate() {
+            if !live_f.contains(&(oi, i as u32)) {
+                continue;
+            }
             m.parse_function_body(&mut code, b.clone())
                 .map_err(|e| format!("{}: {e:?}", objs[oi].name))?;
         }
@@ -741,7 +1275,10 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         .collect();
     for &oi in &included {
         for (n, &f) in &objs[oi].exports {
-            named.push((base[&oi] + f - objs[oi].fimports.len() as u32, n));
+            match fout[&oi][(f - objs[oi].fimports.len() as u32) as usize] {
+                u32::MAX => {}
+                x => named.push((x, n)),
+            }
         }
     }
     named.push((ctors_fn, CALL_CTORS));
@@ -779,6 +1316,7 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
         );
     }
     module.section(&ds);
+    // r[impl wasm.ld.sections]
     let mut customs: Vec<(&str, Vec<u8>)> = Vec::new();
     for &oi in &included {
         for (n, d) in &objs[oi].customs {
@@ -827,6 +1365,47 @@ pub fn link(args: Vec<String>) -> Result<(), String> {
             host.len(),
             data_end - 1024 - stack()
         );
+        eprintln!("pliron-wasm-ld args: {args:?}");
+        let total_f: usize = included.iter().map(|&oi| objs[oi].bodies.len()).sum();
+        let total_d: usize = included.iter().map(|&oi| objs[oi].data.len()).sum();
+        let body_bytes: usize = included
+            .iter()
+            .flat_map(|&oi| objs[oi].bodies.iter())
+            .map(|b| b.range().len())
+            .sum();
+        let live_bytes: usize = included
+            .iter()
+            .flat_map(|&oi| objs[oi].bodies.iter().enumerate().map(move |(i, b)| (oi, i, b)))
+            .filter(|&(oi, i, _)| live_f.contains(&(oi, i as u32)))
+            .map(|(_, _, b)| b.range().len())
+            .sum();
+        eprintln!(
+            "pliron-wasm-ld: {total_f} input functions ({body_bytes} B bodies) -> {} live ({live_bytes} B); {total_d} data objects -> {} live",
+            live_f.len(),
+            live_d.len()
+        );
+        if std::env::var_os("PLIRON_WASM_LD_DUMP").is_some() {
+            let mut ds: Vec<_> = live_d
+                .iter()
+                .map(|&(oi, di)| (objs[oi].data[di].bytes.len(), &objs[oi].data[di].name))
+                .collect();
+            ds.sort();
+            for (sz, n) in ds.iter().rev().take(60) {
+                eprintln!("  data {sz:6} {n}");
+            }
+            let mut by_bytes: HashMap<&[u8], usize> = HashMap::default();
+            for &(oi, di) in &live_d {
+                let d = &objs[oi].data[di];
+                if d.relocs.is_empty() {
+                    *by_bytes.entry(&d.bytes).or_default() += 1;
+                }
+            }
+            let dup: usize = by_bytes
+                .iter()
+                .map(|(b, n)| b.len() * (n - 1))
+                .sum();
+            eprintln!("  reloc-free dup data bytes: {dup}");
+        }
     }
     Ok(())
 }

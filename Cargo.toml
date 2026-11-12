@@ -87,4 +87,19 @@ codegen-units = 1
 
 # If you want to use a crate with local modifications, you can set a path or git dependency here.
 # For git dependencies, also add your source to ALLOWED_SOURCES in src/tools/tidy/src/extdeps.rs.
-#[patch.crates-io]
+[patch.crates-io]
+# Vendored PLIRON patches for compiler/rustc_codegen_pliron — mirror the
+# [patch.crates-io] table in compiler/rustc_codegen_pliron/Cargo.toml so the
+# rustc_codegen_pliron_static / pliron-wasm-ld stubs resolve the patched
+# crates too. Nothing else in this workspace depends on these crates.
+regalloc2 = { path = "compiler/rustc_codegen_pliron/vendor/regalloc2" }
+cranelift-codegen = { path = "compiler/rustc_codegen_pliron/vendor/cranelift-codegen" }
+cranelift-codegen-meta = { path = "compiler/rustc_codegen_pliron/vendor/cranelift-codegen-meta" }
+cranelift-object = { path = "compiler/rustc_codegen_pliron/vendor/cranelift-object" }
+rsasm = { path = "compiler/rustc_codegen_pliron/vendor/rsasm" }
+cranelift-assembler-x64 = { path = "compiler/rustc_codegen_pliron/vendor/cranelift-assembler-x64" }
+cranelift-assembler-x64-meta = { path = "compiler/rustc_codegen_pliron/vendor/cranelift-assembler-x64-meta" }
+cranelift-interpreter = { path = "compiler/rustc_codegen_pliron/vendor/cranelift-interpreter" }
+cranelift-reader = { path = "compiler/rustc_codegen_pliron/vendor/cranelift-reader" }
+cranelift-jit = { path = "compiler/rustc_codegen_pliron/vendor/cranelift-jit" }
+waffle = { path = "compiler/rustc_codegen_pliron/vendor/waffle" }

@@ -1,31 +1,75 @@
 ;; Rematerialize ALU-op-with-imm and iconsts in each block where they're
 ;; used. This is neutral (add-with-imm) or positive (iconst) for
 ;; register pressure, and these ops are very cheap.
-(rule (simplify x @ (iadd _ (iconst _ _) _))
+;; PLIRON: only when the immediate folds into the operand — a remat
+;; that must keep the constant in a register anyway buys no pressure
+;; and re-executes the op at every use (hmget's loop re-xored a
+;; hasher key with a 64-bit constant per iteration).
+(rule (simplify x @ (iadd _ (iconst ty k) _))
+      (if (imm64_addsub_imm ty k))
       (remat x))
-(rule (simplify x @ (iadd _ _ (iconst _ _)))
+(rule (simplify x @ (iadd _ _ (iconst ty k)))
+      (if (imm64_addsub_imm ty k))
       (remat x))
-(rule (simplify x @ (isub _ (iconst _ _) _))
+(rule (simplify x @ (isub _ (iconst ty k) _))
+      (if (imm64_addsub_imm ty k))
       (remat x))
-(rule (simplify x @ (isub _ _ (iconst _ _)))
+(rule (simplify x @ (isub _ _ (iconst ty k)))
+      (if (imm64_addsub_imm ty k))
       (remat x))
-(rule (simplify x @ (band _ (iconst _ _) _))
+(rule (simplify x @ (band _ (iconst ty k) _))
+      (if (imm64_logic_imm ty k))
       (remat x))
-(rule (simplify x @ (band _ _ (iconst _ _)))
+(rule (simplify x @ (band _ _ (iconst ty k)))
+      (if (imm64_logic_imm ty k))
       (remat x))
-(rule (simplify x @ (bor _ (iconst _ _) _))
+(rule (simplify x @ (bor _ (iconst ty k) _))
+      (if (imm64_logic_imm ty k))
       (remat x))
-(rule (simplify x @ (bor _ _ (iconst _ _)))
+(rule (simplify x @ (bor _ _ (iconst ty k)))
+      (if (imm64_logic_imm ty k))
       (remat x))
-(rule (simplify x @ (bxor _ (iconst _ _) _))
+(rule (simplify x @ (bxor _ (iconst ty k) _))
+      (if (imm64_logic_imm ty k))
       (remat x))
-(rule (simplify x @ (bxor _ _ (iconst _ _)))
+(rule (simplify x @ (bxor _ _ (iconst ty k)))
+      (if (imm64_logic_imm ty k))
       (remat x))
 (rule (simplify x @ (bnot _ _))
       (remat x))
-(rule (simplify x @ (iconst _ _))
+;; PLIRON: don't mark plain `iconst` for remat at all. The egraph
+;; remat clones the constant into every use block in the same loop,
+;; so a hoisted radix bound (`iconst 10` feeding `imul`/`icmp` in a
+;; digit-parse chain) becomes a `movz` per block per iteration —
+;; strictly more work than pinning it in a vreg, and under real
+;; register pressure regalloc spills either way. (Was: remat only
+;; when `imm64_remat_cheap`, i.e. one-instruction immediates.)
+;; PLIRON_REMATCALL=1 brings back the one-instruction ones: the elaborator
+;; then clones them only into blocks outside loops or inside loops that
+;; contain a call, where the pinned constant would cross that call in a
+;; callee-saved register or a spill slot (regex-syntax: 778 reloads
+;; of spilled 0/1/-1/sizes).
+(rule (simplify x @ (iconst ty k))
+      (if (pliron_remat_call))
+      (if (imm64_remat_cheap ty k))
       (remat x))
 (rule (simplify x @ (f32const _ _))
       (remat x))
 (rule (simplify x @ (f64const _ _))
+      (remat x))
+;; PLIRON: a `splat` of a materializable constant is one `movi`/`dup` at
+;; the use — far cheaper than the spill reload a long-lived vector value
+;; gets in hot loops (hashbrown probe loops spilled the EMPTY splat).
+(rule (simplify x @ (splat _ (iconst _ _)))
+      (remat x))
+(rule (simplify x @ (splat _ (f32const _ _)))
+      (remat x))
+(rule (simplify x @ (splat _ (f64const _ _)))
+      (remat x))
+;; PLIRON: on unless `PLIRON_REMAT_SADDR=0`: a frame address is one `add rd, sp,
+;; #off`; recompute it in each block that uses it rather than hold it
+;; across calls in a callee-saved register or a spill slot (LLVM's RA
+;; rematerializes frame indices the same way).
+(rule (simplify x @ (stack_addr _ _ _))
+      (if (pliron_remat_saddr))
       (remat x))

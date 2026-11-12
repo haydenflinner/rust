@@ -11,8 +11,104 @@ fn main() {
     let mut kv: Vec<_> = m.into_iter().collect();
     kv.sort();
     println!("{kv:?}");
+    // `entry` returns a borrow that reaches back into the map's stack
+    // slot — sroa's pin sync must not promote past such calls.
+    let mut m: HashMap<u64, u32> = HashMap::with_capacity(64);
+    let mut x = 1u64;
+    for i in 0..2000u64 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *m.entry(x).or_insert(0) += 1;
+        if m.get(&(i * 977)).is_some() {
+            x = x.wrapping_add(1);
+        }
+    }
+    println!("hashmap mix len = {} x = {}", m.len(), x);
     let s = format!("{:.3} {}", 1.5f64.sqrt(), String::from("owned"));
     println!("{s}");
     let r = std::panic::catch_unwind(|| 1 + 1);
     println!("catch_unwind ok = {:?}", r.is_ok());
+    #[cfg(unix)]
+    {
+        // Foreign C-variadic call: float and sub-64-bit args go on the
+        // stack on aarch64-darwin (8-byte slots), in regs/stack on SysV.
+        unsafe extern "C" {
+            fn snprintf(buf: *mut u8, n: usize, fmt: *const u8, ...) -> i32;
+        }
+        let mut buf = [0u8; 64];
+        unsafe {
+            snprintf(
+                buf.as_mut_ptr(),
+                buf.len(),
+                b"%d|%f|%c|%ld\0".as_ptr(),
+                42i32,
+                2.5f64,
+                65u8 as i32,
+                -7i64,
+            );
+        }
+        let s = std::ffi::CStr::from_bytes_until_nul(&buf).unwrap();
+        println!("snprintf = {}", s.to_str().unwrap());
+    }
+
+    // Loop-versioning bounds-check hoisting: in-bounds fast paths must be
+    // correct, and the slow path must panic at the exact OOB index.
+    {
+        #[inline(never)]
+        fn copy1(a: &[u32], dst: &mut [u32], n: usize) {
+            for i in 0..n {
+                dst[i] = a[i] + 1;
+            }
+        }
+        #[inline(never)]
+        fn incl(a: &[u32], dst: &mut [u32], n: usize) {
+            for i in 0..=n {
+                dst[i] = a[i];
+            }
+        }
+        #[inline(never)]
+        fn strided(a: &[u32], dst: &mut [u32], n: usize) {
+            for i in 0..n {
+                dst[i * 2] = a[i];
+            }
+        }
+        let a = vec![7u32; 100];
+        let mut d = vec![0u32; 100];
+        copy1(&a, &mut d, 50);
+        assert_eq!(d[49], 8);
+        assert_eq!(d[60], 0);
+        copy1(&a, &mut d, 0);
+        copy1(&a, &mut d, 100);
+        assert_eq!(d[99], 8);
+        // On Windows against a stock (LLVM-built) std, panics are real SEH
+        // throws the emulated-EH invoke path can't intercept — these asserts
+        // only hold with a backend-built std (`-Zbuild-std`).
+        // r[verify native.win.stock-std]
+        #[cfg(not(pliron_stock_seh))]
+        {
+            let r =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| copy1(&a, &mut d, 200)));
+            assert!(r.is_err());
+        }
+        incl(&a, &mut d, 99);
+        #[cfg(not(pliron_stock_seh))]
+        {
+            let r =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| incl(&a, &mut d, 100)));
+            assert!(r.is_err());
+        }
+        let mut d2 = vec![0u32; 100];
+        strided(&a, &mut d2, 50);
+        assert_eq!(d2[98], 7);
+        #[cfg(not(pliron_stock_seh))]
+        {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut d3 = vec![0u32; 100];
+                strided(&a, &mut d3, 60)
+            }));
+            assert!(r.is_err());
+        }
+        println!("bcheck ok");
+    }
 }

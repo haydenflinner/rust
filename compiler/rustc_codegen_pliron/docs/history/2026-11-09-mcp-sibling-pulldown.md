@@ -1,0 +1,283 @@
+# 2026-11-09 — MCP default-on, sibling-flag flips, pulldown-cmark dig
+
+Three threads: post-allocation copy propagation and the EDGEMERGE/
+EPIMERGE/TBNZ_IREDUCE defaults landed; the pending-flag A/B set closed
+out; pulldown-cmark's remaining gap got a function-level dig.
+
+## PLIRON_MCP (vcode post-allocation copy prop) — default on
+
+A `mov dst, src` whose destination register already carries the
+source's value class is dead: LLVM's `MachineCopyPropagation` deletes
+them inside `VCode::emit`'s instruction walk (`PLIRON_MCP=0` off,
+committed `76177eb` opt-in, `4ee168f` default-on).
+
+- Per-emitted-block `vclass: PReg → class id` map; register-register
+  moves propagate `class[src]`, any other operand definition freshens
+  `class[dst]`, calls and block boundaries clear the map.
+- Participation is restricted to **allocatable Int-class pregs**:
+  `fmov d`/`fmov v` share a `Reg` key but differ in width, and
+  `sp`/`fp`/`lr`/`xzr` take writes (addressing-mode writeback, SP
+  amodes) that never appear as operand definitions.
+- `Edit::Move` (spill/reload) items join the same map; a fused
+  `ldp`/`stp` edit pair must freshen **both** destinations — skipping
+  the second edit leaves the stale class behind and the next needed
+  reload gets wrongly deduplicated (fuzz seed 5042's `ldp x11,x8` →
+  `stp [x11,#0x30]` crash). A source/destination binding slip in the
+  Edit arm poisoned source classes the same way (seed 810).
+- Result: 344 dead movs, −236 insns crate-wide, HqZopfli 2166→2163.
+  Held-out A/B 0.999 [0.981,1.017] — neutral wall, real code size.
+  400-seed fuzz clean, gate 93/93.
+
+## Pending-flag A/B results (eight-program held-out)
+
+| variant | pliron/LV… (ratio) | verdict |
+|---|---|---|
+| `PLIRON_EDGEMERGE=3`+`PLIRON_EPIMERGE=2` | 1.008 [0.995,1.021] | neutral → **default on** (`3bbb029`) |
+| `PLIRON_TBNZ_IREDUCE` | 1.010 [0.994,1.016] | neutral, −172 insns → **default on** |
+| `PLIRON_SROA_MAXSLICES=18` | 1.014 [0.998,1.023] | borderline worse (blind-sig −2.2%*) → stays opt-in |
+| `PLIRON_LIBCALL_DIRECT` | 1.018 [1.000,1.026] | suspicious; rust-html-rewriter −3% → **held** |
+
+The new defaults cut the brotli object's `__text` 0xE9E30 → 0xE94F0
+(−597 insns, ~2.3 KiB). `pliron_mode(var, default)` in vendored
+`vcode.rs` now takes the per-var default so it tracks
+`pliron-cfg::DEFAULT_VALUES`; `=0` remains the off switch for each.
+Gate 93/93 on the flip.
+
+`PLIRON_LIBCALL_DIRECT` marks libcalls `colocated` for direct `bl`
+(linker's PLT stub, as clang emits) instead of `adrp+ldr[GOT]+blr` —
+worth ~2 insns/site, but the A/B's html-rewriter regression needs an
+explanation before flipping.
+
+## Held-out baseline refresh (2026-11-09, 11 rounds + aa)
+
+geomean pliron/LLVM **1.075 [1.068,1.088]** (was 1.081); aa noise
+floor 1.002. rust-protobuf moved to 0.986 — first program faster than
+LLVM. pulldown-cmark 1.100, rust-compression 1.144, rust-html-rewriter
+1.143 remain the top three.
+
+## pulldown-cmark: where the remaining 1.100 lives
+
+Fresh census (`bench/heldout/census.py`, 20 runs): pliron 399 vs LLVM
+365 samples — a 34-sample gap spread across the FirstPass scan
+machinery, not one hot function. Symbol attribution is distorted by
+inlining differences both ways:
+
+- `Parser::next` is 578 insns vs LLVM's 138 — our IR inliner pulled
+  `item_to_tag` (one call site, ~479-insn LLVM body) in while LLVM
+  kept the call. But `PLIRON_INLINE_ONCE=0` makes pulldown *worse*
+  (1.154 vs 1.092): the once-inlining is a net win; the size is not
+  the slowdown.
+- `scalar_iterate_special_bytes` (the parse_line closure): 46 samples
+  vs 0 — LLVM inlined it everywhere into `parse_line`+`Tree::append`
+  callers; we kept a 3594-insn standalone (3 call sites, over every
+  threshold). Aggregation: LLVM 33 (parse_line) + 23 (Tree::append)
+  ≈ 56 samples vs our 46 — roughly equal total work; the "gap" is
+  attribution.
+
+Genuine mechanism findings in `scan_code_fence` (16 vs 3 samples):
+
+1. **Search-loop vectorisation missing.** `iter().any(|&b| b == c)`
+   scans (the "no backtick in suffix" check) emit scalar byte loops
+   for us; LLVM emits `cmeq.16b` + `umaxp`/`shrn` + `rbit`/`clz` NEON —
+   the memchr idiom with early-exit lane position. `loopvec` only
+   handles elementwise and reduction loops, not early-exit searches.
+   This is the largest single code-shape gap in the function (and
+   recurs in the `fminnm`-style LLVM output noted in the brotli dig).
+
+2. **Peel keeps per-copy end tests.** `PLIRON_PEEL` peeled the `.any`
+   loop ×8–9; every copy re-tests `ptr+k == end` + carries a per-copy
+   exit-edge chain eval (`iadd inv,1`, re-materialised by `paramsink`,
+   by design). ~7 insns/element vs LLVM's ~5 in its scalar
+   `scan_ch_repeat` loop, which clamps the pointer select instead of
+   dual index+pointer bookkeeping.
+
+3. `_platform_memmove` +12 samples pliron-side — we feed it more or
+   bigger copies (Event/tree moves), worth a separate look.
+
+Follow-up candidates, in order of leverage: early-exit search
+vectorisation in `loopvec` (`.any`/`position`/`memchr` shapes →
+`cmeq`+reduce+`clz`, recurs across pulldown/regex/json); a
+`ptr+k != end` fact fold inside peeled/punrolled runs where the
+guard already proves `end−ptr ≥ K`; the HqZopfli ~200-mov residue
+(regalloc-level, not emit-level).
+
+## punroll conditional-backedge unrolling (37c7cd7)
+
+Finding 2 above is fixed. `punroll::walk` now records a
+conditional-backedge latch (`brif -> h | exit` with the non-header arm
+outside the body) as `latch_exit`; `run_loop` promotes the loop to the
+rotated path when a pos-0 side exit exists, and demotes back to
+do-while (latch test probed as the count test) when `find_count`
+rejects the top test — the two shapes are syntactically identical at
+walk time and only `find_count` arbitrates (`punroll_ne.clif` keeps its
+do-while `umin` guard).
+
+`scan_code_fence`'s `.any(|&b| b == 0x60)` scan now emits the LLVM
+shape: one `p < end - umin(end, K-2)` group guard (the `PRSTOP`
+fold), K=8 copies at ~3 insns/element (`ldrb`/`cmp`/`b.eq`, the
+found-exit shared) and the rolled scalar remainder — previously ~7
+insns/element of peeled per-copy `ptr+k == end` tests. The scalar
+tail even picks up post-index `ldrb [x0], #1` in lowering.
+
+The neighbouring loops are principled misses, not shape gaps:
+`scan_ch_repeat` (the fence counter) iterates `iter.next()` whose
+step is `select(flag, p, p+1)` — not affine, "no counting latch" is
+correct and LLVM keeps the same `csel` machinery; the `memchr(b'\n')`
+loop does have the NEON `cmeq.16b` region on our side too.
+
+## vrp correlated-difference implication (af81586, 3f98391)
+
+The follow-up "`ptr+k != end` fact fold inside unrolled runs" is done,
+at `ranges` level rather than inside punroll: `Ranges::implied` treats
+each dominating single-pred edge compare as an integer inequality and
+bounds `D = yb - xb`, which decides the sign of `x - y = (kx - ky) - D`
+for `x = xb + kx`, `y = yb + ky`. `edge_fact` now carries branch-arg ->
+block-param bindings so facts reach values bound on the edge
+(`resolve_param` follows single-source params); `lin` reconstructs
+affine forms through params and certified-nonnegative `isub`s;
+`sub_diff` handles the `P - umin(P, k)` remainder idiom where
+satisfiability of the in-range arm forces `umin = k`. Every stripped
+side is certified non-wrapping by `fits` over the at()-refined range —
+the machine adds equal the integer sums only then.
+
+On `BrotliCreateHqZopfliBackwardReferences` vrp folds 26 icmps (was 4):
+the unrolled `idx+k uge rem-bound` checks and the `idx < len` chains
+under a dominating `idx+N < len`. Held-out A/B `vrp/pliron`: geomean
+1.007 [0.990,1.021], rust-compression 0.970 [0.966,1.001]* — its one
+targeted benchmark, borderline-significant ~3%.
+
+Compile-time fix mattered as much as the transform: `resolve_param`'s
+`incoming()` was a whole-layout scan per recursion level — vrp cost
+594 ms (~5% of pipeline) on the rust-compression build. Precomputing
+param single-sources in `Ranges::new` and memoizing `at()` per
+(value, block) brings it to 113 ms (~1%). Gate 94/94 and 400 fuzz
+seeds clean with `PLIRON_VRP=1`; flipped default-on in the pipeline
+gate (`PLIRON_VRP=0` restores).
+
+## HqZopfli residual census (post-vrp, vs LLVM)
+
+Re-counted the opcode mix on `pliron-vrp` vs LLVM builds: 2295 vs
+1321 insns. The gap is structural, not one mechanism:
+
+- `mov` 464 vs 258 (+206): 321 reg-reg movs, ~64 are `ldr xT,[sp]`
+  followed by `mov xA,xT` (reload to scratch then copy to the ABI arg
+  reg — Ion reloads the spilled vreg to its allocated preg rather than
+  the operand's fixed preg). Another ~75 are arg-setup for the 26
+  `panic_bounds_check` call sites (LLVM: 2, via shared stubs over ~8
+  surviving guards). The rest are scattered boundary moves.
+- `ldr`/`str` +154/+99: 247 spill `ldr [sp]` vs 127 — top slots reload
+  17-28x inside unrolled runs (loop invariants spilled under pressure
+  in a 2.3k-insn function). Symptom of the size gap, not a mechanism.
+- `ldur/stur` +54: `amode_no_more_iconst` prefers `Unscaled` before
+  `UnsignedOffset`; same latency as `str`, no win in flipping it.
+- `ldp` gap is `ldp q` vector struct copies on LLVM's side; `copypair`
+  covers what it can.
+- The `ldr w1,[x22,w0,lsl#2]` repeats in the histogram loop are NOT
+  redundant (different byte index per unrolled copy).
+
+Verdict: the remaining bloat is regalloc-quality (fixed-reg reloads,
+spill pressure) + check-elimination depth, not emit-level idiom loss.
+
+## LIBCALL_DIRECT resolved (layout noise) and flipped
+
+The held `PLIRON_LIBCALL_DIRECT` regression did not survive
+randomized-layout reruns:
+
+- rust-html-rewriter, 6 layouts: `lib/pliron 1.013 [1.000,1.021]`
+  vs `aa/pliron 1.011 [0.987,1.020]` — inside the noise floor.
+- Full 8-program, 6 layouts: `lib/pliron 1.005 [0.998,1.012]` vs
+  `aa/pliron 1.001 [0.989,1.007]` — geomean noise-level. blind-sig's
+  starred 1.020 [1.002,1.024] was the only outlier.
+- blind-sig, 12 layouts x 9 rounds: `lib/pliron 1.001 [0.983,1.010]`
+  vs `aa 0.994 [0.987,1.006]` — resolved, no regression.
+
+Flipped default-on via `DEFAULT_ON` (`PLIRON_LIBCALL_DIRECT=0` off):
+`_memcpy`/`_memmove`/`_memset`/`_memcmp` libcalls emit direct `bl`
+(BRANCH26) instead of `adrp; ldr [GOT]; blr`, ~2 insns/site, -1.7 KB
+crate-wide (2026-10-29-code-size.md). Verified on `copy_from_slice`:
+unset → `bl _memcpy`, `=0` → GOT indirection.
+
+## VRP multi-edge edge facts (all-preds agree)
+
+`Ranges` gained per-edge facts for multi-pred blocks whose EVERY pred
+is a `brif` (`edge_facts_multi`, ≤ 8 preds). Three consumers:
+
+- `at()`: joins the per-edge interval ranges (union — alternatives
+  widen), kept only when EVERY edge yields a fact; met into the
+  unconditional range.
+- `known_rel(x, y, at)`: new query — `x == y` decided by edge facts
+  when every edge proves the same verdict (covers `x != bound` for a
+  non-const bound, which intervals can't express).
+- `diff_bounds`: per-edge `D = yb - xb` bounds unioned (widened)
+  across edges.
+
+`fact()` also learned `brif c` binding `c` to a block param: the param
+is `0` on the false arm and *nonzero* on the true arm — NOT `1` (an
+i64 brif cond tests `!= 0`; claiming `[1,1]` was a real miscompile,
+fuzz seed 20565: a `v != 0` edge range of `[1,1]` folded a true
+`x == K` to 0).
+
+`poison_self_params` fixes a second soundness hole found by the
+regression filetests: on a self-edge (single-block loop), a compare
+operand that is a param of the dest and not passed as an arg refers to
+the OLD binding, so `brif (v4 == end) → exit | loop(v4+1)` proves
+`old_v4 != end`, nothing about `v4`. Unbound self-edge params are
+mapped to a sentinel that matches no query; args passed through (e.g.
+`v8 = select(p==end,p,p+1)` tested `!= end`) still translate.
+
+Effect (std corpus): 396 fns differ, net −925 insns, worst +17. On
+`scan_code_fence`'s final shape it folds both `select(p==end,p,p+1)`
+clamps (`v634`, `v648` → 0). Filetests: `vrp_multi_edge{,_flag,_neg}`.
+Validation: corpus 4870 fns 0 mismatches, gate 94 jobs, fuzz 400/400
+(seed 20565 included) — plus one earlier unsound-fold version caught
+by the same filetests before the fix.
+
+### vrp2 (late second vrp) — measured, rejected
+
+`scan_ch_repeat`'s steady-state keeps a `select(p==end,p,p+1)` clamp
+(`sub/cmp/csel`, ~3 insns/iter) that only forms after `dem64`/
+`latchspec` — past vrp's pipeline position. An opt-in `vrp2` after
+latchspec folded both clamps (scan_code_fence 299 → 283 insns) but
+measured `vrp2/pliron 1.005 [0.990,1.065]` on pulldown-cmark and had
+ZERO effect on the 4870-fn std corpus — the late-position facts don't
+fire anywhere else. Reverted: a second 200-ms-corpus pass for one
+function's −16 is not a trade. The clamp needs late LVI or stays.
+Both builds' memchr paths already carry `cmeq.16b` NEON (the memchr
+crate's own vectorized path); LLVM's edge there is 7 vs our 5 cmeq
+sites, not a missing vectorizer.
+
+## ivrefold: const-bound steps, edge-ident idents, late run, r<=0 (fda9d07, a2cdca2)
+
+Held-out census put Brotli's `static_dict::FindMatchLengthWithLimit`
+at 47 vs 33 insns and +6 samples: the loop carried `i`, `base1+i`,
+`base2+i` and recomputed the two pointer args each iteration, while
+LLVM carries `i` and emits `ldrb [x0, x8]` / `ldrb [x2, x8]`.
+ivrefold's alias path already handles exactly this (`arg = iadd B, q'`
+with `q'` another slot's arg) but three matchers missed this shape:
+
+- `step_of` only read literal `iconst` steps; the index stepped by a
+  param bound to the same `iconst` on every edge (`+ stride` threaded
+  as a slot). `pkonst` resolves those steps.
+- That const param itself was fed the same value on every edge but
+  wasn't `p`-identity, so it survived as a slot; `idents` now also
+  strips same-resolved-value-on-every-edge params.
+- `bp = p0 - r*i0` emitted `isub (iadd B, i0), i0`; `add_base` returns
+  `B` directly for r==1.
+
+And one profitability fix that predates this loop: `drops` accepted
+any divisible ratio. With a countdown anchor a +8 pointer becomes
+r = -8 — `bp - 8*iv` can't fold into a scale amode, so the pass
+emitted `imul iv, -8` + a shared pv add per iteration (montgomery in
+blind-sig: +21 insns, 1.31x slower under ivr3). `r <= 0` is now
+rejected — alone it is −177 insns corpus-wide at the existing
+positions.
+
+The pointer-param shape only forms in the late sweep (edgesink/
+latchspec), after ivrefold2's position, so a third `ivrefold3` run
+sits after `latchspec` (default-on, `PLIRON_IVREFOLD3=0` off).
+FindMatchLengthWithLimit now emits LLVM's exact 7-insn loop.
+
+Numbers: corpus 0 mismatches; ivr3 on vs off net +53 static over
+16 fns, held-out A/B 0.991 [0.974,1.013]; jt_backedge_stale needed a
+looser latch pattern (the *index = new* store prints untyped).
+Validation: quick, gate 94/94 both ways, fuzz 400/400.

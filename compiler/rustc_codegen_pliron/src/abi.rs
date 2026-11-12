@@ -13,14 +13,18 @@ use pliron::context::{Context, Ptr};
 use pliron::op::Op;
 use pliron::operation::Operation;
 use pliron::r#type::{TypeHandle, Typed, TypedHandle};
+use pliron::irbuild::inserter::OpInsertionPoint;
+use pliron::linked_list::ContainsLinkedList;
+use pliron::irbuild::listener::DummyListener;
+use pliron::irbuild::rewriter::{IRRewriter, Rewriter};
 use pliron_llvm::ops::{
-    AllocaOp, CallOp, ExtractValueOp, FuncOp, InsertValueOp, LoadOp, ReturnOp, StoreOp,
+    AllocaOp, BrOp, CallOp, ExtractValueOp, FuncOp, InsertValueOp, LoadOp, ReturnOp, StoreOp,
 };
 use pliron_llvm::types::{ArrayType, FuncType, StructLayout, StructType};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::context::{ArgExt, ConstVal, State};
-use crate::inline::{blocks, direct_callee, ops};
+use crate::inline::{blocks_iter, direct_callee, ops_iter};
 use crate::sroa::{mk_const, ptr_plus};
 use crate::types::{TyK, classify, size_align, struct_offsets};
 
@@ -67,16 +71,16 @@ fn fits_regs(ctx: &Context, leaves: &[(u64, TypeHandle)]) -> bool {
 
 fn call_sites(
     ctx: &Context,
-    st: &State<'_>,
+    st: &State,
     internal: &FxHashSet<String>,
 ) -> FxHashMap<String, Vec<Ptr<Operation>>> {
     let mut sites: FxHashMap<String, Vec<Ptr<Operation>>> = FxHashMap::default();
     for f in st.funcs.values() {
-        if !crate::lower::has_body(ctx, f.op) {
+        if !crate::has_body(ctx, f.op) {
             continue;
         }
-        for b in blocks(ctx, f.op) {
-            for op in ops(ctx, b) {
+        for b in blocks_iter(ctx, f.op) {
+            for op in ops_iter(ctx, b) {
                 if let Some(c) = direct_callee(ctx, st, op) {
                     if internal.contains(c) {
                         sites.entry(c.clone()).or_default().push(op);
@@ -91,7 +95,7 @@ fn call_sites(
 /// Dead-argument elimination for internal functions: parameters the body
 /// never reads are dropped from the signature and from every call.
 /// Opt-in (`PLIRON_DEADARG=1`): stage2 instruction count unchanged.
-pub fn dead_args(ctx: &mut Context, st: &mut State<'_>) {
+pub fn dead_args(ctx: &mut Context, st: &mut State) {
     let internal = crate::lower::internal_fns(ctx, st);
     let sites = call_sites(ctx, st, &internal);
     let mut cands: Vec<&String> = internal.iter().collect();
@@ -111,7 +115,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State<'_>) {
             .unwrap();
         let live: Vec<bool> = entry
             .deref(ctx)
-            .arguments()
+            .arguments(ctx)
             .map(|a| a.is_used(ctx))
             .collect();
         if live.len() != args.len() || live.iter().all(|&l| l) {
@@ -120,7 +124,7 @@ pub fn dead_args(ctx: &mut Context, st: &mut State<'_>) {
         let calls = sites.get(sym).cloned().unwrap_or_default();
         if calls
             .iter()
-            .any(|c| st.calls.get(c).is_none_or(|i| i.fn_ty != f.ty))
+            .any(|c| st.calls.get(*c).is_none_or(|i| i.fn_ty != f.ty))
         {
             continue;
         }
@@ -156,14 +160,39 @@ pub fn dead_args(ctx: &mut Context, st: &mut State<'_>) {
                 CallOp::new(ctx, CallOpCallable::Direct(id.clone()), nty, kept).get_operation();
             nc.insert_before(ctx, c);
             if c.deref(ctx).get_num_results() > 0 {
-                let (old, new) = (c.deref(ctx).get_result(0), nc.deref(ctx).get_result(0));
+                let (old, new) = (c.deref(ctx).get_result(ctx, 0), nc.deref(ctx).get_result(ctx, 0));
                 old.replace_all_uses_with(ctx, &new);
             }
-            let mut info = st.calls.remove(&c).unwrap();
+            let mut info = st.calls.remove(c).unwrap();
             info.fn_ty = nty.into();
             info.exts = exts.clone();
+            // `nocap`/`arg_extent` are indexed by operand position — re-index
+            // them like `kept` so they line up with the rewritten arg list.
+            if let Some(v) = info.nocap.take() {
+                info.nocap = (v.len() == cargs.len())
+                    .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
+            }
+            // The sret out-pointer is operand 0; if dead-arg elimination
+            // dropped it there is no sret operand to sync anymore.
+            info.sret_nocap &= live.first().copied().unwrap_or(false);
+            if let Some(v) = info.arg_extent.take() {
+                info.arg_extent = (v.len() == cargs.len())
+                    .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
+            }
+            if let Some(v) = info.arg_noalias.take() {
+                info.arg_noalias = (v.len() == cargs.len())
+                    .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
+            }
+            if let Some(v) = info.arg_byval_ro.take() {
+                info.arg_byval_ro = (v.len() == cargs.len())
+                    .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
+            }
+            if let Some(v) = info.arg_ro.take() {
+                info.arg_ro = (v.len() == cargs.len())
+                    .then(|| v.iter().zip(&live).filter(|p| *p.1).map(|p| *p.0).collect());
+            }
             st.calls.insert(nc, info);
-            if let Some(u) = st.invokes.remove(&c) {
+            if let Some(u) = st.invokes.remove(c) {
                 st.invokes.insert(nc, u);
             }
             if st.last_call == Some(c) {
@@ -173,15 +202,20 @@ pub fn dead_args(ctx: &mut Context, st: &mut State<'_>) {
         }
         n += live.iter().filter(|&&l| !l).count();
     }
-    if std::env::var("PLIRON_STATS").is_ok() {
-        eprintln!("deadarg {}: {n} params removed", st.cgu);
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "deadarg {}: {n} params removed", st.cgu)
+        };
     }
 }
 
-pub fn run(ctx: &mut Context, st: &mut State<'_>) {
+// r[impl front.abi.sret2reg]
+pub fn run(ctx: &mut Context, st: &mut State) {
     let internal = crate::lower::internal_fns(ctx, st);
     let sites = call_sites(ctx, st, &internal);
-    if std::env::var("PLIRON_STATS").is_ok() {
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
         let (mut total, mut dead, mut ro) = (0, 0, 0);
         for s in &internal {
             let f = &st.funcs[s];
@@ -189,24 +223,25 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
                 .unwrap()
                 .get_entry_block(ctx)
                 .unwrap();
-            for a in e.deref(ctx).arguments() {
+            for a in e.deref(ctx).arguments(ctx) {
                 total += 1;
                 if !a.is_used(ctx) {
                     dead += 1;
                 } else if matches!(classify(ctx, a.get_type(ctx)), TyK::Ptr)
-                    && a.uses(ctx)
-                        .into_iter()
+                    && a
+                        .uses_iter(ctx)
                         .all(|u| Operation::is_op::<LoadOp>(u.user_op(), ctx))
                 {
                     ro += 1;
                 }
             }
         }
-        eprintln!(
-            "abi {}: {} internal fns, {total} params, {dead} dead, {ro} load-only ptrs",
-            st.cgu,
-            internal.len()
-        );
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "abi {}: {} internal fns, {total} params, {dead} dead, {ro} load-only ptrs",
+                st.cgu,
+                internal.len()
+            )
+        };
     }
     let mut n = 0;
     let mut cands: Vec<&String> = internal.iter().collect();
@@ -224,21 +259,24 @@ pub fn run(ctx: &mut Context, st: &mut State<'_>) {
         let calls = sites.get(sym).cloned().unwrap_or_default();
         if calls
             .iter()
-            .any(|c| st.calls.get(c).is_none_or(|i| i.fn_ty != f.ty))
+            .any(|c| st.calls.get(*c).is_none_or(|i| i.fn_ty != f.ty))
         {
             continue;
         }
         rewrite(ctx, st, sym, sty, &leaves, &calls);
         n += 1;
     }
-    if std::env::var("PLIRON_STATS").is_ok() {
-        eprintln!("sret2reg {}: {n} functions", st.cgu);
+    if pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::stats", tracing::Level::INFO)
+    {
+        if pliron_cfg::tracing_on() {
+            tracing::info!(target: "pliron::stats", "sret2reg {}: {n} functions", st.cgu)
+        };
     }
 }
 
 fn rewrite(
     ctx: &mut Context,
-    st: &mut State<'_>,
+    st: &mut State,
     sym: &str,
     sty: TypeHandle,
     leaves: &[(u64, TypeHandle)],
@@ -265,14 +303,13 @@ fn rewrite(
     let one = mk_const(ctx, st, i32t, ConstVal::Bits(1));
     let a = AllocaOp::new(ctx, arr, one, 0).get_operation();
     a.insert_at_front(entry, ctx);
-    let slot = a.deref(ctx).get_result(0);
+    let slot = a.deref(ctx).get_result(ctx, 0);
     st.allocas.insert(slot, (size, align));
-    let sret = entry.deref(ctx).get_argument(0);
+    let sret = entry.deref(ctx).get_argument(ctx, 0);
     sret.replace_all_uses_with(ctx, &slot);
     BasicBlock::remove_argument(entry, ctx, 0);
-    let rets: Vec<_> = blocks(ctx, fop)
-        .into_iter()
-        .flat_map(|b| ops(ctx, b))
+    let rets: Vec<_> = blocks_iter(ctx, fop)
+        .flat_map(|b| ops_iter(ctx, b))
         .filter(|&op| Operation::is_op::<ReturnOp>(op, ctx))
         .collect();
     for r in rets {
@@ -281,10 +318,10 @@ fn rewrite(
             let p = ptr_plus(ctx, st, slot, off, r);
             let ld = LoadOp::new(ctx, p, t).get_operation();
             ld.insert_before(ctx, r);
-            let v = ld.deref(ctx).get_result(0);
+            let v = ld.deref(ctx).get_result(ctx, 0);
             let iv = InsertValueOp::new(ctx, agg, v, vec![i as u32]).get_operation();
             iv.insert_before(ctx, r);
-            agg = iv.deref(ctx).get_result(0);
+            agg = iv.deref(ctx).get_result(ctx, 0);
         }
         ReturnOp::new(ctx, Some(agg))
             .get_operation()
@@ -312,23 +349,56 @@ fn rewrite(
         )
         .get_operation();
         nc.insert_before(ctx, c);
-        let r = nc.deref(ctx).get_result(0);
+        let r = nc.deref(ctx).get_result(ctx, 0);
+        // The leaf stores run only when the call returns. For an invoke
+        // they go at the head of a fresh normal-edge block so the invoke
+        // still ends its block (`call; br`): ops after an invoke would be
+        // credited to its landing pad by block-level dominance, and
+        // sroa-fwd forwarded such a store into cleanup code
+        // (nu_command `copy_on_thread`, 2026-10-22).
+        let anchor = if st.invokes.get(c).is_some() {
+            let b = c.deref(ctx).get_parent_block().unwrap();
+            let mut rw = IRRewriter::<DummyListener>::default();
+            let cont = rw.split_block(ctx, b, OpInsertionPoint::AfterOperation(c), None);
+            BrOp::new(ctx, cont, vec![]).get_operation().insert_after(ctx, c);
+            if let Some(&rb) = st.region_blocks.get(b) {
+                st.region_blocks.insert(cont, rb);
+            }
+            cont.deref(ctx).iter(ctx).next().unwrap()
+        } else {
+            c
+        };
         for (i, &(off, _)) in leaves.iter().enumerate() {
             let ev = ExtractValueOp::new(ctx, r, vec![i as u32])
                 .unwrap()
                 .get_operation();
-            ev.insert_before(ctx, c);
-            let v = ev.deref(ctx).get_result(0);
-            let p = ptr_plus(ctx, st, cargs[0], off, c);
+            ev.insert_before(ctx, anchor);
+            let v = ev.deref(ctx).get_result(ctx, 0);
+            let p = ptr_plus(ctx, st, cargs[0], off, anchor);
             StoreOp::new(ctx, v, p)
                 .get_operation()
-                .insert_before(ctx, c);
+                .insert_before(ctx, anchor);
         }
-        let mut info = st.calls.remove(&c).unwrap();
+        let mut info = st.calls.remove(c).unwrap();
         info.fn_ty = nty.into();
         info.exts = exts.clone();
+        // `nocap`/`arg_extent` are indexed by operand position, and operand 0
+        // (the sret pointer) is gone — shift the arrays left to match.
+        info.sret_nocap = false;
+        if let Some(v) = info.nocap.take() {
+            info.nocap = (v.len() == cargs.len()).then(|| v[1..].into());
+        }
+        if let Some(v) = info.arg_extent.take() {
+            info.arg_extent = (v.len() == cargs.len()).then(|| v[1..].into());
+        }
+        if let Some(v) = info.arg_noalias.take() {
+            info.arg_noalias = (v.len() == cargs.len()).then(|| v[1..].into());
+        }
+        if let Some(v) = info.arg_byval_ro.take() {
+            info.arg_byval_ro = (v.len() == cargs.len()).then(|| v[1..].into());
+        }
         st.calls.insert(nc, info);
-        if let Some(u) = st.invokes.remove(&c) {
+        if let Some(u) = st.invokes.remove(c) {
             st.invokes.insert(nc, u);
         }
         if st.last_call == Some(c) {

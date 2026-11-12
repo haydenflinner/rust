@@ -37,7 +37,7 @@ use crate::{
         listener::Recorder,
         rewriter::{IRRewriter, Rewriter},
     },
-    linked_list::{ContainsLinkedList, LinkedList},
+    linked_list::ContainsLinkedList,
     op::{op_cast, op_impls},
     operation::{OpDbg, Operation},
     opts::constants::{BranchOpFoldInterface, ConstFoldInterface},
@@ -67,7 +67,7 @@ fn constant_operand_attrs(op: Ptr<Operation>, ctx: &Context) -> Vec<Option<AttrO
         }
     };
     op.deref(ctx)
-        .operands()
+        .operands(ctx)
         .map(|v| v.defining_op().and_then(|def| get_def_const(def, v)))
         .collect()
 }
@@ -118,7 +118,7 @@ fn try_merge_succ(
         succ.label(ctx)
     );
 
-    let formal_args: Vec<Value> = succ.deref(ctx).arguments().collect();
+    let formal_args: Vec<Value> = succ.deref(ctx).arguments(ctx).collect();
     assert_eq!(
         formal_args.len(),
         actual_args.len(),
@@ -131,7 +131,7 @@ fn try_merge_succ(
     rewriter.erase_operation(ctx, pred_terminator);
     let mut cur = succ.deref(ctx).get_head();
     while let Some(op) = cur {
-        let next = op.deref(ctx).get_next();
+        let next = op.get_next(ctx);
         rewriter.move_operation(ctx, op, OpInsertionPoint::AtBlockEnd(pred));
         cur = next;
     }
@@ -147,7 +147,7 @@ pub fn remove_blocks_inside_op(
     ctx: &mut Context,
     rewriter: &mut dyn Rewriter,
 ) -> IRStatus {
-    let regions: Vec<Ptr<Region>> = op.deref(ctx).regions().collect();
+    let regions: Vec<Ptr<Region>> = op.deref(ctx).regions(ctx).collect();
     let mut status = IRStatus::Unchanged;
     //TODO: RegionBranchOpInterface should allow us to handle this less conservatively
     for region in regions {
@@ -233,7 +233,7 @@ pub fn merge_inside_op(
     ctx: &mut Context,
     rewriter: &mut dyn Rewriter,
 ) -> IRStatus {
-    let regions: Vec<Ptr<Region>> = op.deref(ctx).regions().collect();
+    let regions: Vec<Ptr<Region>> = op.deref(ctx).regions(ctx).collect();
     let mut status = IRStatus::Unchanged;
     //TODO: RegionBranchOpInterface should allow us to handle this less conservatively
     for region in regions {

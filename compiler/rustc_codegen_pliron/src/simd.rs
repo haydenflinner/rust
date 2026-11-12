@@ -31,6 +31,49 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         )
     }
 
+    /// The scalar lane of a splat: a `pliron.vsplat`, or a constant vector
+    /// whose lanes are all equal.
+    fn splat_lane(&self, v: Value) -> Option<Value> {
+        if let Some(ConstVal::Agg(ids)) = self.cval(v) {
+            let first = self.const_to_opt_u128(*ids.first()?, false)?;
+            return ids
+                .iter()
+                .all(|&i| self.const_to_opt_u128(i, false) == Some(first))
+                .then_some(ids[0]);
+        }
+        // Constant vectors from MIR (`Simd::splat(4)` folded at -O) arrive
+        // as raw little-endian lane bytes.
+        if let Some(ConstVal::Bytes(b)) = self.cval(v) {
+            let crate::types::TyK::Vector(e, n) = self.cx.kind(self.cx.ty_of(v)) else {
+                return None;
+            };
+            let w = (self.elem_bits(e) / 8) as usize;
+            if w == 0 || b.len() != w * n as usize {
+                return None;
+            }
+            let lane = |k: usize| b[k * w..(k + 1) * w].iter().rev().fold(0u128, |a, &x| a << 8 | x as u128);
+            let first = lane(0);
+            return (1..n as usize).all(|k| lane(k) == first).then(|| self.const_uint_big(e, first));
+        }
+        let op = v.defining_op()?;
+        if self.st.borrow().intrinsics.get(op).map(|s| s.as_str()) != Some("pliron.vsplat") {
+            return None;
+        }
+        Some(op.deref(&self.cx.pctx.borrow()).get_operand(&self.cx.pctx.borrow(), 0))
+    }
+
+    fn aarch64(&self) -> bool {
+        self.tcx.sess.target.arch == rustc_target::spec::Arch::AArch64
+    }
+
+    /// Bit width of an integer element type (0 otherwise).
+    fn elem_bits(&self, t: TypeHandle) -> u32 {
+        match self.cx.kind(t) {
+            crate::types::TyK::Int(w) => w,
+            _ => 0,
+        }
+    }
+
     /// Whether `ty` lowers to native Cranelift SIMD values.
     pub(crate) fn native(&self, ty: TypeHandle) -> bool {
         match self.cx.kind(ty) {
@@ -189,6 +232,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     }
 
     /// Returns `None` for SIMD intrinsics that aren't implemented yet.
+    // r[impl front.simd.native]
     pub fn simd_intrinsic(
         &mut self,
         name: &str,
@@ -207,7 +251,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         use rustc_codegen_ssa::diagnostics::{
             ExpectedPointerMutability, InvalidMonomorphization as IM,
         };
-        use rustc_middle::ty::{self, consts::ConstExt};
+        use rustc_middle::ty;
         let name_sym = rustc_span::Symbol::intern(name);
         macro_rules! fail {
             ($err:expr) => {{
@@ -217,12 +261,21 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
         macro_rules! require {
             ($cond:expr, $err:expr) => {
-                if !$cond { fail!($err) }
+                if !$cond {
+                    fail!($err)
+                }
             };
         }
         macro_rules! require_simd {
             ($ty:expr, $variant:ident) => {{
-                require!($ty.is_simd(), IM::$variant { span, name: name_sym, ty: $ty });
+                require!(
+                    $ty.is_simd(),
+                    IM::$variant {
+                        span,
+                        name: name_sym,
+                        ty: $ty
+                    }
+                );
                 $ty.simd_size_and_type(self.tcx)
             }};
         }
@@ -258,7 +311,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             };
             require!(
                 ok,
-                IM::InvalidBitmask { span, name: name_sym, mask_ty, expected_int_bits, expected_bytes }
+                IM::InvalidBitmask {
+                    span,
+                    name: name_sym,
+                    mask_ty,
+                    expected_int_bits,
+                    expected_bytes
+                }
             );
         }
 
@@ -279,18 +338,33 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 require!(
                     out_len == in_len,
                     IM::ReturnLengthInputType {
-                        span, name: name_sym, in_len, in_ty, ret_ty: ret_rty, out_len
+                        span,
+                        name: name_sym,
+                        in_len,
+                        in_ty,
+                        ret_ty: ret_rty,
+                        out_len
                     }
                 );
                 require!(
                     out_ty.is_integral(),
-                    IM::ReturnIntegerType { span, name: name_sym, ret_ty: ret_rty, out_ty }
+                    IM::ReturnIntegerType {
+                        span,
+                        name: name_sym,
+                        ret_ty: ret_rty,
+                        out_ty
+                    }
                 );
             }
             "and" | "or" | "xor" | "shl" | "shr" => {
                 require!(
                     in_elem.is_integral(),
-                    IM::UnsupportedOperation { span, name: name_sym, in_ty, in_elem }
+                    IM::UnsupportedOperation {
+                        span,
+                        name: name_sym,
+                        in_ty,
+                        in_elem
+                    }
                 );
             }
             "saturating_add" | "saturating_sub" => {
@@ -304,11 +378,16 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     }
                 );
             }
-            "bswap" | "bitreverse" | "ctlz" | "ctpop" | "cttz" | "carryless_mul"
-            | "funnel_shl" | "funnel_shr" => {
+            "bswap" | "bitreverse" | "ctlz" | "ctpop" | "cttz" | "carryless_mul" | "funnel_shl"
+            | "funnel_shr" => {
                 require!(
                     in_elem.is_integral(),
-                    IM::UnsupportedOperation { span, name: name_sym, in_ty, in_elem }
+                    IM::UnsupportedOperation {
+                        span,
+                        name: name_sym,
+                        in_ty,
+                        in_elem
+                    }
                 );
             }
             "cast" => {
@@ -316,20 +395,34 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 require!(
                     out_len == in_len,
                     IM::ReturnLengthInputType {
-                        span, name: name_sym, in_len, in_ty, ret_ty: ret_rty, out_len
+                        span,
+                        name: name_sym,
+                        in_len,
+                        in_ty,
+                        ret_ty: ret_rty,
+                        out_len
                     }
                 );
             }
             "select" => {
                 require!(
                     in_elem.is_integral(),
-                    IM::MaskWrongElementType { span, name: name_sym, ty: in_elem }
+                    IM::MaskWrongElementType {
+                        span,
+                        name: name_sym,
+                        ty: in_elem
+                    }
                 );
                 let (v_len, _) = require_simd!(args[1].layout.ty, SimdArgument);
                 require_simd!(args[2].layout.ty, SimdArgument);
                 require!(
                     v_len == in_len,
-                    IM::MismatchedLengths { span, name: name_sym, m_len: in_len, v_len }
+                    IM::MismatchedLengths {
+                        span,
+                        name: name_sym,
+                        m_len: in_len,
+                        v_len
+                    }
                 );
             }
             "insert" => {
@@ -360,7 +453,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             "extract" => {
                 require!(
                     ret_rty == in_elem,
-                    IM::ReturnType { span, name: name_sym, in_elem, in_ty, ret_ty: ret_rty }
+                    IM::ReturnType {
+                        span,
+                        name: name_sym,
+                        in_elem,
+                        in_ty,
+                        ret_ty: ret_rty
+                    }
                 );
                 if name == "simd_extract"
                     && let Some(ConstVal::Bits(bits)) = self.cval(a(1))
@@ -389,7 +488,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     {
                         idx_ty.simd_size_and_type(self.tcx).0
                     } else {
-                        fail!(IM::SimdShuffle { span, name: name_sym, ty: idx_ty })
+                        fail!(IM::SimdShuffle {
+                            span,
+                            name: name_sym,
+                            ty: idx_ty
+                        })
                     }
                 };
                 let (out_len, out_ty) = require_simd!(ret_rty, SimdReturn);
@@ -416,8 +519,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 );
                 let total_len = u128::from(in_len) * 2;
                 if name == "simd_shuffle_const_generic" {
-                    for (i, c) in
-                        instance.args[2].expect_const().to_branch().iter().enumerate()
+                    for (i, c) in instance.args[2]
+                        .expect_const()
+                        .to_branch()
+                        .iter()
+                        .enumerate()
                     {
                         if u128::from(c.to_leaf().to_u32()) >= total_len {
                             fail!(IM::SimdIndexOutOfBounds {
@@ -430,7 +536,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     }
                 } else if let Some(ConstVal::Agg(ids)) = self.cval(a(2)) {
                     for (i, id) in ids.iter().enumerate() {
-                        if self.const_to_opt_u128(*id, true).is_some_and(|k| k >= total_len) {
+                        if self
+                            .const_to_opt_u128(*id, true)
+                            .is_some_and(|k| k >= total_len)
+                        {
                             fail!(IM::SimdIndexOutOfBounds {
                                 span,
                                 name: name_sym,
@@ -488,7 +597,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 );
                 require!(
                     in_elem.is_integral(),
-                    IM::MaskWrongElementType { span, name: name_sym, ty: in_elem }
+                    IM::MaskWrongElementType {
+                        span,
+                        name: name_sym,
+                        ty: in_elem
+                    }
                 );
             }
             "gather" | "scatter" => {
@@ -521,7 +634,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 if base == "gather" {
                     require!(
                         ret_rty == in_ty,
-                        IM::ExpectedReturnType { span, name: name_sym, in_ty, ret_ty: ret_rty }
+                        IM::ExpectedReturnType {
+                            span,
+                            name: name_sym,
+                            in_ty,
+                            ret_ty: ret_rty
+                        }
                     );
                 }
                 let mutability = if base == "scatter" {
@@ -543,7 +661,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 );
                 require!(
                     mask_elem.is_integral(),
-                    IM::MaskWrongElementType { span, name: name_sym, ty: mask_elem }
+                    IM::MaskWrongElementType {
+                        span,
+                        name: name_sym,
+                        ty: mask_elem
+                    }
                 );
             }
             "bitmask" => {
@@ -551,11 +673,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let expected_bytes = in_len / 8 + u64::from(!in_len.is_multiple_of(8));
                 let ok = match *ret_rty.kind() {
                     ty::Int(i) => i.bit_width() == Some(expected_int_bits),
-                ty::Uint(i) => i.bit_width() == Some(expected_int_bits),
+                    ty::Uint(i) => i.bit_width() == Some(expected_int_bits),
                     ty::Array(elem, l) => {
                         matches!(elem.kind(), ty::Uint(ty::UintTy::U8))
-                            && l.try_to_target_usize(self.tcx).unwrap_or(u64::MAX)
-                                == expected_bytes
+                            && l.try_to_target_usize(self.tcx).unwrap_or(u64::MAX) == expected_bytes
                     }
                     _ => false,
                 };
@@ -578,14 +699,22 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     require!(
                         ret_rty == in_elem,
                         IM::ReturnType {
-                            span, name: name_sym, in_elem, in_ty, ret_ty: ret_rty
+                            span,
+                            name: name_sym,
+                            in_elem,
+                            in_ty,
+                            ret_ty: ret_rty
                         }
                     );
                 }
                 let int_only = !matches!(
                     base,
-                    "reduce_add" | "reduce_mul" | "reduce_add_ordered" | "reduce_mul_ordered"
-                        | "reduce_add_unordered" | "reduce_mul_unordered"
+                    "reduce_add"
+                        | "reduce_mul"
+                        | "reduce_add_ordered"
+                        | "reduce_mul_ordered"
+                        | "reduce_add_unordered"
+                        | "reduce_mul_unordered"
                 );
                 require!(
                     if int_only {
@@ -607,7 +736,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         }
 
         if op == "expose_provenance" || op == "with_exposed_provenance" {
-            let (n, _) = self.elem_of(ret_rty);
+            let (_n, _) = self.elem_of(ret_rty);
             let et = self.element_type(ret);
             let xs = self.arg_lanes(&args[0]);
             let out = xs
@@ -630,7 +759,13 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let (n, e) = if args[0].layout.ty.is_simd() {
             self.elem_of(args[0].layout.ty)
         } else {
-            (0, Elem { signed: false, float: false })
+            (
+                0,
+                Elem {
+                    signed: false,
+                    float: false,
+                },
+            )
         };
         match base {
             "add" | "sub" | "mul" | "div" | "rem" | "shl" | "shr" | "and" | "or" | "xor"
@@ -640,6 +775,30 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     "maximum_number_nsz" => "fmax",
                     o => o,
                 };
+                // Native integer vector shifts by a splat amount: Cranelift
+                // shifts a vector by one scalar, so pass the splat's lane.
+                // Per-lane emulation of memchr's `vshrn_n_u16` (a shift
+                // then a narrowing cast) dominated serde_json's escape
+                // scan (`skip_to_escape`: 1,322 instructions vs LLVM's 181).
+                if self.native(ret) && !e.float && matches!(op, "shl" | "shr") && self.aarch64() {
+                    if let Some(k) = self.splat_lane(a(1)) {
+                        let name = match (op, e.signed) {
+                            ("shl", _) => "pliron.vshl",
+                            ("shr", true) => "pliron.vshr.s",
+                            _ => "pliron.vshr.u",
+                        };
+                        return Some(self.intrinsic(name, ret, &[a(0), k]));
+                    }
+                    // Not visibly a splat yet (`vdupq_n_u16` is a call until
+                    // inlining): a whole-vector shift; lowering finds the
+                    // splat then, or shifts lane by lane.
+                    let (x, y) = (a(0), a(1));
+                    return Some(match (op, e.signed) {
+                        ("shl", _) => self.shl(x, y),
+                        ("shr", true) => self.ashr(x, y),
+                        _ => self.lshr(x, y),
+                    });
+                }
                 if self.native(ret) {
                     let (x, y) = (a(0), a(1));
                     let r = match (op, e.float) {
@@ -1027,6 +1186,22 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             "cast" | "as" => {
                 let (_, to) = self.elem_of(ret_rty);
                 let et = self.element_type(ret);
+                // Native int vector truncated to half-width lanes (memchr's
+                // movemask: i16x8 -> i8x8): one native narrow, not lanes.
+                let src = self.val_ty(a(0));
+                if !e.float
+                    && !to.float
+                    && self.aarch64()
+                    && self.native(src)
+                    && self.native(ret)
+                {
+                    let (fw, tw) = (self.elem_bits(self.element_type(src)), self.elem_bits(et));
+                    // The lowering narrows a 128-bit vector to a 64-bit one.
+                    let full = matches!(self.cx.kind(src), crate::types::TyK::Vector(_, n) if n as u32 * fw == 128);
+                    if full && (fw == 16 || fw == 32) && tw * 2 == fw {
+                        return Some(self.intrinsic("pliron.vtrunc", ret, &[a(0)]));
+                    }
+                }
                 let xs = self.arg_lanes(&args[0]);
                 let out = xs
                     .into_iter()
@@ -1051,7 +1226,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let a = |i: usize| args[i].immediate();
         match name {
             "llvm.x86.ssse3.pshuf.b.128" | "llvm.x86.avx2.pshuf.b" => {
-                // r[i] = b[i] & 0x80 ? 0 : a[16 * (i / 16) + (b[i] & 15)]
+                // out[i] = b[i] & 0x80 ? 0 : a[16 * (i / 16) + (b[i] & 15)]
                 let (n, _) = self.elem_of(ret_rty);
                 let one = rustc_abi::Align::ONE;
                 let slot = self.alloca(rustc_abi::Size::from_bytes(n), one);
@@ -1100,6 +1275,70 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 }
                 Some(self.build_vec(ret, out))
             }
+            "llvm.x86.sha256rnds2" | "llvm.x86.sha256msg1" | "llvm.x86.sha256msg2" => {
+                // SHA-NI ops in plain i32 IR (lane i is element i).
+                // σ0(x)=ror7^ror18^shr3, σ1(x)=ror17^ror19^shr10,
+                // Σ0(x)=ror2^ror13^ror22, Σ1(x)=ror6^ror11^ror25.
+                let (xs, ys) = (self.arg_lanes(&args[0]), self.arg_lanes(&args[1]));
+                if name == "llvm.x86.sha256rnds2" {
+                    // Two rounds of SHA-256; arg2 lanes 0/1 carry W+K.
+                    // arg0 supplies the (C,D,G,H) state, arg1 the (A,B,E,F).
+                    let ks = self.arg_lanes(&args[2]);
+                    let (mut a, mut b, mut c, mut d) = (ys[3], ys[2], xs[3], xs[2]);
+                    let (mut e, mut f, mut g, mut h) = (ys[1], ys[0], xs[1], xs[0]);
+                    for i in 0..2 {
+                        let bs1 = sha_ror_sum(self, e, &[6, 11, 25]);
+                        let ef = self.and(e, f);
+                        let ne = self.not(e);
+                        let neg = self.and(ne, g);
+                        let ch = self.xor(ef, neg);
+                        let bs0 = sha_ror_sum(self, a, &[2, 13, 22]);
+                        let ab = self.and(a, b);
+                        let ac = self.and(a, c);
+                        let bc = self.and(b, c);
+                        let abac = self.xor(ab, ac);
+                        let maj = self.xor(abac, bc);
+                        let hbs1 = self.add(h, bs1);
+                        let chk = self.add(ch, ks[i]);
+                        let t1 = self.add(hbs1, chk);
+                        let t2 = self.add(bs0, maj);
+                        h = g;
+                        g = f;
+                        f = e;
+                        e = self.add(t1, d);
+                        d = c;
+                        c = b;
+                        b = a;
+                        a = self.add(t1, t2);
+                    }
+                    Some(self.build_vec(ret, vec![f, e, b, a]))
+                } else if name == "llvm.x86.sha256msg1" {
+                    // lane i: W_i += σ0(W_{i+1}); top lane adds σ0(src top).
+                    let s = sha_sigma(self, ys[0], 7, 18, 3);
+                    let l3 = self.add(xs[3], s);
+                    let s = sha_sigma(self, xs[3], 7, 18, 3);
+                    let l2 = self.add(xs[2], s);
+                    let s = sha_sigma(self, xs[2], 7, 18, 3);
+                    let l1 = self.add(xs[1], s);
+                    let s = sha_sigma(self, xs[1], 7, 18, 3);
+                    let l0 = self.add(xs[0], s);
+                    Some(self.build_vec(ret, vec![l0, l1, l2, l3]))
+                } else {
+                    // msg2: σ1 of the running top word; right-to-left, using
+                    // updated values. σ1(x)=ror17^ror19^shr10.
+                    // W16=x0+σ1(src W14), W17=x1+σ1(src W15),
+                    // W18=x2+σ1(W16), W19=x3+σ1(W17).
+                    let s = sha_sigma(self, ys[2], 17, 19, 10);
+                    let l0 = self.add(xs[0], s);
+                    let s = sha_sigma(self, ys[3], 17, 19, 10);
+                    let l1 = self.add(xs[1], s);
+                    let s = sha_sigma(self, l0, 17, 19, 10);
+                    let l2 = self.add(xs[2], s);
+                    let s = sha_sigma(self, l1, 17, 19, 10);
+                    let l3 = self.add(xs[3], s);
+                    Some(self.build_vec(ret, vec![l0, l1, l2, l3]))
+                }
+            }
             "llvm.x86.sse.max.ps"
             | "llvm.x86.sse2.max.pd"
             | "llvm.x86.avx.max.ps.256"
@@ -1107,7 +1346,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | "llvm.x86.avx512.max.ps.512"
             | "llvm.x86.avx512.max.pd.512" => {
                 // maxps returns the second operand unless a > b (NaNs, +-0).
-                let (n, _) = self.elem_of(ret_rty);
+                let (_n, _) = self.elem_of(ret_rty);
                 let (xs, ys) = (self.arg_lanes(&args[0]), self.arg_lanes(&args[1]));
                 let mut out = Vec::new();
                 for (x, y) in xs.into_iter().zip(ys) {
@@ -1123,7 +1362,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | "llvm.x86.avx512.min.ps.512"
             | "llvm.x86.avx512.min.pd.512" => {
                 // minps returns the second operand unless a < b (NaNs, +-0).
-                let (n, _) = self.elem_of(ret_rty);
+                let (_n, _) = self.elem_of(ret_rty);
                 let (xs, ys) = (self.arg_lanes(&args[0]), self.arg_lanes(&args[1]));
                 let mut out = Vec::new();
                 for (x, y) in xs.into_iter().zip(ys) {
@@ -1135,7 +1374,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             "llvm.x86.avx512.mask.cmp.ps.512" | "llvm.x86.avx512.mask.cmp.pd.512" => {
                 // (a, b, imm, k, sae) -> integer bitmask of the predicate, ANDed with k.
                 let imm = self.const_to_opt_u128(a(2), false)? as u8 & 0xf;
-                let (n, _) = self.elem_of(args[0].layout.ty);
+                let (_n, _) = self.elem_of(args[0].layout.ty);
                 let mt = self.val_ty(a(3));
                 let (xs, ys) = (self.arg_lanes(&args[0]), self.arg_lanes(&args[1]));
                 let mut acc = self.const_int(mt, 0);
@@ -1161,7 +1400,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // Predicates 16..31 only differ in signaling, so the low 4 bits suffice.
                 let imm = self.const_to_opt_u128(a(2), false)? as u8 & 0xf;
                 let pred = X86_CMP[imm as usize];
-                let (n, _) = self.elem_of(ret_rty);
+                let (_n, _) = self.elem_of(ret_rty);
                 let et = self.element_type(ret);
                 let it = self.type_ix(if name.contains(".ps") { 32 } else { 64 });
                 let (xs, ys) = (self.arg_lanes(&args[0]), self.arg_lanes(&args[1]));
@@ -1201,5 +1440,48 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
 /// x86 `cmpps` immediate (low 4 bits) to predicate.
 const X86_CMP: [rustc_codegen_ssa::common::RealPredicate; 16] = {
     use rustc_codegen_ssa::common::RealPredicate::*;
-    [RealOEQ, RealOLT, RealOLE, RealUNO, RealUNE, RealUGE, RealUGT, RealORD, RealUEQ, RealULT, RealULE, RealPredicateFalse, RealONE, RealOGE, RealOGT, RealPredicateTrue]
+    [
+        RealOEQ,
+        RealOLT,
+        RealOLE,
+        RealUNO,
+        RealUNE,
+        RealUGE,
+        RealUGT,
+        RealORD,
+        RealUEQ,
+        RealULT,
+        RealULE,
+        RealPredicateFalse,
+        RealONE,
+        RealOGE,
+        RealOGT,
+        RealPredicateTrue,
+    ]
 };
+
+/// ror(x, n) composed from shifts for the SHA-256 intrinsic emulation.
+fn sha_ror(b: &mut Builder<'_, '_>, x: Value, n: u32) -> Value {
+    let lo = b.lshr(x, b.const_u32(n));
+    let hi = b.shl(x, b.const_u32(32 - n));
+    b.or(lo, hi)
+}
+
+/// xor of rotates — the Σ0/Σ1 round-function sums.
+fn sha_ror_sum(b: &mut Builder<'_, '_>, x: Value, ns: &[u32]) -> Value {
+    let mut acc = sha_ror(b, x, ns[0]);
+    for &n in &ns[1..] {
+        let r = sha_ror(b, x, n);
+        acc = b.xor(acc, r);
+    }
+    acc
+}
+
+/// xor of two rotates and a logical shift — the σ0/σ1 message sums.
+fn sha_sigma(b: &mut Builder<'_, '_>, x: Value, r1: u32, r2: u32, s: u32) -> Value {
+    let a = sha_ror(b, x, r1);
+    let c = sha_ror(b, x, r2);
+    let d = b.lshr(x, b.const_u32(s));
+    let ac = b.xor(a, c);
+    b.xor(ac, d)
+}

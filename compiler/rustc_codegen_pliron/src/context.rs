@@ -3,7 +3,6 @@
 
 use std::cell::RefCell;
 
-use cranelift_codegen::isa::CallConv;
 use cranelift_module::Linkage;
 use pliron::basic_block::BasicBlock;
 use pliron::builtin::op_interfaces::SingleBlockRegionInterface;
@@ -19,9 +18,8 @@ use pliron_llvm::ops::{FuncOp, GlobalOp, UndefOp};
 use pliron_llvm::types::FuncType;
 use rustc_abi::{HasDataLayout, TargetDataLayout, VariantIdx};
 use rustc_attr_ir::Linkage as RLinkage;
-use rustc_codegen_ssa::common::AtomicRmwBinOp;
 use rustc_codegen_ssa::traits::*;
-use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
+use rustc_data_structures::fx::FxHashMap;
 use rustc_middle::mir::interpret::ConstAllocation;
 use rustc_middle::mono::Visibility;
 use rustc_middle::ty::layout::{
@@ -36,168 +34,32 @@ use rustc_target::spec::{HasTargetSpec, Target};
 
 use crate::types::{TyK, classify};
 
-#[derive(Clone, Debug)]
-pub enum ConstVal {
-    /// Raw little-endian bits of a scalar of the value's type.
-    Bits(u128),
-    Zero,
-    Undef,
-    Bytes(Vec<u8>),
-    /// Struct / array / vector of other constants.
-    Agg(Vec<Value>),
-    /// Address of a symbol plus a byte offset.
-    Sym {
-        sym: String,
-        off: i64,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ArgExt {
-    #[default]
-    None,
-    Zext,
-    Sext,
-    /// Hidden struct-return pointer (`sret`).
-    SRet,
-    /// Aggregate passed by value on the stack (`byval`), with its size in bytes.
-    ByVal(u32),
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Exts {
-    pub params: Vec<ArgExt>,
-    pub ret: ArgExt,
-}
-
-pub struct FuncInfo {
-    pub op: Ptr<Operation>,
-    pub ty: TypeHandle,
-    pub linkage: Linkage,
-    pub exts: Exts,
-    pub no_inline: bool,
-    pub always_inline: bool,
-    /// `#[cold]`: blocks calling it are laid out out of line.
-    pub cold: bool,
-    /// Declared or inferred unable to unwind (see nounwind.rs).
-    pub nounwind: bool,
-    /// Backend type of the value returned through the sret pointer.
-    pub sret_ty: Option<TypeHandle>,
-    /// Params pointing at memory rustc marks `noalias readonly` (frozen `&T`):
-    /// (param index, dereferenceable bytes), valid when the function has
-    /// `nparams` params.
-    pub frozen: Vec<(usize, u64)>,
-    pub nparams: usize,
-}
-
-pub struct GlobalInfo {
-    pub ty: TypeHandle,
-    pub init: Option<Value>,
-    pub align: u64,
-    pub mutable: bool,
-    pub tls: bool,
-    pub linkage: Linkage,
-    pub used: bool,
-    pub section: Option<String>,
-}
-
-#[derive(Clone)]
-pub struct CallInfo {
-    pub fn_ty: TypeHandle,
-    pub exts: Exts,
-    /// Whether the callee is a foreign (extern) function; only meaningful for
-    /// C-variadic signatures, where foreign callees get real inline C-ABI
-    /// arguments and Rust callees get a packed buffer pointer.
-    pub foreign: bool,
-    /// Explicit calling convention for the call (e.g. `extern "win64"` calls
-    /// on non-Windows hosts). None = the default for the callee kind.
-    pub cc: Option<CallConv>,
-    /// `become f(...)`: emit a `return_call`/`return_call_indirect` (real TCO)
-    /// instead of call+ret. Only honored when the caller's own convention is
-    /// `CallConv::Tail` (Cranelift requires it).
-    pub tail: bool,
-}
-
-#[derive(Default)]
-pub struct State<'tcx> {
-    pub consts: FxHashMap<Value, ConstVal>,
-    pub funcs: FxIndexMap<String, FuncInfo>,
-    pub globals: FxIndexMap<String, GlobalInfo>,
-    pub ident_to_sym: FxHashMap<String, String>,
-    pub sym_to_ident: FxHashMap<String, Identifier>,
-    pub allocas: FxHashMap<Value, (u64, u64)>,
-    /// Allocas lowered as Cranelift variables (see sroa.rs), with their value type.
-    pub promoted: FxHashMap<Value, TypeHandle>,
-    /// Fresh copies SROA makes for a diverging call; never split again.
-    pub escape_copies: rustc_data_structures::fx::FxHashSet<Value>,
-    pub calls: FxHashMap<Ptr<Operation>, CallInfo>,
-    pub intrinsics: FxHashMap<Ptr<Operation>, String>,
-    pub rmw: FxHashMap<Ptr<Operation>, AtomicRmwBinOp>,
-    pub const_allocs: FxHashMap<ConstAllocation<'tcx>, Value>,
-    pub strs: FxHashMap<String, Value>,
-    pub counter: usize,
-    pub cgu: String,
-    pub asm: String,
-    /// EII symbol aliases: (alias, aliasee, weak); emitted as extra object symbols.
-    pub aliases: Vec<(String, String, bool)>,
-    /// call op → (landing block, is catch_unwind catch-all)
-    pub invokes: FxHashMap<Ptr<Operation>, (Ptr<BasicBlock>, bool)>,
-    pub last_call: Option<Ptr<Operation>>,
-    pub llvm_stubs: rustc_data_structures::fx::FxHashSet<String>,
-    /// Volatile loads/stores/mem intrinsics: memory passes must leave them alone.
-    pub volatile: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
-    /// Loads whose (pointer) result rustc marked `!nonnull`.
-    pub nonnull: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
-    /// Entry params of local functions that point at frozen memory, with
-    /// their dereferenceable size (see `FuncInfo::frozen`).
-    pub frozen: FxHashMap<Value, u64>,
-    /// Loads rustc marked `!range [0, 2)` (`bool`s): already 0 or 1.
-    pub bool01: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
-    /// `inbounds` GEPs: null only if their base is.
-    pub inbounds: rustc_data_structures::fx::FxHashSet<Ptr<Operation>>,
-    /// Local fns with no remaining references after inlining; not lowered.
-    pub dead_fns: rustc_data_structures::fx::FxHashSet<String>,
-    /// Lower non-volatile loads/stores as `notrap` (set by finish_module at -O).
-    pub notrap: bool,
-    /// Run `jumpthread` on each lowered Cranelift function (-O, `PLIRON_JUMPTHREAD`).
-    pub jumpthread: bool,
-
-    /// Run `loadfwd` on each lowered Cranelift function (`-O`, `PLIRON_LOADFWD`).
-    pub loadfwd: bool,
-
-    /// Run `clifpeep` on each lowered Cranelift function (`-O`, `PLIRON_PEEP`).
-    pub peep: bool,
-
-    /// Run `tailmerge` on each lowered Cranelift function (`-O`, `PLIRON_TAILMERGE`).
-    pub tailmerge: bool,
-    /// Run `unreach` on each lowered Cranelift function (`-O`, `PLIRON_UNREACH`).
-    pub unreach: bool,
-    /// Run `taildup` on each lowered Cranelift function (`PLIRON_TAILDUP=0` disables).
-    pub taildup: bool,
-    /// cond_br op → expected condition value (`likely`/`unlikely`).
-    pub expect: FxHashMap<Ptr<Operation>, bool>,
-    /// `#[link(wasm_import_module = ..)]` functions: symbol -> (module, name).
-    pub wasm_imports: FxHashMap<String, (String, String)>,
-}
+pub use pliron_ir_opt::state::*;
 
 pub struct CodegenCx<'tcx> {
     pub tcx: TyCtxt<'tcx>,
     pub pctx: RefCell<Context>,
     pub module: Ptr<Operation>,
-    pub st: RefCell<State<'tcx>>,
+    pub st: RefCell<State>,
+    /// `static_addr_of` memoization — rustc-side because the key is an
+    /// interned `ConstAllocation`.
+    pub const_allocs: RefCell<FxHashMap<ConstAllocation<'tcx>, Value>>,
     pub vtables: RefCell<FxHashMap<(Ty<'tcx>, Option<ExistentialTraitRef<'tcx>>), Value>>,
     pub tcache: RefCell<FxHashMap<(Ty<'tcx>, Option<VariantIdx>), TypeHandle>>,
     pub scache: RefCell<FxHashMap<Ty<'tcx>, TypeHandle>>,
+    /// `-g`: the location `set_dbg_loc` made current (0 = none), stamped
+    /// on every op the Builder emits; see `debuginfo.rs`.
+    pub dbg_cur: std::cell::Cell<u32>,
+    pub dbg_insts: RefCell<FxHashMap<Instance<'tcx>, u32>>,
+    pub dbg_files: RefCell<FxHashMap<rustc_span::BytePos, u32>>,
+    pub dbg_types: RefCell<FxHashMap<Ty<'tcx>, u32>>,
+    /// CGU symbol this codegen context is building (set at construction;
+    /// read-only afterwards — tracing uses it without borrowing `st`).
+    pub cgu_name: String,
 }
 
-pub fn mask(bits: u128, w: u32) -> u128 {
-    if w >= 128 {
-        bits
-    } else {
-        bits & ((1u128 << w) - 1)
-    }
-}
-
+// r[impl front.ir.symbols]
+// r[impl native.obj.linkage]
 pub fn map_linkage(l: RLinkage, vis: Visibility) -> Linkage {
     match l {
         RLinkage::Internal => Linkage::Local,
@@ -223,27 +85,38 @@ impl<'tcx> CodegenCx<'tcx> {
             .get_operation();
         CodegenCx {
             tcx,
+            cgu_name: name.to_string(),
             pctx: RefCell::new(ctx),
             module,
-            st: RefCell::new(State::default()),
+            st: RefCell::new(State {
+                eh_personality: rustc_symbol_mangling::eh_personality_symbol(tcx),
+                dbg: crate::debuginfo::cu_info(tcx, name),
+                ..State::default()
+            }),
+            const_allocs: Default::default(),
             vtables: Default::default(),
             tcache: Default::default(),
             scache: Default::default(),
+            dbg_cur: Default::default(),
+            dbg_insts: Default::default(),
+            dbg_files: Default::default(),
+            dbg_types: Default::default(),
         }
     }
 
+    // r[impl front.ir.consts]
     pub fn new_value(&self, ty: TypeHandle, cv: ConstVal) -> Value {
         let v = {
             let mut ctx = self.pctx.borrow_mut();
             let op = UndefOp::new(&mut ctx, ty).get_operation();
-            op.deref(&ctx).get_result(0)
+            op.deref(&ctx).get_result(&ctx, 0)
         };
         self.st.borrow_mut().consts.insert(v, cv);
         v
     }
 
     pub fn cval(&self, v: Value) -> Option<ConstVal> {
-        self.st.borrow().consts.get(&v).cloned()
+        self.st.borrow().consts.get(v).cloned()
     }
 
     pub fn ty_of(&self, v: Value) -> TypeHandle {
@@ -258,6 +131,7 @@ impl<'tcx> CodegenCx<'tcx> {
         IntegerType::get(&mut self.pctx.borrow_mut(), w, Signedness::Signless).into()
     }
 
+    // r[impl front.det.names]
     pub fn ident(&self, sym: &str) -> Identifier {
         let mut st = self.st.borrow_mut();
         if let Some(i) = st.sym_to_ident.get(sym) {
@@ -315,11 +189,17 @@ impl<'tcx> CodegenCx<'tcx> {
                 exts,
                 no_inline: false,
                 always_inline: false,
+                inline_hint: false,
                 cold: false,
                 nounwind: false,
+                odr: false,
                 sret_ty: None,
                 frozen: Vec::new(),
+                noalias: Vec::new(),
+                nonnull: Vec::new(),
+                ret_nonnull: 0,
                 nparams: 0,
+                tail_cc: false,
             },
         );
         op
@@ -395,7 +275,9 @@ impl<'tcx> CodegenCx<'tcx> {
         if let Some(f) = self.st.borrow_mut().funcs.get_mut(sym) {
             f.cold |= cold;
             f.nounwind |= !fn_abi.can_unwind;
-            (f.frozen, f.nparams) = frozen_params(fn_abi);
+            f.tail_cc |= fn_abi.conv == rustc_abi::CanonAbi::RustTail;
+            (f.frozen, f.noalias, f.nonnull, f.nparams) = frozen_params(fn_abi);
+            f.ret_nonnull = ret_nonnull(fn_abi);
         }
         if let rustc_target::callconv::PassMode::Indirect { .. } = fn_abi.ret.mode {
             let t = self.backend_type(fn_abi.ret.layout);
@@ -468,6 +350,7 @@ impl<'tcx> CodegenCx<'tcx> {
         }
         if !self.st.borrow().globals.contains_key(sym) {
             let ty = self.type_i8();
+            let tls = self.tcx.is_thread_local_static(def_id);
             self.declare_global(
                 sym,
                 GlobalInfo {
@@ -475,14 +358,39 @@ impl<'tcx> CodegenCx<'tcx> {
                     init: None,
                     align: 1,
                     mutable: true,
-                    tls: self.tcx.is_thread_local_static(def_id),
+                    tls,
                     linkage: Linkage::Import,
                     used: false,
                     section: None,
                 },
             );
+            if !tls && !self.tcx.is_foreign_item(def_id) && let Some(b) = self.static_bytes(def_id) {
+                self.st.borrow_mut().extern_bytes.insert(sym.to_string(), b);
+            }
         }
         self.sym_addr(sym)
+    }
+
+    /// The bytes of an immutable, `Freeze` static's initializer when they
+    /// are fully initialized, pointer-free and 16..=4096 long (a lookup
+    /// table): rustc evaluates initializers of statics from other CGUs and
+    /// crates too. Writing such a static is UB, so the bytes are fixed.
+    fn static_bytes(&self, def_id: rustc_hir::def_id::DefId) -> Option<std::sync::Arc<[u8]>> {
+        // A `#[linkage]` (weak) definition can be replaced at link time.
+        if self.tcx.static_mutability(def_id) != Some(rustc_ast::Mutability::Not)
+            || self.tcx.codegen_fn_attrs(def_id).linkage.is_some()
+        {
+            return None;
+        }
+        let alloc = self.tcx.eval_static_initializer(def_id).ok()?;
+        let a = alloc.inner();
+        let len = a.len();
+        if a.mutability.is_mut() || !(16..=4096).contains(&len) || !a.provenance().ptrs().is_empty() {
+            return None;
+        }
+        let range = rustc_middle::mir::interpret::alloc_range(rustc_abi::Size::ZERO, a.size());
+        a.init_mask().is_range_initialized(range).ok()?;
+        Some(std::sync::Arc::from(a.inspect_with_uninit_and_ptr_outside_interpreter(0..len)))
     }
 
     pub fn print_ir(&self) -> String {
@@ -499,9 +407,9 @@ impl<'tcx> BackendTypes for CodegenCx<'tcx> {
     type Value = Value;
     type Type = TypeHandle;
     type FunctionSignature = TypeHandle;
-    type DIScope = ();
-    type DILocation = ();
-    type DIVariable = ();
+    type DIScope = u32;
+    type DILocation = u32;
+    type DIVariable = u32;
 }
 
 impl<'tcx> HasTyCtxt<'tcx> for CodegenCx<'tcx> {
@@ -596,7 +504,8 @@ impl<'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'tcx> {
     fn eh_personality(&self) -> Ptr<Operation> {
         let void = self.type_void();
         let ty = self.type_func(&[], void);
-        self.declare_fn_sym("rust_eh_personality", ty, Linkage::Import, Exts::default())
+        let name = self.st.borrow().eh_personality.clone();
+        self.declare_fn_sym(&name, ty, Linkage::Import, Exts::default())
     }
 
     fn sess(&self) -> &Session {
@@ -649,6 +558,7 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
         self.add_aliases(symbol_name, &attrs.foreign_item_symbol_aliases);
     }
 
+    // r[impl front.fn.attrs]
     fn predefine_fn(
         &mut self,
         instance: Instance<'tcx>,
@@ -658,20 +568,38 @@ impl<'tcx> PreDefineCodegenMethods<'tcx> for CodegenCx<'tcx> {
     ) {
         let fn_abi = self.fn_abi_of_instance(instance, ty::List::empty());
         let (ty, exts) = self.fn_sig(fn_abi);
+        // Promoted for other CGUs' local copies (`xcgu::promoted`). A
+        // CGU's own `extra` copy of a promoted item stays `Internal`:
+        // only the home definition may go hidden-external, or two objects
+        // define the same symbol.
+        let (linkage, visibility) = if matches!(linkage, RLinkage::Internal)
+            && crate::xcgu::promoted(self.tcx).contains(symbol_name)
+            && !self.st.borrow().xcgu_extra.contains(symbol_name)
+        {
+            (RLinkage::External, Visibility::Hidden)
+        } else {
+            (linkage, visibility)
+        };
         self.declare_fn_sym(symbol_name, ty, map_linkage(linkage, visibility), exts);
         use rustc_attr_ir::InlineAttr;
         let inline = self.tcx.codegen_instance_attrs(instance.def).inline.clone();
         if let Some(f) = self.st.borrow_mut().funcs.get_mut(symbol_name) {
             f.no_inline = matches!(inline, InlineAttr::Never);
             f.always_inline = matches!(inline, InlineAttr::Always | InlineAttr::Force { .. });
+            f.inline_hint = matches!(inline, InlineAttr::Hint);
+            f.odr = matches!(linkage, RLinkage::WeakODR | RLinkage::LinkOnceODR);
         }
         self.mark_attrs(symbol_name, instance, fn_abi);
         let attrs = self.tcx.codegen_instance_attrs(instance.def);
+        if let Some(a) = attrs.alignment {
+            self.st.borrow_mut().fn_align.insert(symbol_name.to_string(), a.bytes());
+        }
         self.add_aliases(symbol_name, &attrs.foreign_item_symbol_aliases);
     }
 }
 
 impl<'tcx> CodegenCx<'tcx> {
+    // r[impl native.obj.alias]
     fn add_aliases(
         &self,
         aliasee: &str,
@@ -692,13 +620,13 @@ impl<'tcx> StaticCodegenMethods for CodegenCx<'tcx> {
     fn static_addr_of(&self, alloc: ConstAllocation<'_>, _kind: Option<&str>) -> Value {
         // SAFETY of lifetime: allocations are interned for 'tcx.
         let alloc: ConstAllocation<'tcx> = unsafe { std::mem::transmute(alloc) };
-        if let Some(v) = self.st.borrow().const_allocs.get(&alloc) {
+        if let Some(v) = self.const_allocs.borrow().get(&alloc) {
             return *v;
         }
         let init = self.const_alloc_to_value(alloc.inner());
         let a = alloc.inner();
         let v = self.private_global(init, a.align.bytes(), a.mutability.is_mut());
-        self.st.borrow_mut().const_allocs.insert(alloc, v);
+        self.const_allocs.borrow_mut().insert(alloc, v);
         v
     }
 
@@ -710,6 +638,15 @@ impl<'tcx> StaticCodegenMethods for CodegenCx<'tcx> {
         let ty = self.ty_of(init);
         let instance = Instance::mono(self.tcx, def_id);
         let sym = self.tcx.symbol_name(instance).name;
+        // A nested static (the allocation behind `static S: &[T] = &[..]`)
+        // is a synthetic def with no type of its own; cg_llvm skips it too.
+        let nested = matches!(
+            self.tcx.def_kind(def_id),
+            rustc_hir::def::DefKind::Static { nested: true, .. }
+        );
+        if self.st.borrow().dbg.is_some() && !nested && !self.tcx.is_thread_local_static(def_id) {
+            self.dbg_static(def_id, instance, sym);
+        }
         let mut st = self.st.borrow_mut();
         let g = st.globals.get_mut(sym).expect("static was not predefined");
         g.ty = ty;
@@ -732,7 +669,8 @@ impl<'tcx> AsmCodegenMethods<'tcx> for CodegenCx<'tcx> {
     }
 
     fn mangled_name(&self, instance: Instance<'tcx>) -> String {
-        self.tcx.symbol_name(instance).name.to_string()
+        // Naked functions' labels: raw asm names, like `asm_const` syms.
+        self.asm_sym(self.tcx.symbol_name(instance).name)
     }
 }
 
@@ -756,15 +694,43 @@ pub fn layout_ty_key<'tcx>(l: TyAndLayout<'tcx>) -> (Ty<'tcx>, Option<VariantIdx
     (l.ty, v)
 }
 
+/// Return leaves rustc marks `nonnull` (see `FuncInfo::ret_nonnull`).
+fn ret_nonnull(fn_abi: &FnAbi<'_, Ty<'_>>) -> u64 {
+    use rustc_target::callconv::{ArgAttribute as A, PassMode};
+    let nn = |a: &rustc_target::callconv::ArgAttributes| a.regular.contains(A::NonNull);
+    match &fn_abi.ret.mode {
+        PassMode::Direct(a) => u64::from(nn(a)),
+        PassMode::Pair(a, b) => u64::from(nn(a)) | u64::from(nn(b)) << 1,
+        _ => 0,
+    }
+}
+
 /// Frozen pointer params of `fn_abi` by backend param index (the layout of
 /// `fn_decl_backend_type`), and the backend param count.
-fn frozen_params(fn_abi: &FnAbi<'_, Ty<'_>>) -> (Vec<(usize, u64)>, usize) {
+// r[impl front.abi.facts]
+fn frozen_params(
+    fn_abi: &FnAbi<'_, Ty<'_>>,
+) -> (
+    Vec<(usize, u64)>,
+    Vec<(usize, u64, bool)>,
+    Vec<usize>,
+    usize,
+) {
     use rustc_target::callconv::{ArgAttribute as A, ArgAttributes, PassMode};
+    // `pointee_size` is also set for nullable refs (`Option<&T>`), which
+    // LLVM lowers to `dereferenceable_or_null`: only `NonNull` makes the
+    // bytes unconditionally loadable. Frozen loads become `can_move`, and
+    // `deref` licenses licm's speculative hoists — both would move a load
+    // above its null check (regex-automata `find_fwd_imp` read `*pre` with
+    // `pre == None`).
     let size = |a: &ArgAttributes| {
         let n = a.pointee_size.bytes();
-        (a.regular.contains(A::NoAlias | A::ReadOnly) && n > 0).then_some(n)
+        (a.regular.contains(A::NoAlias | A::ReadOnly | A::NonNull) && n > 0).then_some(n)
     };
+    let nn = |a: Option<&ArgAttributes>| a.is_some_and(|a| a.regular.contains(A::NonNull));
     let mut v = Vec::new();
+    let mut na = Vec::new();
+    let mut null = Vec::new();
     let mut i = usize::from(matches!(fn_abi.ret.mode, PassMode::Indirect { .. }));
     let nargs = if fn_abi.c_variadic {
         fn_abi.fixed_count as usize
@@ -776,41 +742,34 @@ fn frozen_params(fn_abi: &FnAbi<'_, Ty<'_>>) -> (Vec<(usize, u64)>, usize) {
             PassMode::Ignore => continue,
             PassMode::Direct(a) => (Some(a), 1),
             PassMode::Pair(a, _) => (Some(a), 2),
-            PassMode::Indirect {
-                meta_attrs: Some(_),
-                ..
-            } => (None, 2),
+            PassMode::IndirectUnsized { .. } => (None, 2),
             PassMode::Cast { pad_i32_count, .. } => (None, *pad_i32_count as usize + 1),
-            PassMode::Indirect {
-                attrs,
-                meta_attrs: None,
-                ..
-            } => (Some(attrs), 1),
+            PassMode::Indirect { attrs, .. } => (Some(attrs), 1),
         };
         if let Some(s) = a.and_then(size) {
             v.push((i, s));
         }
+        if let Some(a) = a.filter(|a| a.regular.contains(A::NoAlias)) {
+            // 0 bytes = no dereferenceability claim (nullable: see `size`);
+            // the `noalias` itself still holds when non-null.
+            let n = if a.regular.contains(A::NonNull) { a.pointee_size.bytes() } else { 0 };
+            na.push((i, n, !a.regular.contains(A::ReadOnly)));
+        }
+        // `nonnull` leaf attrs: direct/pair element attrs and the
+        // indirect/meta pointers. Cast args are packed; skip them.
+        let ats: [Option<&ArgAttributes>; 2] = match &arg.mode {
+            PassMode::Direct(a) => [Some(a), None],
+            PassMode::Pair(a, b) => [Some(a), Some(b)],
+            PassMode::Indirect { attrs, .. } => [Some(attrs), None],
+            PassMode::IndirectUnsized { attrs, meta_attrs } => [Some(attrs), Some(meta_attrs)],
+            _ => [None, None],
+        };
+        for (k, at) in ats.into_iter().enumerate() {
+            if nn(at) {
+                null.push(i + k);
+            }
+        }
         i += n;
     }
-    (v, i)
-}
-
-/// Entry-block params of bodies in this module that point at frozen memory.
-pub fn frozen_values(ctx: &Context, st: &State<'_>) -> Vec<(Value, u64)> {
-    let mut out = Vec::new();
-    for f in st.funcs.values() {
-        if f.frozen.is_empty() {
-            continue;
-        }
-        let Some(e) = Operation::get_op::<FuncOp>(f.op, ctx).and_then(|o| o.get_entry_block(ctx))
-        else {
-            continue;
-        };
-        let args: Vec<Value> = e.deref(ctx).arguments().collect();
-        if args.len() != f.nparams {
-            continue;
-        }
-        out.extend(f.frozen.iter().map(|&(i, s)| (args[i], s)));
-    }
-    out
+    (v, na, null, i)
 }

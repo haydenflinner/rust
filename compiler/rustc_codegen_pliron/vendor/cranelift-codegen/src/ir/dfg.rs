@@ -18,6 +18,7 @@ use core::mem;
 use core::ops::{Index, IndexMut};
 
 use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 #[cfg(feature = "enable-serde")]
 use serde_derive::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -31,6 +32,7 @@ pub struct Insts(PrimaryMap<Inst, InstructionData>);
 impl Index<Inst> for Insts {
     type Output = InstructionData;
 
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     fn index(&self, inst: Inst) -> &InstructionData {
         self.0.index(inst)
     }
@@ -38,6 +40,7 @@ impl Index<Inst> for Insts {
 
 /// Allow mutable access to instructions via indexing.
 impl IndexMut<Inst> for Insts {
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     fn index_mut(&mut self, inst: Inst) -> &mut InstructionData {
         self.0.index_mut(inst)
     }
@@ -85,12 +88,14 @@ impl Blocks {
 impl Index<Block> for Blocks {
     type Output = BlockData;
 
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     fn index(&self, block: Block) -> &BlockData {
         &self.0[block]
     }
 }
 
 impl IndexMut<Block> for Blocks {
+    #[inline] // PLIRON: hot cross-crate call in dev builds
     fn index_mut(&mut self, block: Block) -> &mut BlockData {
         &mut self.0[block]
     }
@@ -141,6 +146,17 @@ pub struct DataFlowGraph {
     /// Primary value table with entries for all values.
     values: PrimaryMap<Value, ValueDataPacked>,
 
+    /// PLIRON: bumped whenever a new value alias is written
+    /// (`change_to_alias`/`replace_with_aliases`), letting consumers skip
+    /// whole-table alias scans on mutations that created none.
+    alias_epoch: u32,
+
+    /// PLIRON: `dest` of every real alias write (the same events that
+    /// bump `alias_epoch`), in write order with duplicates. Consumers
+    /// that need "which values became aliases" walk this instead of the
+    /// whole `values` table — O(alias writes) rather than O(values).
+    alias_dirty: Vec<Value>,
+
     /// Function signature table. These signatures are referenced by indirect call instructions as
     /// well as the external function references.
     pub signatures: PrimaryMap<SigRef, Signature>,
@@ -181,6 +197,8 @@ impl DataFlowGraph {
             dynamic_types: DynamicTypes::new(),
             value_lists: ValueListPool::new(),
             values: PrimaryMap::new(),
+            alias_epoch: 0,
+            alias_dirty: Vec::new(),
             signatures: PrimaryMap::new(),
             ext_funcs: PrimaryMap::new(),
             values_labels: None,
@@ -202,6 +220,7 @@ impl DataFlowGraph {
         self.dynamic_types.clear();
         self.value_lists.clear();
         self.values.clear();
+        self.alias_dirty.clear();
         self.signatures.clear();
         self.ext_funcs.clear();
         self.values_labels = None;
@@ -248,8 +267,25 @@ impl DataFlowGraph {
     }
 
     /// Get the total number of values.
+#[inline]
     pub fn num_values(&self) -> usize {
         self.values.len()
+    }
+
+    /// PLIRON: epoch bumped by every `change_to_alias`/
+    /// `replace_with_aliases` call — see the field comment. Equal epochs
+    /// mean no new aliases exist since the caller last scanned.
+#[inline]
+    pub fn alias_epoch(&self) -> u32 {
+        self.alias_epoch
+    }
+
+    /// PLIRON: `dest` of every real alias write since creation/clear, in
+    /// write order (values can repeat when re-aliased). The write list
+    /// for `alias_epoch` — see the field comment.
+    #[inline]
+    pub fn alias_writes(&self) -> &[Value] {
+        &self.alias_dirty
     }
 
     /// Get an iterator over all values and their definitions.
@@ -277,6 +313,7 @@ impl DataFlowGraph {
 ///
 /// Find the original SSA value that `value` aliases, or None if an
 /// alias cycle is detected.
+#[inline] // PLIRON: hot cross-crate call in dev builds
 fn maybe_resolve_aliases(
     values: &PrimaryMap<Value, ValueDataPacked>,
     value: Value,
@@ -298,6 +335,7 @@ fn maybe_resolve_aliases(
 /// Resolve value aliases.
 ///
 /// Find the original SSA value that `value` aliases.
+#[inline] // PLIRON: hot cross-crate call in dev builds
 fn resolve_aliases(values: &PrimaryMap<Value, ValueDataPacked>, value: Value) -> Value {
     if let Some(v) = maybe_resolve_aliases(values, value) {
         v
@@ -329,6 +367,7 @@ fn valid_valuedata(data: ValueDataPacked) -> bool {
 impl<'a> Iterator for Values<'a> {
     type Item = Value;
 
+#[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.inner
             .by_ref()
@@ -389,6 +428,7 @@ impl DataFlowGraph {
     }
 
     /// Get the type of a value.
+#[inline]
     pub fn value_type(&self, v: Value) -> Type {
         self.values[v].ty()
     }
@@ -397,6 +437,7 @@ impl DataFlowGraph {
     ///
     /// This is either the instruction that defined it or the Block that has the value as an
     /// parameter.
+#[inline]
     pub fn value_def(&self, v: Value) -> ValueDef {
         match ValueData::from(self.values[v]) {
             ValueData::Inst { inst, num, .. } => ValueDef::Result(inst, num as usize),
@@ -410,12 +451,60 @@ impl DataFlowGraph {
         }
     }
 
+    /// PLIRON: `resolve_aliases` that yields `None` instead of panicking
+    /// on chains ending at a reserved/invalid target or on a cycle.
+    /// Passes iterating every value (`carry_aliases`) meet tombstone
+    /// chains from deleted defs — an unrecoverable panic is the wrong
+    /// answer there.
+#[inline]
+    pub fn try_resolve_aliases(&self, v: Value) -> Option<Value> {
+        if v == Value::reserved_value() || !self.values.is_valid(v) {
+            return None;
+        }
+        let mut v = v;
+        for _ in 0..=self.values.len() {
+            match ValueData::from(self.values[v]) {
+                ValueData::Alias { original, .. } => {
+                    if original == Value::reserved_value()
+                        || !self.values.is_valid(original)
+                    {
+                        return None;
+                    }
+                    v = original;
+                }
+                _ => return Some(v),
+            }
+        }
+        None
+    }
+
+    /// PLIRON: `value_def` without the alias chase or indexing hazards.
+    /// `value_def` resolves an alias's chain unconditionally and
+    /// `resolve_aliases` indexes `values` unchecked — a chain ending at
+    /// a reserved/tombstoned target panics (stage2 `std` build via
+    /// `carry_pmap`'s stale pairs). Reserved, out-of-range, and aliased
+    /// values yield `None`; callers that only need the def *kind* skip
+    /// the resolve entirely.
+#[inline]
+    pub fn try_value_def(&self, v: Value) -> Option<ValueDef> {
+        if v == Value::reserved_value() || !self.values.is_valid(v) {
+            return None;
+        }
+        match ValueData::from(self.values[v]) {
+            ValueData::Inst { inst, num, .. } => Some(ValueDef::Result(inst, num as usize)),
+            ValueData::Param { block, num, .. } => Some(ValueDef::Param(block, num as usize)),
+            ValueData::Union { x, y, .. } => Some(ValueDef::Union(x, y)),
+            ValueData::Alias { .. } => None,
+        }
+    }
+
     /// Determine if `v` is an attached instruction result / block parameter.
     ///
     /// An attached value can't be attached to something else without first being detached.
     ///
     /// Value aliases are not considered to be attached to anything. Use `resolve_aliases()` to
     /// determine if the original aliased value is attached.
+#[inline]
     pub fn value_is_attached(&self, v: Value) -> bool {
         use self::ValueData::*;
         match ValueData::from(self.values[v]) {
@@ -429,8 +518,82 @@ impl DataFlowGraph {
     /// Resolve value aliases.
     ///
     /// Find the original SSA value that `value` aliases.
+#[inline]
     pub fn resolve_aliases(&self, value: Value) -> Value {
         resolve_aliases(&self.values, value)
+    }
+
+    /// PLIRON: walk `v`'s alias chain once, returning the resolved
+    /// value and its decoded data. The common `value_def` +
+    /// `resolve_aliases` pattern hits `values` and decodes twice; this
+    /// does each once per chain hop.
+    fn resolve_to_data(&self, v: Value) -> (Value, ValueData) {
+        let mut v = v;
+        for _ in 0..=self.values.len() {
+            match ValueData::from(self.values[v]) {
+                ValueData::Alias { original, .. } => v = original,
+                data => return (v, data),
+            }
+        }
+        panic!("Value alias loop detected for {v}");
+    }
+
+    /// PLIRON: fused `resolve_aliases` + `value_def`. For unaliased
+    /// `v` (the common case) this is one `values` hit + one decode
+    /// instead of two.
+    ///
+    /// Same panic behavior as `resolve_aliases` + `value_def`.
+    #[inline]
+    pub fn resolved_value_def(&self, v: Value) -> ValueDef {
+        match self.resolve_to_data(v).1 {
+            ValueData::Inst { inst, num, .. } => ValueDef::Result(inst, num as usize),
+            ValueData::Param { block, num, .. } => ValueDef::Param(block, num as usize),
+            ValueData::Union { x, y, .. } => ValueDef::Union(x, y),
+            ValueData::Alias { .. } => unreachable!("resolve_to_data never returns an alias"),
+        }
+    }
+
+    /// PLIRON: `resolved_value_def` with `try_resolve_aliases`'s
+    /// hazards: reserved/invalid values and dead-ended chains yield
+    /// `None`.
+    #[inline]
+    pub fn try_resolved_value_def(&self, v: Value) -> Option<ValueDef> {
+        if v == Value::reserved_value() || !self.values.is_valid(v) {
+            return None;
+        }
+        let mut v = v;
+        for _ in 0..=self.values.len() {
+            match ValueData::from(self.values[v]) {
+                ValueData::Alias { original, .. } => {
+                    if original == Value::reserved_value() || !self.values.is_valid(original) {
+                        return None;
+                    }
+                    v = original;
+                }
+                ValueData::Inst { inst, num, .. } => {
+                    return Some(ValueDef::Result(inst, num as usize));
+                }
+                ValueData::Param { block, num, .. } => {
+                    return Some(ValueDef::Param(block, num as usize));
+                }
+                ValueData::Union { x, y, .. } => return Some(ValueDef::Union(x, y)),
+            }
+        }
+        None
+    }
+
+    /// PLIRON: `resolve_aliases` + `value_def` when the caller needs
+    /// both the resolved value and its def — one chain walk.
+    #[inline]
+    pub fn resolve_and_def(&self, v: Value) -> (Value, ValueDef) {
+        let (v, data) = self.resolve_to_data(v);
+        let def = match data {
+            ValueData::Inst { inst, num, .. } => ValueDef::Result(inst, num as usize),
+            ValueData::Param { block, num, .. } => ValueDef::Param(block, num as usize),
+            ValueData::Union { x, y, .. } => ValueDef::Union(x, y),
+            ValueData::Alias { .. } => unreachable!("resolve_to_data never returns an alias"),
+        };
+        (v, def)
     }
 
     /// Replace all uses of value aliases with their resolved values, and delete
@@ -502,9 +665,34 @@ impl DataFlowGraph {
         // - `signatures` and `ext_funcs` have no values.
 
         if let Some(values_labels) = &mut self.values_labels {
-            // Debug info is best-effort. If any is attached to value aliases,
-            // just discard it.
-            values_labels.retain(|&k, _| !matches!(self.values[k].into(), ValueData::Alias { .. }));
+            // PLIRON: labels on an alias move to the value it stands for
+            // (upstream discards them). A pass that replaces a value with
+            // an alias keeps the variable it holds.
+            let moved: Vec<(Value, ValueLabelAssignments)> = values_labels
+                .iter()
+                .filter(|&(&k, _)| matches!(self.values[k].into(), ValueData::Alias { .. }))
+                .map(|(&k, a)| (k, a.clone()))
+                .collect();
+            for (k, a) in moved {
+                values_labels.remove(&k);
+                let (ValueData::Alias { original, .. }, ValueLabelAssignments::Starts(starts)) =
+                    (self.values[k].into(), a)
+                else {
+                    continue;
+                };
+                if !self.values.is_valid(original)
+                    || matches!(self.values[original].into(), ValueData::Alias { .. })
+                {
+                    continue;
+                }
+                match values_labels
+                    .entry(original)
+                    .or_insert_with(|| ValueLabelAssignments::Starts(Vec::new()))
+                {
+                    ValueLabelAssignments::Starts(to) => to.extend(starts),
+                    ValueLabelAssignments::Alias { .. } => {}
+                }
+            }
 
             // If debug-info says a value should have the same labels as another
             // value, then make sure that target is not a value alias.
@@ -539,23 +727,102 @@ impl DataFlowGraph {
         // Try to create short alias chains by finding the original source value.
         // This also avoids the creation of loops.
         let original = self.resolve_aliases(src);
-        debug_assert_ne!(
-            dest, original,
-            "Aliasing {dest} to {src} would create a loop"
-        );
         let ty = self.value_type(original);
-        debug_assert_eq!(
-            self.value_type(dest),
-            ty,
-            "Aliasing {} to {} would change its type {} to {}",
-            dest,
-            src,
-            self.value_type(dest),
-            ty
-        );
-        debug_assert_ne!(ty, types::INVALID);
+        // PLIRON: upstream debug-asserts the alias is type-correct; in
+        // release a pass that resolves args across stale/malformed chains
+        // would silently write a cross-type alias (uses of `dest` then
+        // read `src`'s differently-typed data). Skipping the alias is
+        // strictly conservative — `dest` keeps its own def — so bail
+        // loudly-but-bounded instead of writing it.
+        if dest == original
+            || self.value_type(dest) != ty
+            || ty == types::INVALID
+            || self.value_is_attached(dest)
+        {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                eprintln!(
+                    "pliron: change_to_alias skipped bad alias {dest}->{src} \
+                     (dest_ty={} src_ty={ty} attached={} loop={})\n{}",
+                    self.value_type(dest),
+                    self.value_is_attached(dest),
+                    dest == original,
+                    std::backtrace::Backtrace::capture(),
+                );
+            }
+            return;
+        }
 
         self.values[dest] = ValueData::Alias { ty, original }.into();
+        self.alias_epoch = self.alias_epoch.wrapping_add(1);
+        self.alias_dirty.push(dest);
+    }
+
+    /// PLIRON: flatten every alias so its `original` is the chain's final
+    /// target. `change_to_alias` resolves its target at creation, but the
+    /// target can itself be turned into an alias later — each such event
+    /// grows chains a hop, and per-inst `resolve_aliases`/`value_def`
+    /// calls in passes then go quadratic (stage2 `unic_langid_impl`
+    /// spent minutes resolving hundreds-deep chains in lcse). Rewriting
+    /// `original` in place keeps every later resolve O(1).
+    pub fn compact_aliases(&mut self) {
+        let mut memo: crate::FxHashMap<Value, Value> = Default::default();
+        // PLIRON: `alias_dirty` holds every value ever written as an
+        // alias — a superset of the live aliases (dead ends stay
+        // Alias-typed and dead entries just fail the match below), so
+        // this walks O(alias writes) instead of O(values). Duplicates
+        // re-enter a 1-hop chain and hit the memo immediately.
+        for i in 0..self.alias_dirty.len() {
+            let v = self.alias_dirty[i];
+            let ValueData::Alias { original, .. } = ValueData::from(self.values[v])
+            else {
+                continue;
+            };
+            if original == Value::reserved_value() {
+                continue;
+            }
+            let mut path = Vec::new();
+            let mut w = v;
+            let target = loop {
+                if let Some(&t) = memo.get(&w) {
+                    break t;
+                }
+                if w == Value::reserved_value() || !self.values.is_valid(w) {
+                    break w;
+                }
+                match ValueData::from(self.values[w]) {
+                    ValueData::Alias { original, .. } => {
+                        path.push(w);
+                        w = original;
+                    }
+                    _ => break w,
+                }
+                // Same guard as `maybe_resolve_aliases`: a cycle (only
+                // reachable via the parser's unchecked alias path)
+                // stops instead of looping.
+                if path.len() > self.values.len() {
+                    break w;
+                }
+            };
+            // A chain dead-ending at a reserved/invalid target keeps its
+            // shape — writing `reserved` into a live alias's `original`
+            // wouldn't change `resolve_aliases` (it panics either way)
+            // and only obscures the chain for inspection.
+            let dead_end =
+                target == Value::reserved_value() || !self.values.is_valid(target);
+            for &x in &path {
+                memo.insert(x, target);
+                if !dead_end
+                    && let ValueData::Alias { ty, .. } = ValueData::from(self.values[x])
+                {
+                    self.values[x] = ValueData::Alias {
+                        ty,
+                        original: target,
+                    }
+                    .into();
+                }
+            }
+        }
     }
 
     /// Replace the results of one instruction with aliases to the results of another.
@@ -596,8 +863,10 @@ impl DataFlowGraph {
             debug_assert_ne!(ty, types::INVALID);
 
             self.values[dest] = ValueData::Alias { ty, original }.into();
+            self.alias_dirty.push(dest);
         }
 
+        self.alias_epoch = self.alias_epoch.wrapping_add(1);
         self.clear_results(dest_inst);
     }
 
@@ -770,6 +1039,7 @@ impl ValueDataPacked {
 }
 
 impl From<ValueData> for ValueDataPacked {
+#[inline]
     fn from(data: ValueData) -> Self {
         match data {
             ValueData::Inst { ty, num, inst } => {
@@ -789,6 +1059,7 @@ impl From<ValueData> for ValueDataPacked {
 }
 
 impl From<ValueDataPacked> for ValueData {
+#[inline]
     fn from(data: ValueDataPacked) -> Self {
         let tag = data.field(ValueDataPacked::TAG_SHIFT, ValueDataPacked::TAG_BITS);
         let ty = data.field(ValueDataPacked::TYPE_SHIFT, ValueDataPacked::TYPE_BITS);
@@ -858,6 +1129,7 @@ impl DataFlowGraph {
     }
 
     /// Construct a read-only visitor context for the values of this instruction.
+#[inline]
     pub fn inst_values<'dfg>(
         &'dfg self,
         inst: Inst,
@@ -912,6 +1184,7 @@ impl DataFlowGraph {
     }
 
     /// Get all value arguments on `inst` as a slice.
+#[inline]
     pub fn inst_args(&self, inst: Inst) -> &[Value] {
         self.insts[inst].arguments(&self.value_lists)
     }
@@ -1084,6 +1357,7 @@ impl DataFlowGraph {
     }
 
     /// Return all the results of an instruction.
+#[inline]
     pub fn inst_results(&self, inst: Inst) -> &[Value] {
         self.results[inst].as_slice(&self.value_lists)
     }
@@ -1247,6 +1521,7 @@ impl DataFlowGraph {
     }
 
     /// Get the parameters on `block`.
+#[inline]
     pub fn block_params(&self, block: Block) -> &[Value] {
         self.blocks[block].params(&self.value_lists)
     }
@@ -1537,6 +1812,8 @@ impl DataFlowGraph {
         };
         let data = ValueData::Alias { ty, original: src };
         self.values[dest] = data.into();
+        self.alias_epoch = self.alias_epoch.wrapping_add(1);
+        self.alias_dirty.push(dest);
     }
 
     /// If `v` is already defined as an alias, return its destination value.

@@ -63,7 +63,7 @@
 use crate::dominator_tree::DominatorTree;
 use crate::entity::SecondaryMap;
 use crate::inst_predicates::visit_block_succs;
-use crate::ir::{Block, Function, Inst, Opcode};
+use crate::ir::{Block, BlockArg, Function, Inst, Opcode};
 use crate::{FxHashMap, FxHashSet};
 use crate::{machinst::*, trace};
 
@@ -88,6 +88,15 @@ pub struct BlockLoweringOrder {
     /// which is used by VCode emission to sink the blocks at the last
     /// moment (when we actually emit bytes into the MachBuffer).
     cold_blocks: FxHashSet<BlockIndex>,
+    /// PLIRON: (block, successor index) pairs the CLIF marked unlikely
+    /// (`Layout::unlikely_arm`), for emission-time placement.
+    unlikely_succs: FxHashSet<(BlockIndex, usize)>,
+    /// PLIRON: targets of true dominance back-edges (loop headers, and
+    /// the critical-edge blocks materialized for such edges). Edges
+    /// that merely point backward in emission order — e.g. merge
+    /// blocks pulled early by hot-path chaining — are excluded so
+    /// their padding doesn't execute on the fallthrough path.
+    back_edge_targets: FxHashSet<BlockIndex>,
     /// Lowered blocks that are indirect branch targets.
     indirect_branch_targets: FxHashSet<BlockIndex>,
 }
@@ -155,6 +164,9 @@ impl BlockLoweringOrder {
         // Step 1: compute the in-edge and out-edge count of every block.
         let mut block_in_count = SecondaryMap::with_default(0);
         let mut block_out_count = SecondaryMap::with_default(0);
+        // PLIRON: predecessor lists for the chained-order loop heuristic.
+        let mut block_preds: SecondaryMap<Block, SmallVec<[Block; 4]>> =
+            SecondaryMap::with_default(SmallVec::new());
 
         // Block successors are stored as `LoweredBlocks` to simplify the construction of
         // `lowered_succs` in the final result. Initially, all entries are `Orig` values, and are
@@ -169,6 +181,7 @@ impl BlockLoweringOrder {
             visit_block_succs(f, block, |_, succ, from_table| {
                 block_out_count[block] += 1;
                 block_in_count[succ] += 1;
+                block_preds[succ].push(block);
                 block_succs.push(LoweredBlock::Orig { block: succ });
 
                 if from_table {
@@ -199,9 +212,211 @@ impl BlockLoweringOrder {
         // Step 2: walk the postorder from the domtree in reverse to produce our desired node
         // lowering order, identifying critical edges to split along the way.
 
+        // PLIRON: walk a chained order instead of plain RPO. The
+        // domtree's `.rev()` DFS heuristic posts a brif's *second*
+        // successor first, which lands its subtree at the far end of
+        // the emitted order — in rustc-style dispatch code
+        // (`brif unusual, common`) that's the hot edge, so every
+        // iteration pays an unconditional branch. Instead, start
+        // chains at RPO positions and greedily extend each block with
+        // its preferred fallthrough successor: a non-cold forward edge
+        // whose idom dominates-or-equals this block (preserving the
+        // dominator-before-block property lowering relies on),
+        // preferring merge points — dispatch preds converge on the hot
+        // continuation. `PLIRON_BCHAIN=0` disables.
+        static BCHAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let bchain = *BCHAIN
+            .get_or_init(|| std::env::var("PLIRON_BCHAIN").map_or(true, |v| v != "0"));
+
+        static BCHAIN_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let bchain_debug =
+            *BCHAIN_DEBUG.get_or_init(|| std::env::var_os("PLIRON_BCHAIN_DEBUG").is_some());
+
+        let mut orig_order: Vec<Block> = Vec::new();
+        if bchain {
+            let rpo: Vec<Block> = domtree.cfg_rpo().copied().collect();
+            // PLIRON: a block whose own terminator reaches a dominator is
+            // a loop latch — preferring it as the fallthrough puts the
+            // loop's hot spine on the not-taken side of the brif, so an
+            // iteration pays only the latch's own back-edge branch.
+            let mut is_latch = SecondaryMap::with_default(false);
+            for &block in &rpo {
+                let range = block_succ_range[block].clone();
+                is_latch[block] = block_succs[range]
+                    .iter()
+                    .any(|lb| domtree.block_dominates(lb.orig_block().unwrap(), block));
+            }
+            // PLIRON (`PLIRON_LOOPFT=0` disables): a succ that can
+            // reach a back-edge latch keeps the function's loop work
+            // on the straight-line fetch path — a leaf/return arm
+            // gets out-of-lined instead. On recursive hot loops the
+            // alternative is a taken front-end redirect per
+            // non-leaf call (~1.4x on fib where the leaf arm is the
+            // *less* dynamic-work arm but won the in-count tie).
+            let loopft = std::env::var("PLIRON_LOOPFT").as_deref() != Ok("0");
+            let mut reaches_latch = SecondaryMap::with_default(false);
+            if loopft {
+                let mut stack: Vec<Block> = Vec::new();
+                for &block in &rpo {
+                    if is_latch[block] {
+                        reaches_latch[block] = true;
+                        stack.push(block);
+                    }
+                }
+                while let Some(b) = stack.pop() {
+                    for &p in &block_preds[b] {
+                        if !reaches_latch[p] {
+                            reaches_latch[p] = true;
+                            stack.push(p);
+                        }
+                    }
+                }
+            }
+            let mut best_succ = SecondaryMap::with_default(
+                crate::packed_option::PackedOption::<Block>::default(),
+            );
+            // PLIRON (`PLIRON_CHAINJOIN=0` disables): when two of a
+            // brif's successors form a diamond — the join's other
+            // predecessor is the sibling arm — prefer the arm over the
+            // join despite its lower in-count. Emitting `block, arm,
+            // join` makes *both* edges fallthrough (the arm's closing
+            // jump included); emitting `block, join, ..., arm` forces
+            // two taken branches on every trip through the arm —
+            // `iter().filter`'s keep-block landed out-of-line, costing
+            // a `ja`+`jmp` per kept element in `iterw`.
+            // Read per function so tests can toggle it within one
+            // process.
+            let chainjoin = std::env::var("PLIRON_CHAINJOIN").as_deref() != Ok("0");
+            for &block in &rpo {
+                let range = block_succ_range[block].clone();
+                let mut pick: Option<Block> = None;
+                let mut pick_in = 0;
+                let mut pick_rank = 0;
+                let mut pick_latch = false;
+                let mut pick_reach = false;
+                let mut pick_njoin = false;
+                for lb in &block_succs[range] {
+                    let succ = lb.orig_block().unwrap();
+                    if f.is_effectively_cold(succ) || domtree.block_dominates(succ, block) {
+                        continue;
+                    }
+                    let idom = match domtree.idom(succ) {
+                        Some(d) if domtree.block_dominates(d, block) => d,
+                        _ => continue,
+                    };
+                    // Succ preference, highest first:
+                    // - a succ that dominates a predecessor of `block` is
+                    //   on a cycle back to it — the loop body past a head's
+                    //   exit check. `brif done, exit-merge, continue`
+                    //   should fall through to the body, not the exit.
+                    // - a domtree child — a continuation only reachable
+                    //   through this block, including merges fully inside
+                    //   its region (dispatch preds converge on the hot
+                    //   continuation).
+                    // - a shared merge whose region extends outside
+                    //   `block`'s subtree — adjacent only as a last resort;
+                    //   pulling it in scatters the region.
+                    // In-count breaks ties within a class, and a latch
+                    // beats a non-latch of the same count.
+                    // PLIRON_CHAINJOIN: `succ` is a diamond join when a
+                    // sibling successor `p` of `block` also jumps to it
+                    // — but only when that sibling is itself a viable
+                    // chain target (non-cold, not a back edge, idom
+                    // reachable); with a cold arm the join is the real
+                    // continuation and stays preferred.
+                    let djoin = chainjoin
+                        && block_preds[succ].iter().any(|&p| {
+                            p != block
+                                && block_succs[block_succ_range[block].clone()]
+                                    .iter()
+                                    .any(|lb| lb.orig_block() == Some(p))
+                                && !f.is_effectively_cold(p)
+                                && !domtree.block_dominates(p, block)
+                                && domtree
+                                    .idom(p)
+                                    .is_some_and(|d| domtree.block_dominates(d, block))
+                        });
+                    // The rank-2 loop-spine bonus ("dominates a
+                    // predecessor of `block`") applies to a diamond join
+                    // too — every trip around the loop flows through
+                    // it — but placing the arm between `block` and the
+                    // join keeps the spine contiguous anyway, so the
+                    // join must not outrank the arm on it.
+                    let rank = if djoin {
+                        // Cap, don't promote: an outside-region merge
+                        // stays rank 0.
+                        1.min(
+                            if block_preds[block]
+                                .iter()
+                                .any(|&p| domtree.block_dominates(succ, p))
+                            {
+                                2
+                            } else if idom == block {
+                                1
+                            } else {
+                                0
+                            },
+                        )
+                    } else if block_preds[block]
+                        .iter()
+                        .any(|&p| domtree.block_dominates(succ, p))
+                    {
+                        2
+                    } else if idom == block {
+                        1
+                    } else {
+                        0
+                    };
+                    let latch = is_latch[succ];
+                    let reach = reaches_latch[succ];
+                    let njoin = !djoin;
+                    if pick.is_none()
+                        || rank > pick_rank
+                        || (rank == pick_rank
+                            && ((latch && !pick_latch)
+                                || (latch == pick_latch
+                                    && ((reach && !pick_reach)
+                                        || (reach == pick_reach
+                                            && ((njoin && !pick_njoin)
+                                                || (njoin == pick_njoin
+                                                    && block_in_count[succ] >= pick_in)))))))
+                    {
+                        pick = Some(succ);
+                        pick_in = block_in_count[succ];
+                        pick_rank = rank;
+                        pick_latch = latch;
+                        pick_reach = reach;
+                        pick_njoin = njoin;
+                    }
+                }
+                if let Some(s) = pick {
+                    best_succ[block] = s.into();
+                    if bchain_debug {
+                        eprintln!(
+                            "bchain {} {block}: pick {s} rank={pick_rank} latch={pick_latch} in={pick_in}",
+                            f.name
+                        );
+                    }
+                }
+            }
+            let mut emitted = FxHashSet::default();
+            for &block in &rpo {
+                let mut cur = block;
+                while emitted.insert(cur) {
+                    orig_order.push(cur);
+                    cur = match best_succ[cur].expand() {
+                        Some(next) => next,
+                        None => break,
+                    };
+                }
+            }
+        } else {
+            orig_order.extend(domtree.cfg_rpo().copied());
+        }
+
         let mut lowered_order = Vec::new();
         let mut blockindex_by_block = SecondaryMap::with_default(BlockIndex::invalid());
-        for &block in domtree.cfg_rpo() {
+        for &block in &orig_order {
             let idx = BlockIndex::new(lowered_order.len());
             lowered_order.push(LoweredBlock::Orig { block });
             blockindex_by_block[block] = idx;
@@ -216,16 +431,48 @@ impl BlockLoweringOrder {
                 // elimination.
                 let succs = ctrl_plane.shuffled(block_succs[range].iter_mut().enumerate());
 
+                // PLIRON: `br_table` entries that pass the same block call
+                // (same target, same args) share one split-edge block
+                // instead of one identical `mov*; b` block each. The
+                // duplicates' table entries point at the shared block; its
+                // jump takes the first entry's args (equal by construction).
+                // `Lower::lower_branch_blockparam_args` keeps the vcode CFG
+                // free of the repeated successor. `PLIRON_EDGEDEDUP` (default on).
+                let dedup_dests = if edge_dedup_enabled() {
+                    f.layout.last_inst(block).and_then(|inst| {
+                        let data = &f.dfg.insts[inst];
+                        (data.opcode() == Opcode::BrTable).then(|| {
+                            data.branch_destination(&f.dfg.jump_tables, &f.dfg.exception_tables)
+                        })
+                    })
+                } else {
+                    None
+                };
+                let mut seen_calls: FxHashMap<(Block, SmallVec<[BlockArg; 4]>), LoweredBlock> =
+                    FxHashMap::default();
+
                 for (succ_ix, lb) in succs {
                     let succ = lb.orig_block().unwrap();
                     if block_in_count[succ] > 1 {
                         // Mutate the successor to be a critical edge, as `block` has multiple
                         // edges leaving it, and `succ` has multiple edges entering it.
-                        *lb = LoweredBlock::CriticalEdge {
+                        let edge = LoweredBlock::CriticalEdge {
                             pred: block,
                             succ,
                             succ_idx: succ_ix as u32,
                         };
+                        if let Some(dests) = dedup_dests {
+                            let call = &dests[succ_ix];
+                            let pool = &f.dfg.value_lists;
+                            debug_assert_eq!(call.block(pool), succ);
+                            let key = (succ, call.args(pool).collect());
+                            if let Some(&shared) = seen_calls.get(&key) {
+                                *lb = shared;
+                                continue;
+                            }
+                            seen_calls.insert(key, edge);
+                        }
+                        *lb = edge;
                         lowered_order.push(*lb);
                     }
                 }
@@ -244,7 +491,9 @@ impl BlockLoweringOrder {
         // first.
         let mut lowered_succ_indices = Vec::new();
         let mut cold_blocks = FxHashSet::default();
+        let mut unlikely_succs = FxHashSet::default();
         let mut indirect_branch_targets = FxHashSet::default();
+        let mut back_edge_targets = FxHashSet::default();
         let lowered_succ_ranges =
             Vec::from_iter(lowered_order.iter().enumerate().map(|(ix, lb)| {
                 let bindex = BlockIndex::new(ix);
@@ -254,11 +503,24 @@ impl BlockLoweringOrder {
                     // determining the block order already.
                     &LoweredBlock::Orig { block } => {
                         let range = block_succ_range[block].clone();
-                        lowered_succ_indices
-                            .extend(block_succs[range].iter().map(|lb| lb_to_bindex[lb]));
+                        lowered_succ_indices.extend(block_succs[range].iter().map(|lb| {
+                            // PLIRON: tag dominance back-edge targets —
+                            // the succ's CLIF block dominates this pred.
+                            let s = match lb {
+                                LoweredBlock::Orig { block: s } => *s,
+                                LoweredBlock::CriticalEdge { succ, .. } => *succ,
+                            };
+                            if domtree.block_dominates(s, block) {
+                                back_edge_targets.insert(lb_to_bindex[lb]);
+                            }
+                            lb_to_bindex[lb]
+                        }));
 
                         if f.is_effectively_cold(block) {
                             cold_blocks.insert(bindex);
+                        }
+                        if let Some(arm) = f.layout.unlikely_arm(block) {
+                            unlikely_succs.insert((bindex, arm as usize));
                         }
 
                         if indirect_branch_target_clif_blocks.contains(&block) {
@@ -275,9 +537,12 @@ impl BlockLoweringOrder {
 
                     // Critical edges won't have successor information in block_succ_range, but
                     // they only have a single known successor to record anyway.
-                    &LoweredBlock::CriticalEdge { succ, .. } => {
+                    &LoweredBlock::CriticalEdge { pred, succ, .. } => {
                         let succ_index = lb_to_bindex[&LoweredBlock::Orig { block: succ }];
                         lowered_succ_indices.push(succ_index);
+                        if domtree.block_dominates(succ, pred) {
+                            back_edge_targets.insert(succ_index);
+                        }
 
                         // Edges inherit indirect branch and cold block metadata from their
                         // successor.
@@ -303,6 +568,8 @@ impl BlockLoweringOrder {
             lowered_succ_ranges,
             blockindex_by_block,
             cold_blocks,
+            unlikely_succs,
+            back_edge_targets,
             indirect_branch_targets,
         };
 
@@ -333,6 +600,18 @@ impl BlockLoweringOrder {
     /// Determine whether the given lowered-block index is cold.
     pub fn is_cold(&self, block: BlockIndex) -> bool {
         self.cold_blocks.contains(&block)
+    }
+
+    /// PLIRON: is successor `idx` of `block` hinted unlikely?
+    pub fn is_unlikely_succ(&self, block: BlockIndex, idx: usize) -> bool {
+        self.unlikely_succs.contains(&(block, idx))
+    }
+
+    /// PLIRON: whether the given lowered-block index is the target of
+    /// a dominance back-edge (a loop header, or the critical-edge
+    /// block materialized for such an edge).
+    pub fn is_back_edge_target(&self, block: BlockIndex) -> bool {
+        self.back_edge_targets.contains(&block)
     }
 
     /// Determine whether the given lowered block index is an indirect branch
@@ -483,4 +762,11 @@ mod test {
         assert!(order.lowered_order[8].in_edge().is_none());
         assert!(order.lowered_order[8].out_edge().is_none());
     }
+}
+
+/// PLIRON: `PLIRON_EDGEDEDUP` (default on; `=0` off) shares one split-edge
+/// block among the `br_table` entries that pass the same block call.
+pub(crate) fn edge_dedup_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_EDGEDEDUP").as_deref() != Ok("0"))
 }

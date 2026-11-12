@@ -1,0 +1,1167 @@
+# x86-64 codegen notes (wt/x64-codegen)
+
+Running log of work + learnings. Bench: `/tmp/cpubench/{main,wide}.rs`,
+`rustc +nightly-2026-10-06 -O --target x86_64-apple-darwin -Ctarget-cpu=x86-64-v3
+--edition 2021 [-Zcodegen-backend=...dylib]`, run via `arch -x86_64` (Rosetta).
+
+## Session 1: target-cpu → Cranelift ISA flags
+
+- Cargo.toml: cranelift `host-arch` → `all-arch` (required to emit x86_64).
+- **`-Ctarget-cpu` was a no-op for x86**: `cpu_features()` in src/lib.rs only
+  knew Apple cpus → `internal_target_features` got no sse4.1/avx2 →
+  `has_sse41` etc. never enabled → every SSE4.1 lowering rule fell back to
+  SSE2 sequences (`umax.i32x4` = pxor-bias + pcmpgtd + pand/pandn/por +
+  constant reload *inside the loop*; `imul.i32x4` = pmuludq dance).
+  Added an x86 cpu table: x86-64-v2/v3/v4 + mainstream Intel/AMD names.
+  `internal_target_features` expands implied features, so entry points
+  suffice (avx2 pulls the whole sse chain).
+- **Rosetta finding: VEX-128 xmm encodings are ~2x slower than legacy SSE**
+  in streaming loops (verified with a faithful micro-repro: 104ms vs 54ms).
+  Integer VEX (BMI1/2: mulx/shlx) is fine. ymm VEX is fast too (stock LLVM
+  uses it) — but vendored Cranelift x64 has *no >128-bit vector register
+  class* (`type_register_class` returns None over 128 bits), so has_avx*
+  only bought VEX-128 encodings. `build_isa` now maps only
+  sse3/ssse3/sse4.1/sse4.2/popcnt/bmi1/bmi2/lzcnt/cmpxchg16b for x86_64;
+  `PLIRON_X64_VEX=1` re-enables the VEX families for real-hardware runs.
+- Result (Rosetta, v3 flags): everything in wide.rs/main.rs at parity or
+  faster than stock LLVM -O:
+  max_u 0.193 vs 0.233, min_i 0.195 vs 0.237, dot_i32 0.095 vs 0.132,
+  sum_u8 0.388 vs 0.702, dot_i8 0.320 vs 0.447, axpy 0.384 vs 0.581,
+  clamp8 0.092 vs 0.144, plus prior wins held (find_off 14x, has_val 4.4x,
+  dot_u8 3.1x, even_sum 2.7x, cnt_vowel 2.3x, rev_copy32 1.7x).
+  Residual gaps: sum2d ~5% slow (ordered fadd reduction — extractlane fold
+  per group + serial scalar acc; LLVM splits vector accs and folds with
+  shuffle+add tree), fillzero/xor_fold parity, matmul ~parity (LLVM sees
+  n=256 constant; black_box blocks it for us).
+- 256-bit vectors: not feasible without writing ymm register-class +
+  lowering support in vendored Cranelift (upstream never did it; only
+  aarch64 has real vector-legalization for >128). loopvec stays 128-bit;
+  UNROLL=4 gives 512 bits/iter anyway.
+
+### Mach-O x64 fixes (backend already ran on aarch64; these unblock x86_64-apple-darwin)
+
+- `va_tramp_asm`/`va_tramp_ind_asm` (src/lower.rs) emitted ELF-only stubs:
+  `.section .text.<sym>,"ax",@progbits` + `.type`/`.size`/`.hidden`. On
+  Mach-O rsasm parsed `.text.__pliron_va8.snprintf` as a segment name →
+  >16 chars → "a Mach-O segment name is at most 16 characters" panic in
+  objmerge. Now both take a `macho` flag (from `isa().triple().binary_format`)
+  and emit `__TEXT,__text` + `.private_extern` for Mach-O, ELF path
+  unchanged. Verified: `snprintf = 42|2.500000|A|-7` through the `%al=8`
+  trampoline under Rosetta.
+- `llvm_intrinsic_stub` MachO branch (src/asm.rs) dropped the
+  `.intel_syntax noprefix`/`.att_syntax` wrappers the ELF branch adds, so
+  every Intel-syntax x86 stub body (xgetbv/pclmulqdq/vzeroupper/ud2/…)
+  mis-assembled ("no form of `movq` accepts a memory operand"). Now emits
+  `{syntax}{body}{back}` on both paths. Verified: `pclmulqdq ok` under
+  Rosetta.
+
+x64 smoke status (Rosetta): std/unwind/unroll/licm/asm all compile+run;
+std & unroll outputs identical to expectations (stock x64 can't link
+tests/asm — the test's global_asm is ELF-styled, no Mach-O underscore).
+
+### Scalar partial unrolling (src/punroll.rs, `PLIRON_PUNROLL`, default on)
+
+- sum2d was the last wide.rs regression: LLVM doesn't vectorize the
+  ordered fadd reduction but scalar-unrolls the inner loop 8x. Existing
+  `unroll.rs` only handles constant-trip full unrolls.
+- `punroll::run` (after loop rotation, before lowering) detects a
+  latch-tested linear counted loop (`a cc bound`, single-entry chain of
+  jump/brif blocks, body <= 24 insts), then emits a guarded K-copy chain:
+  `hu` checks `bound - a0` covers the group (widened, no wrap), then K
+  clones run; only the last copy re-tests the count and exits, so all
+  intermediate entry tests are implied. Scalar remainder keeps the
+  original loop (tail iterations + re-entry on non-multiple trips).
+- SSA: the exit block's dominance cone may use loop values directly
+  (e.g. `return acc`). If so the whole cone is cloned (<= 16 blocks /
+  128 insts, no try_call/br_table) and the unrolled exit targets the
+  clone; cone-internal edges retarget via a block map. Verified with
+  `PLIRON_VERIFY=1`; earlier verifier error "uses value v76 from
+  non-dominating inst63" was this exact pattern.
+- Result (Rosetta, v3): sum2d 0.79 vs stock 0.75 — parity; the serial
+  addss dependency chain is the bound, unrolling only removes the
+  per-iteration loop overhead. asm confirms 8 consecutive addss in the
+  fast path (K=8 for bodies <= 16 insts).
+- Host `./test.sh` passes; x86 target std/unwind/asm/unroll/licm all
+  run correctly under Rosetta.
+
+### 128-bit lowering audit (post ISA-flag work, x86-64-v3 dumps)
+
+All three flagged kernels already emit 4 independent `i32x4`-lane
+accumulator chains per iteration (loopvec UNROLL=4) — the "two
+independent 128-bit accumulator chains" stretch goal is effectively
+already there.
+
+- min/max (`max_u`, `min_i`): in-loop `umax.i32x4`/`smin.i32x4` →
+  single `pmaxud`/`pminsd` per group (SSE4.1 now mapped). Epilogue is
+  `extractlane`×4 + 3 scalar ops per accumulator instead of LLVM's
+  psrldq+pminud shuffle tree — but it runs once per call (~30 uops vs
+  ~2.5M in the loop), so it cannot explain any measurable gap. A
+  shuffle-tree epilogue would be a loopvec.rs change; it IS expressible
+  in CLIF today without ISLE work (`shuffle` uimm128 masks already lower
+  to `pshufd`/`palignr` via the rules at lower.isle:4632+), but it's not
+  worth the churn — ~30 uops once per call.
+- `dot_i32` (indexing `a[i]*b[i]` form): `imul.i32x4` + `iadd.i32x4` →
+  `pmulld`+`paddd` — optimal for i32 lanes (pmaddwd only applies to
+  i16). Note: the `.iter().zip(b)` formulation does NOT vectorize
+  (bounds-check shape hides the induction) — only the indexing form.
+- `sum_u8`: **fixed** — see `psadbw` section below.
+
+### `psadbw` byte-sum fold (vendored assembler + new CLIF op)
+
+- `sum_u8` (`a[i] as u64` widening sum) emitted a 3-level `uwiden` tree
+  per u8x16 (6 unpacks + 2 iadd_pairwise + 2 iadd ≈ 10 vec ops) where
+  LLVM emits `psadbw x, zero` + `paddq`. The widen tree's per-byte lane
+  mapping doesn't align with psadbw's group sums, so no ISLE-only fold
+  was possible — the epilogue sums all lanes anyway, so any lane
+  grouping of the accumulator is legal.
+- Vendored `cranelift-assembler-x64` and `cranelift-assembler-x64-meta`
+  (0.135.5, path deps via `[patch.crates-io]`; meta is the assembler's
+  build-dep table crate — the actual encoding addition is one
+  `inst("psadbw", ...)`/`inst("vpsadbw", ...)` pair in
+  `instructions/avg.rs`). `cranelift-codegen-meta`'s assembler.isle
+  generator then emits `x64_psadbw_a_or_avx` for free.
+- New CLIF op `x86_psadbw` (i8x16,i8x16 → i64x2, real |a−b| group-sum
+  semantics) in codegen-meta `shared/instructions.rs`; `x64_psadbw`
+  decl in `isa/x64/inst.isle`; `lower.isle` rules lower it and fold a
+  `splat(iconst 0)` operand to `xmm_zero`.
+- loopvec: `widen_vec_into` emits `iadd(acc, x86_psadbw(chunk, splat0))`
+  for the unsigned u8→u64 unmasked-sum case, gated on a new `x64` flag
+  threaded from `run` (aarch64 keeps the pairwise-widen tree — uaddlp
+  folds already). Diff is ~12 lines plus signatures.
+- Result (Rosetta, x86-64-v3): sum_u8 **0.135 ms vs stock 0.693 ms**
+  (was 0.39 pre-fold; now ~5x stock). Disasm: one `psadbw xmm,zero` +
+  `paddq` per 16-byte group, zero reg hoisted. Correctness checked
+  n∈{0,1,7,…,4093,4096,1M} vs scalar reference; host ./test.sh and x86
+  std/unwind/asm/unroll/licm all green under Rosetta.
+
+### `scatter::hist` side-exit transfer study (checked histogram, Rosetta)
+
+Investigated the remaining checked-histogram gap: the unrolled loop's
+mid-chain `brif` side exits (index + bounds panics) transfer live values
+(`i`, `a[i]`, `alen`) to shared cold panic blocks via edge args. RA2
+splits each value's bundle at the hot/cold boundary — the cold segment
+has fixed-reg requirements from the panic call — producing per-element
+boundary movs incl. `movq %rdi,%r9` save/restore pairs around each
+bounds check.
+
+Four transfer mechanisms measured (same-address `vec![3;1<<20]` /
+varied input, ms/iter, Rosetta):
+
+| mechanism | same-addr | varied |
+|---|---|---|
+| stock LLVM | ~0.44 | ~0.34 |
+| shared cone + edge params (committed) | ~0.47 | ~0.47 |
+| per-copy cold trampolines binding params | ~0.47 | ~0.47 |
+| stack-slot hand-off (store hot, load cold) | ~0.70 | ~0.44 |
+| per-copy cone clones reading globals | ~1.02 | ~0.41 |
+
+Findings:
+
+- The boundary movs are **structurally unavoidable** with a shared cold
+  target: any value live into a cold block whose use needs a fixed reg
+  gets its bundle split in hot code — via edge args, explicit cold
+  trampolines, or continue-edge rebinding (all equivalent).
+- Eliminating the movs entirely requires LLVM's shape — each check's
+  cold code reads globals directly — i.e. per-copy cone clones. That
+  produced the *cleanest* hot asm (~10 insts/element vs ~12) yet ran
+  ~2.2x **slower** on same-address input. Likely a Rosetta translation
+  artifact of multiplied cold branch targets, not instruction count.
+- Stack slots avoid the register split but the hot-path stores lose
+  more on the store-bound loop than they save.
+- Conclusion: the committed shared-param shape is locally optimal; the
+  residual ~7% same-address gap vs LLVM is the boundary-mov cost, and
+  the larger varied gap is worth more future effort (cold-cone
+  rematerialization — reload `a[i]` inside the cone from already-live
+  `aptr`+`i` — is the most promising remaining transfer reduction).
+- Debug tooling added (uncommitted, env-gated):
+  `PLIRON_PREVCODE=<pat>` dumps pre-regalloc VCode and
+  `PLIRON_RA2_EDITS=1` dumps regalloc-inserted moves in
+  vendor/cranelift-codegen/src/machinst/compile.rs.
+
+### regex-syntax unconditional-branch audit + `edgefwd` pass (src/edgefwd.rs)
+
+Task: explain ~9.7k `b` vs stock ~2.2k in regex-syntax aarch64 output.
+
+Taxonomy of the 9,819 unconditional `b` (aarch64, `llvm-objdump -d`):
+
+| category | pliron | stock |
+|---|---|---|
+| backward loop branches | 1,568 | 571 |
+| diamond-merge jumps | 3,752 | 588 |
+| after-cond forward jumps | 227 | 260 |
+| jump-to-next-block (missed fallthrough) | 2 | 16 |
+| other forward jumps | 4,270 | ~812 |
+
+Blocks: ~22,751 vs ~10,418 stock; small (≤3-inst) `b`-terminated
+trampolines ~3,929 vs ~704. So the gap is **block-count driven**, not
+layout: missed fallthrough (2) and jump-to-jump chains (~0) are noise.
+
+Root causes found:
+
+1. MIR `bbN: { _x = const k; goto -> T }` blocks lower verbatim to
+   `iconst; jump T(iconst, ...)` forwarders — the dominant residual after
+   earlier passes (all remaining small tramps in `visit_post` were this
+   or `call; jump`).
+2. `try_call` normal/exception edges to forwarder and trap blocks — the
+   earlier `jumpthread::bypass_forwarders` whitelists jump/brif/br_table
+   preds, so `try_call` edges never got retargeted.
+3. `call; jump T` forwarders can't be edge-forwarded (the call result
+   lives in the block) — residual.
+4. `fusechains` only merges single-pred targets; most tramp targets are
+   multi-pred → doesn't reach this shape.
+5. `bl; b shared_udf` machine-level pairs are mostly `try_call`
+   normal-edge artifacts (~162 crate-wide), not ordinary jumps — the
+   trap-tail inline only nets ~3 `b`.
+
+What landed: `src/edgefwd.rs` (new, `PLIRON_EDGEFWD`, default on,
+`PLIRON_BISECT=edgefwd`-able), run in lower.rs after fusechains, before
+`define_function`. Three pieces:
+
+- `bypass_round` — bypass_forwarders generalized to ALL predecessor
+  terminators incl. `try_call`/`try_call_indirect`; non-Value edge args
+  (TryCallRet/TryCallExn pseudo-values) forward verbatim on the same
+  edge. Criteria otherwise identical (empty or pure locally-consumed
+  body, `jump` tail, non-escaping params, args must dominate pred edge).
+- `remat_round` — `iconst; jump T(iconst,...)` forwarders whose args
+  don't dominate the preds: substitute a provably-equal value already
+  valid on the edge (same-typed `iconst` among other targs / pargs /
+  pred-block iconsts), else clone the ≤4-inst pure body into the pred
+  before its terminator and retarget.
+- `inline_trap_tails` — `jump trap_only_blk` → `trap` in place (minor).
+
+Results (regex-syntax rlib, aarch64 disasm): `b` 9,819 → 9,147 (-6.8%),
+total insts 105,033 → 105,540 (+0.5% — the cloned constants are
+materializations LLVM emits per-edge anyway). Per-function: `visit_post`
+(hir) 502→432, `Translator::visit_post` (ast) 630→587, `alternation`
+376→356, `extract` 170→147, `translate` 214→201; a few funcs moved the
+other way on block-order reshuffles (`Display::fmt` 193→221,
+`concat` 248→259). Remaining small tramps in visit_post are all
+`call; jump` (can't forward past a call). Still ~4x stock's `b` count —
+the residual is dominated by diamond-merge/other forward jumps from the
+~2x CLIF block count vs LLVM's CFG.
+
+Correctness: `PLIRON_VERIFY=1` clean on the whole regex-syntax crate;
+test.sh all green (nostd/std/unwind/asm/licm/unroll/proc-macro/wasm);
+Rosetta x86_64-apple-darwin std+unwind pass; scatter kernel output
+correct (hist 0.660 ms/iter vs stock 0.797). x64 regex-syntax compile
+was initially blocked by a pre-existing `splat.i32x2` x64 lowering gap —
+identical with `PLIRON_EDGEFWD=0`, unrelated; fixed by the sub-128 splat
+rules documented below.
+
+### x64 sub-128 vector splat lowering (`vendor/.../x64/lower.isle`)
+
+x64 whole-crate builds failed in `Hir::alternation` with
+`Compilation(Unsupported("should be implemented in ISLE: inst = v21083 =
+splat.i32x2 v4529"))` — identical with `PLIRON_EDGEFWD=0`. Origin: pliron's
+own SLP pass (`src/slp.rs`, `Pack::Splat`) packs two adjacent i32 stores of
+one scalar into `splat.i32x2` + an 8-byte vector store (regex-syntax's
+`extend_trusted`/`map_fold` `(u32,u32)` pair fill). x64 only had splat
+rules for the six 128-bit vector types.
+
+Fix: five wildcard rules at priority -1 keyed on
+`(is_xmm_type (multi_lane <bits> _))` + the scalar source's `value_type`,
+covering i8x{2,4,8}, i16x{2,4}, i32x2, f16x2, f32x2. Sub-128 vectors live
+in xmm registers and consumers read only the low lanes, so broadcasting
+across all 128 bits is correct — the rules reuse the same sequences as
+the 128-bit splats (movd/bitcast + punpcklbw/pshuflw/pshufd/shufps). The
+`is_xmm_type` guard keeps the wildcard lane-count from matching a >128-bit
+type if Cranelift ever legalizes one. Priority -1 puts them below the
+concrete 128-bit rules so nothing existing is shadowed.
+
+Validation:
+- minimal repro: `fn fill2(x:u32, out:&mut [u32;2]) { for i in 0..2 {
+  out[i]=x; } }` — SLP emits `splat.i32x2` + `store.i32x2`; disasm
+  `movd %edi,%xmm3; pshufd $0,%xmm3,%xmm5; movsd %xmm5,(%rsi)`; plus
+  i8x8/i16x4/f32x2 variants (punpcklbw+pshuflw+pshufd / pshuflw+pshufd /
+  shufps), all runtime-verified under Rosetta (`splat ok`).
+- Full x86_64-apple-darwin regex-syntax rlib now compiles end-to-end
+  (previously hard-failed); `PLIRON_VERIFY=1` clean.
+- x64 disasm `jmp` count: pliron 10,534 vs stock 2,491 — same ~4x
+  block-count-driven gap as aarch64 (9,147 vs 2,247).
+- test.sh green; Rosetta std+unwind pass.
+
+Rejected experiment (edgefwd): privatising `try_call` normal edges to
+shared trap-only blocks — per-site `try_call f, ret=private_trap, [pad]`
+with the private trap placed after the call — aimed at `callq; ud2`
+fallthrough instead of `callq; jmp shared_ud2` (~1.3k sites crate-wide).
+`Function::is_effectively_cold` marks every trap-terminated block cold,
+so the private traps always sink to the cold section and the jmp stays:
++1,193 `ud2` for only -187 `jmp`. Reverted; kept as a code comment.
+
+### try_call → trap continuation inline materialization (vendored emit)
+
+`callq; jmp shared_ud2` after try_call (~850 direct + ~74 via edge-block
+forwarders crate-wide in regex-syntax x64) could not be fixed at CLIF
+level: `Function::is_effectively_cold` marks every trap-terminated block
+cold so shared traps always sink and the jump never becomes fallthrough.
+The CLIF-level private-trap variant was tried and rejected (prior entry).
+
+Fix is in the vendored backend, at emit time:
+
+- `TryCallInfo` gains `continuation_trap: Option<TrapCode>`
+  (machinst/abi.rs).
+- `try_call_info` (machinst/isle.rs) fills it when the exception-table
+  `normal_return()` BlockCall targets a block whose only inst is a
+  `trap` and whose edge carries no args. Detection is on the CLIF block,
+  so critical-edge forwarders to the same trap are bypassed too.
+- x64 emit (inst/emit.rs, `CallKnown` + `CallUnknown`): when set, emit
+  `ud2` in place of the `jmp continuation` — `callq; ud2`, matching
+  LLVM's `call f; unreachable` shape. Trap record is registered via the
+  assembler's `add_trap`; exception-handler edges (add_try_call_site)
+  are unchanged.
+- aarch64 emit gets the same treatment (`bl; udf` via `Inst::Udf`).
+
+Results (regex-syntax rlib):
+
+- x64: `callq;jmp` 2,701 → 1,067; total `jmp` 10,189 → 9,069 (−11%);
+  `callq;ud2` 1,144 → 2,774; `__text` 171,764 → 170,852 B (−912 B).
+- aarch64: `b` 9,161 → 8,287 (−9.5% vs the edgefwd-era build).
+- Stock x64 reference: 534 `callq;jmp` (incl. 141 → ud2) + 71 inline
+  `callq;ud2` — the residual pliron gap is try_call site COUNT (2.7k
+  invoke sites vs ~600 LLVM) and non-trap continuations, i.e. the same
+  block-count inflation, not this pattern.
+
+Correctness: unwind semantics unaffected — the ud2 only executes on a
+normal return into `unreachable`; landing pads come from
+`add_try_call_site` at the call offset, untouched. cargo build clean;
+test.sh green (incl. aarch64 unwind); PLIRON_VERIFY=1 clean on whole
+x64 regex-syntax; Rosetta x86_64-apple-darwin std+unwind pass.
+
+sum2d residual check (x64, Rosetta): pliron 0.788–0.795 ms vs stock
+0.766–0.777 — ~2%, inside earlier-run noise; the ledger's "-5%"
+residual is stale. Accepted as parity.
+
+### Dual-128 loopvec probe + hist re-audit (x64-v3, Rosetta)
+
+Dual-128 turns out to be already implemented: loopvec's vector body
+unrolls by `UNROLL` (`src/loopvec.rs:2419`), currently **4×128-bit
+groups per iteration** — quad-128, not dual. Probe of `unroll=8` on
+x64 (reverted): no kernel improved, several regressed — even_sum
+−21% (0.607→0.733), dot_i8 −10%, dot_u8/sum_sq −5%; the extra
+accumulator regs + epilogue cost lose to port pressure. **4×128 is
+the saturation point; keep UNROLL=4.** A per-arch tunable is
+possible (`apply` already takes `x64`) but measurement says don't
+bother.
+
+Wide-kernel results, `-Ctarget-cpu=x86-64-v3` under Rosetta
+(pliron / stock ms/iter): axpy 0.364/0.593, vadd_u32 0.525/0.653,
+clamp_u8 0.090/0.142, dot_i32 0.088/0.130, sum_u8 0.128/0.694
+(psadbw), dot_i8 0.300/0.430, matmul_256 4.832/12.062, has_val
+0.382/1.491, max_u 0.194/0.353, min_i 0.191/0.227, sum_sq
+0.882/1.057, dot_u8 0.461/1.445, scaled 0.727/0.941, rev_copy32
+0.362/0.636, cnt_vowel 0.666/1.562, even_sum 0.607/1.844, xor_fold
+0.365/0.422, find_off 0.084/1.198, fillzero parity, sum2d
+0.780/0.750 (-4%, ordered fadd — accepted). **Every vectorizable
+kernel beats LLVM's ymm codegen** — dual-128-in-spirit is already
+winning; a real ymm regclass is not on the critical path.
+
+scatter/hist re-audit on shared HEAD (coldedges + coldargs + edgefwd
++ foldf + vmax all merged): gather 0.455 vs stock 0.495 — now a
+**win** (+8%). hist 0.619 vs 0.444 — 1.5x -> 1.39x residual, not
+closed. Per-element in the 4x-unrolled hot loop: movzbq + cmpq + jae
++ addl RMW (4 core insts, same as stock's movzbl/cmpq/jbe/incl) plus
+**~3 cold-edge ABI-pinning copies**: `movq %r11,%rdi` (iv -> panic
+arg reg), `movq %rdi,%r9` / `movq %r9,%rdi` (a[i] save/restore around
+the `jae` to `panic_bounds_check(index=rdi,len=rsi)`). ~8.5 vs ~5.7
+insts/element. The residual lives in coldedge adapter/ABI-pinning
+copies (native agent's coldedges work, 87909ba) — not edgefwd's
+domain. A deeper fix would hoist the per-element `a[i] < len` check:
+a[i] is u8 and cnt.len()=256 makes it statically provable —
+constraint-elimination territory (LLVM doesn't do it either; we'd
+*beat* stock if we did).
+
+Verify: cargo build, test.sh green, Rosetta std+unwind pass at
+0b88590.
+
+### Constraint elimination (src/celim.rs, PLIRON_CELIM)
+
+General dominating-condition compare elimination on final CLIF — a
+superset of jumpthread's `fold_dominated_conds` (PLIRON_DOMCOND),
+run late (after foldf, before sameargs/coldedge) so it sees checks
+materialized by switchmap/bcheck/loopvec/punroll/ifconv and so a
+folded check's dead panic edge never gets a cold adapter.
+
+Beyond domcond it handles: multi-predecessor successors when every
+other pred is dominated by the dest (loop headers — entry via the
+guard edge is the only way into the region); fact operands restated
+through edge-arg -> block-param maps (only for slots every edge
+passes identically — the uniform_slot check keeps loop re-entry
+sound); `brif v` non-icmp facts (`v != 0`); +-1 operand offsets both
+directions (`x<y` => `x+1<=y`, `x-1<y` fact => `x<=y`; wrap cases are
+excluded by the fact holding); `x-1<k`/`x+1>k` range tightening; one
+transitivity hop; signed<->unsigned range transfer (`x s<0` =>
+`x u>= half`).
+
+Measured (PLIRON_STATS, regex-syntax -O): domcond folds 2,360
+icmps; celim adds **+243 in 77 fns** (~10%) — translate/visitor,
+IntervalSet::difference, literal extract, Display fmt, `Pattern::
+is_contained_in`, allocator reserve/spec paths. Also fires in
+cpubench mains + `find_byte_off`. Verification: `func.replace` keeps
+the iconst type; folded `brif` retargeted via fold_const_branches.
+`PLIRON_VERIFY=1` clean on x64 regex-syntax; test.sh green; Rosetta
+std+unwind pass; targeted checks (`a[i]` folded, `a[i+1]` kept under
+`i<len`; `i<len && j<len` elides both) disasm-verified. Soundness
+fixes en route: block-param substitution only on uniform slots, and
+the `(x-y)==0` norm reports sub operands as range raw (was comparing
+`x-y`'s range against `y`'s const — wrong predicate).
+
+Perf: neutral on micros — hist 0.596-0.600 (same as baseline; its
+per-element `a[i]`+`cnt[v]` checks aren't dominated by anything, the
+residual stays cold-edge adapter copies); gather 0.452 vs stock
+0.491; wide kernels unchanged. The win is check removal on real
+code paths (bounds-check-dense Rust), not the hist hot loop.
+
+### CELIM v2 + hist re-audit after native umulhi coldargs (Rosetta)
+
+Synced to a224f39 which carries native's coldargs upgrade
+(`umulhi(arg, 0)` disguised-zero instead of `sadd_overflow` rebinding
+for non-i128 ints). Hist re-audit: the `r11->rdi->r9->rdi` pin-chain
+is GONE — the input pointer stays in `rax` for the whole unrolled
+body; no clifpeep change needed. The hot loop is now structurally
+close to stock (4-way unrolled, per-element `i+k < len` +
+`cnt[v] < cnt.len` checks, `addl $1`), so no clifpeep fix this round.
+
+Remaining hist gap is structural, not register-pinning: stock LLVM
+merges the `a[i]` bounds check into the loop exit (`cmpq %r8,%rsi /
+je`) — rustc's MIR gives the loop a const trip `i < 0x100000` while
+the `a[i]` check tests `i < a.len` (a param), so LLVM's
+loop-predication/check-exit fusion can't be matched by folding; it
+needs a min(n, len) exit rewrite. celim can't fold `i < rsi` from
+`i < 0x100000` facts either (different bases). Documented as the
+next candidate pass ("check-exit fusion").
+
+CELIM v2 (all nowrap-gated, CLIF has no nuw/nsw):
+- general offsets: `x +/- c` decompose to `V(base, off)`; same-base
+  compare pairs decide via net shifts `x fc y+F` vs `x qc y+Q`
+  (delta_implied tables verified for lt/le/gt/ge/eq both domains);
+  domain chosen consistently (signed fact -> signed nowrap checks),
+  equality facts decide any-domain queries.
+- `x + d cc k` facts restate as `x cc k-d` when `x + d` provably
+  can't wrap in the inferred range (second pass after range
+  gathering). Headline case verified: `i + 3 < len` dominating
+  `a[i..i+4]` with `i = uextend(u32)` folds all four checks —
+  `narrow4` fast path is check-free like LLVM's constraint-elim.
+- band/bor icmp-leaf seeding on taken/not-taken edges (punroll
+  trip-bound guards decompose into component bounds).
+- load-width facts: `uload8` => `< 256`, uload16/32, sload*
+  signed mirrors — seeds the `cnt[v]` hist fold when `cnt.len`
+  dominates 256 (dynamic-len hist still keeps the check, as
+  expected: nothing proves `cnt.len >= 256`).
+- guard-band collapse: `band(x < C, C - x > k)` ->
+  `x <= min(C-1, C-k-1)` (or false when the bound is < 0). Fires in
+  the hist 4-way dispatch (`celim-guard 1`), removes the setcc/test
+  pair. 0 hits in regex-syntax.
+- unpeeled retry: plain `v != 0` facts are stated on the add node;
+  peeled queries `x+3 == 0` retry unpeeled so they still match.
+
+Measured (PLIRON_STATS, regex-syntax -O): celim **310 folds in 101
+fns** (v1: 243/77); `celim-guard 0` there, 1 in the hist micro.
+Correctness: adversarial wrap/len tests match stock incl. panic
+indices (`i64::MIN` offsets rejected; unsigned_abs used); narrow4 /
+wide4 probe — usize wrapping_add correctly keeps its checks.
+Verify: cargo build, test.sh green (incl. wasm), Rosetta std+unwind
+pass, PLIRON_VERIFY=1 clean on x64 regex-syntax.
+
+Bench (best-of-10, Rosetta, 4M/1M-element workloads):
+hist 2.02 vs stock 0.89 (2.3x — check-exit fusion above),
+gather 1.16 vs 0.33 (3.5x — see below), scatter 0.87 vs 0.29,
+chars 0.87 vs 0.39, tokenize 1.26 vs 0.38, dot_u32 0.35 vs 0.07
+(stock SIMD), matmul 0.38 vs 0.15, prefix 0.87 vs 0.44;
+pliron wins sum_u8 0.032 vs 0.148 (loopvec) and strlen.
+
+New gap found — multi-pointer loop param shuffle: gather/scatter
+bodies carry ~5 movq/lea copies per iter as the rotation merge
+re-maps advancing pointers/indices through block params (regalloc2
+copies, not coldargs). Stock keeps them straight-line unrolled.
+Same family as the old pin-chain but structural to loop params.
+
+### Anomaly-table reconciliation + ivrefold (src/ivrefold.rs, opt-in)
+
+Reconciled the table above against the earlier "all-wins" suite:
+that suite (wide.rs, `-Ctarget-cpu=x86-64-v3`, 4M elems) benched
+axpy/vadd_u32/clamp_u8/dot_i32/sum_u8/dot_i8/matmul_256/has_val/
+max_u/min_i/sum_sq/dot_u8/scaled/rev_copy32/cnt_vowel/even_sum/
+xor_fold/find_off/fillzero/sum2d. Verdicts:
+
+- `chars`, `tokenize`, `prefix`, `dot_u32`, `cnt_aff`, `strlen`:
+  **new kernels** — not in any earlier table; not regressions vs
+  previously-measured baselines. dot_u32's 0.35/0.07 ratio is
+  stock's ymm SIMD on a 1M-dot; apples-to-apples requires matching
+  loopvec coverage, and on v3-flagged kernels we already win
+  (dot_i32 0.088/0.130).
+- `matmul` (0.38/0.15): **different workload** — 64x64 elementwise
+  constant matrices in the temp harness vs `matmul_256`'s 256x256
+  (4.83/12.06 win). Not comparable; no regression shown.
+- `hist`/`gather`/`scatter`: **real gaps but overstated** — the
+  2.3x/3.5x/3.0x numbers came from a one-off harness that no longer
+  reproduces. Re-measured on a clean reconstruction (1M elems,
+  haswell, Rosetta, best-of-10): hist 0.32/0.23 (1.4x — the known
+  check-exit-fusion gap), gather 0.59/0.37 (1.6x), scatter
+  0.48/0.40 (1.2x). The 3.5x gather residual decomposes into the
+  counter/param rotation copies + 2 bounds-check pairs/iter vs
+  stock's 9-insn tight loop — the earlier harness likely also
+  included cold-edge pin copies now removed.
+
+Copy-chain fix attempt — `ivrefold` (PLIRON_IVREFOLD, default OFF):
+refolds loop-carried affine params (`p' = p + s` on every back
+edge) onto one anchor IV: `p` uses become `bp + r*i` with
+`bp = p0 - r*i0` materialized on the entry edge (ring-exact, no
+nowrap needed), params stripped from all edges. Verified:
+eliminates 3 params in gather/scatter (loop body 17→13 insns,
+all three cursors become `(%base,%idx,4)` amodes, single `addq $1`),
+780 slots in 114 fns on regex-syntax, PLIRON_VERIFY=1 clean.
+
+Measured (x64 Rosetta, isolated best-of-10): gather 0.50→0.59,
+scatter **0.48→0.78 (-60%)**, prefix 0.47→0.36 (+25%), hist
+0.335→0.32; aarch64 native gather flat, scatter 0.43→0.46.
+Root cause of the regression: with the cursors gone, every memory
+op's address keys off the one anchor register — regalloc2 then
+splits the anchor param's live range and parks loaded values in
+the freed register, emitting save/restore copies (`idx[i]` lands
+in the counter's home reg, needs `movq %rdx,%rbx`/`%rbx,%r11`)
+that SERIALIZE what were independent cursor recurrences. OoO
+machines (and Rosetta especially) exploited the parallel chains;
+LLVM's regalloc handles the refolded form better than regalloc2.
+Prefix wins because its real recurrence is the scalar accumulator,
+not the address chains.
+
+**Verdict: transform implemented + verified, kept opt-in**
+(`PLIRON_IVREFOLD=1`); not a default win until regalloc2 stops
+merging loaded values into the anchor's register. The residual
+"copies" in the hot loops are the loop-rotation counter shuffle
+(param↔working reg, 2 movq/iter — present in both forms) plus
+the uextend movq — not redundant cursor carries.
+
+### Shared-HEAD re-measure: bcheck versioning + deadrec + uload32
+
+Re-measured the anomaly kernels on shared HEAD (native's bcheck
+affine versioning merged) with new `deadrec` + late `uload32`
+passes, `/tmp/bigbench.rs` (1M elems, haswell, Rosetta,
+best-of-10, same binary for both):
+
+| kernel | pliron | stock | ratio |
+|--------|--------|-------|-------|
+| gather | 0.511  | 0.510 | **1.00x — parity** |
+| scatter| 0.656  | 0.521 | 1.26x |
+| hist   | 0.462  | 0.320 | 1.44x |
+| prefix | 0.470  | 0.467 | parity |
+| chars  | 0.605  | 0.444 | 1.36x |
+| tokenize | 7.910 | 1.577 | **5.0x** |
+
+**Gather — now at parity.** bcheck's affine versioning splits the
+loop: a checked fallback (~15 insns, keeps both bounds checks +
+rotation copies) and a **9-insn check-free fast loop** — exactly
+stock's instruction count:
+
+```asm
+movl  (%rdi), %edx          ; a[i]
+cmpq  %rcx, %rdx            ; idx < tab.len — data-dependent, stays
+jae   panic
+movl  (%rax,%rdx,4), %edx   ; tab[idx]
+movl  %edx, (%r8)           ; out[i]
+addq  $1, %r9
+addq  $4, %rdi
+addq  $4, %r8
+cmpq  %rsi, %r9
+jb    loop
+```
+
+- The `i < out.len` bound is versioned away (prologue computes a
+  mulxq-based 128-bit trip bound; falls back to the checked loop
+  when it fails). The `i < n` loop-exit test remains — that IS
+  the loop condition, not a removable check. The gather index
+  check `idx < tab.len` is data-dependent and correctly remains.
+- The `uextend.i64 (load.i32)` `movq` is gone: late `uloads32`
+  (PLIRON_ULOAD32, runs after coldedges, right before codegen —
+  earlier passes match `Opcode::Load` so i32 widening must be
+  late) folds to `uload32.i64`; the `movl` zero-extends in one
+  vreg. `deadrec` (PLIRON_DEADREC) drops the leftover `p → iadd
+  p,4 → backedge` cursor recurrence that forward liveness can't
+  see (circular self-use).
+- Residual vs stock: we still use 3 adds (src cursor, dst cursor,
+  index) vs stock's single index + indexed amodes, and stock
+  4x-unrolls with IPSCCP'd constant lens (`cmpq $0xfff`). Even
+  cost under Rosetta, parity measured.
+
+**Scatter — 1.26x residual.** Loop is ~14 insns: `movl (%rax),
+%r10d` (val[i]), `movl (%rdi), %edx` (idx[i]), two cmp/jae pairs
+(`i < val.len` affine — NOT versioned here, and `idx < out.len`
+data-dependent), `movl %r10d, (%r8,%rdx,4)`, 3 cursor adds, exit
+cmp/jb — plus `movq %r11,%rdx`/`movq %rdx,%r11` rotation copies
+on the carried index (deadrec removed one slot but regalloc still
+maps the i-param through a working reg). Stock: ~7-8 insns/iter,
+4x-unrolled, both checks constant-folded via IPSCCP. The affine
+`i < val.len` check not getting the versioning gather got is the
+main remaining gap.
+
+**Tokenize — 5.0x reproduced, shape documented** (native is
+investigating on aarch64; not fixed here). `tokenize =
+s.split_whitespace().map(len).sum()`. Stock inlines the whole
+iterator: per ASCII char ~6-8 insns — byte load, `testb js` UTF-8
+ASCII fast path, and `is_whitespace` as a single **bitmap test**
+(`cmpl $0x20; btq %rax, %r8` with `r8 = 0x100003e00`), unicode
+ranges + WHITESPACE_MAP table only off the cold path. Pliron's
+loop instead has, per char/iteration:
+- a **linear branch chain** for is_whitespace (~10-15 insns:
+  `cmpl $0x20/je`, `cmpl $0x9/jb`, `cmpl $0xd/jbe`, `cmpl $0x84`,
+  shr $8 range checks) — no bitmap fusion;
+- a **jump-table dispatch** (`movslq (%rax,%r11,4); jmpq *%rax`)
+  for the SplitWhitespace state machine each iteration;
+- **stack spill/reload** of ~5 loop-carried iterator values
+  (`front offset`, `done flag`, `word start`, counters parked at
+  `0x8(%rsp)`..`0x30(%rsp)`).
+≈25-35 insns/char vs stock's ~8 → the observed 5x. The UTF-8
+decode itself is already inlined fine; the gap is the state-
+machine dispatch + the non-bitmapped whitespace test + carried-
+state spills.
+
+**revnorm exit-edge fix (correctness, shared HEAD).** The Rosetta
+std test was segfaulting ~50% of runs (HashMap→`kv.sort()`;
+HashMap order randomizes which layout trips it). Bisected to
+`revnorm` on `smallsort::insert_tail`: Phase B rewrote descending-
+iv uses only in `info.body`, so the exit block's use of the iv
+param (the hole pointer = iv's final value, via `v177 -> v84`)
+kept reading the new ascending byte count `j` — `store` at address
+`j` ≈ NULL page → `insertion_sort_shift_left` SIGSEGV at 0x0.
+Fixed by scanning all blocks (param uses are dominance-confined
+anyway) and rewriting via `inst_values`/`map_inst_values`, which
+also covers exception contexts and call args the old
+fixed-args+terminator-only scan missed. After: 0/20 aarch64 +
+0/15 x64-Rosetta failures, std/unwind 5/5 green.
+
+**deadrec verify-fix.** First version scanned
+`dfg.inst_fixed_args`, which returns only
+`num_fixed_value_arguments` — for calls/try_calls ALL args are
+variable-length, so a live `umulhi→iadd→try_call` use of the
+param's alias was invisible and the param got removed anyway
+(dangling `v1421 -> v2887`). Now scans `inst_args` (all non-edge
+args) and skips params/intermediates that are alias targets
+(`alias_targets` set — a `va -> p` alias would strand on removal).
+
+Validation: cargo build clean; test.sh green (nostd/std/unwind/
+asm/unroll/licm/proc-macro/wasm); Rosetta x86_64-apple-darwin
+std+unwind 5/5; PLIRON_VERIFY=1 clean on bigbench + the HashMap
+repro + scat_bench.
+
+### Post-brchain re-measure + x64 `bt` fold (gather/scatter/tokenize)
+
+HEAD `b9bc035` + the `bt` ISLE rules below, `/tmp/bigbench.rs`
+(1M elems, haswell, Rosetta, best-of-5):
+
+| kernel | pliron | stock | ratio |
+|--------|--------|-------|-------|
+| gather | 0.484  | 0.514 | **parity** |
+| scatter| 0.837  | 0.510 | 1.64x (harness noise; ~1.3x isolated) |
+| tokenize | 3.97 | 1.55  | **2.56x** (was 5.0x) |
+
+**Tokenize 5.0x → 2.56x.** `brchain` (src/brchain.rs) replaced
+the per-char `movslq/jmpq *%rax` state-machine dispatch with a
+direct `cmpl/je` chain — the indirect-branch mispredict per
+iteration was the single biggest cost. The remaining 2.56x is
+two pieces, both invasive (documented, not fixed here):
+
+1. **Whitespace check: range-chain vs guarded bitmap.** Stock
+   emits `cmpl $0x20; ja skip; movl %r12d,%eax; btq %rax,%r8`
+   with `r8 = 0x100003e00` hoisted — the `c <= 0x20` guard makes
+   `bt`'s mod-64 index safe; LLVM folds the match-set
+   {9,10,11,12,13,32} into a bitmap at switch level. Our CLIF
+   carries the same test as a *branch* chain (`cmpl $0x20/je`,
+   `cmpl $0x9/jb`, `cmpl $0xd/jbe`, `cmpl $0x84/jbe`, then
+   `shr $8` + WHITESPACE_MAP byte-table for the unicode ranges)
+   — there is no `ushr` in the dataflow for ISLE to see, so
+   closing this needs a range-set→bitmap fold on the branch/
+   switch structure (LLVM's SwitchToLookupTable analogue).
+2. **11 loop-carried params → ~5 spill slots per char.** The
+   block14 state loop carries `(flag, ptr, off0..5, len_sel,
+   accum, sel)` — all verified *live* (SplitWhitespace's
+   front/back offsets, word bounds, char width + the `n` sum;
+   sameargs/deadrec found nothing removable). ~11 carried i64s
+   > usable GPRs → `0x8..0x28(%rsp)` stores+reloads every
+   iteration. Stock SROA/promotion shrinks per-iter state to ~7
+   regs, zero hot-loop stack traffic. This is a carried-state
+   fatness + spill-placement issue, not a pass we can cheaply
+   add — fixing means either MIR-level state reduction or
+   regalloc spill-cost work.
+
+**Gather — parity confirmed on HEAD.** bcheck versions the
+`i < out.len` affine bound; the fast loop is exactly stock's
+9-insn scalar shape (data-dependent `idx < tab.len` preserved).
+The `uextend.i64 (load.i32)` `movq` is gone via late `uloads32`
+— `movl` zero-extends in one vreg.
+
+**Scatter — bcheck skips it by default, deliberately.** Only
+one of scatter's two checks is affine-foldable, and the single-
+partial-check gate requires all stores to have affine addresses;
+`out[idx[i]]` is not, so the `i < val.len` check stays (the gate
+exists to protect histogram/RMW same-address forwarding).
+`PLIRON_BCHECK_PARTIAL=1` overrides: versioned fast loop ~8-9
+insns, isolated scatter **0.450ms vs stock 0.52 — beats stock**.
+Do not flip the default without re-measuring hist/RMW.
+
+**x64 `bt` fold added** (`PLIRON_X64_BITTAB=0` to disable):
+`(bitmap >> x) & 1` with constant bitmap → `x64_bt`, matching
+LLVM's X86 `BT` combine. Complements the existing `x & (1<<b)`
+and `x & single-bit-imm` rules; `bt`'s mod-operand-width index
+matches CLIF's masked `ushr`, so semantics are exact. Verified:
+`movabsq $0x100003e00,%rsi; andq $0x3f,%rdi; btq %rdi,%rsi;
+setb %al` (was `shrq %cl; testq $1; setne`). It does **not**
+fire on tokenize (no `ushr` form there — needs the switch-level
+fold above), but covers hand-rolled bit-table code.
+
+### Scatter gate refined + bittab/edgespec merge (post-everything baseline)
+
+Merged `wt/native-opt@fe62bed` (edgespec sentinel threading +
+bittab set-membership bitmask + wasm winline; the x64 `bt` ISLE
+fold was already merged back). Fresh sweep, `/tmp/bigbench.rs`,
+1M elems, haswell, Rosetta, best-of-3:
+
+| kernel | pliron | stock | ratio |
+|--------|--------|-------|-------|
+| hist   | 0.463  | 0.321 | 1.44x |
+| gather | 0.473  | 0.508 | **0.93 — wins** |
+| scatter| 0.452  | 0.512 | **0.88 — wins (new)** |
+| sum_u8 | 0.044  | 0.238 | **5.4x win** |
+| cnt_aff| 0.802  | 0.781 | ~parity |
+| dot_u32| 0.155  | 0.230 | **1.5x win** |
+| matmul | 0.320  | 0.122 | 2.6x |
+| prefix | 0.470  | 0.466 | parity |
+| chars  | 0.605  | 0.444 | 1.36x |
+| tokenize| 4.015 | 1.550 | 2.59x |
+
+**bcheck partial-versioning gate — relaxed, landed.** The old
+rule required *every* store affine (`dst[i]`). The actual hazard
+it protects is same-address store->load forwarding replay, which
+needs a load that can re-read a stored slot. New rule: a single
+partial check is allowed unless the body has BOTH a non-affine
+store AND a non-affine load (hist's `cnt[idx]` on both sides →
+still blocked; exotic memory ops count as both). Scatter
+(`out[idx[i]] = val[i]`) has a non-affine store but only affine
+loads — write-only w.r.t. data-dependent slots — so it versions
+by default now: **0.452 vs stock 0.512, beats stock** (was
+0.84-0.91). Paired RMW kernel `cnt[idx[i]] += val[i]` confirmed
+still gated (bcheck doesn't fire). Versioning is semantics-
+preserving regardless; the gate is a perf heuristic only.
+**Merge-flag: this is native's `src/bcheck.rs`** — the widening
+is ~40 lines at the single-partial-check site, marked with an
+`(x64 wt note ...)` comment in the source.
+
+**bittab fired on tokenize** (`bittab 1`, `edgespec 16`): the
+whitespace range-chain is now a guarded bitmap — `cmpl $0x40;
+cmovbq bitmap,%rax; shrxq %r10,%rax,%rax; testq; jne` (~5 insns,
+stock is `cmpl $0x20; ja; bt` ~4). The x64 `bt` ISLE rule can't
+fold further: the const is wrapped in a `select(c<64)` guard
+which is semantically required — a bare `bt` would index mod-64
+for c>=64. Time unchanged (~4.0): classification is no longer
+the bottleneck.
+
+**Tokenize residual — spills are NOT the cause (measured).**
+aarch64 native (31 GPRs vs x64's 15, ~1 spill slot in the whole
+hot loop vs x64's ~10 stack ops/char) shows the *same* ~2.5x
+(4.02 vs 1.55) — so register pressure explains at most a small
+x64-specific tail. The residual is structural: ~2.5x dynamic
+insns/char from the flattened SplitWhitespace state machine —
+11 live block14 params mean per-char select/copy merges +
+per-path cursor recompute, where stock carries ~7 regs and
+sinks state updates into the paths that need them. No cheap
+lever found: ra2's `spill_weight_from_constraint` is a fixed
+formula (loop-depth 4^n + def/constraint bonuses) with no knobs;
+tuning vendored ra2 is shared-infra risky and wouldn't fix
+aarch64 anyway; block-param count is set by MIR's iterator
+layout before our pipeline sees it. Documented as the remaining
+structural item (real fix = iterator state sinking at MIR/LLVM-
+dialect level, or a vectorized whitespace-skip fast path).
+
+Validation: cargo build clean; test.sh green incl. merged
+`edgespec` test; Rosetta std 5/5 + unwind 3/3; PLIRON_VERIFY=1
+clean on rmw_gate (scatter+RMW kernels), bigbench, std, unwind.
+rmw_gate checksums match stock.
+
+### hist decomp + bounded-index versioning (landed), matmul-64/chars decomp
+
+On `0e3af1a` (mirror-swap + scatter-gate + winline merged).
+
+**hist — precise decomp.** Inner loops, `c[a[i] as usize] += 1`
+(u8 in, 256-entry counts):
+
+- stock x64: 8x unrolled, **no bounds check** — LLVM versions on
+  the u8 type bound (`idx <= 255 < c.len` proven once outside),
+  then `movzbl (%rdi,%rcx),%r8d; incl (%rdx,%r8,4)` x8 ≈ 2.4
+  insns/elem.
+- pliron x64 (pre-fix): scalar `movzbl; cmpq; jae; addl $1;
+  addq; cmpq; jb` ≈ 7-8 insns/elem — the data-dependent check
+  stayed (bcheck only folded *affine* indices) + no unroll.
+- Same shape on aarch64 (pliron scalar+checked ~1.47x, not
+  beating stock in this build).
+
+**Fix landed — bounded-index checks in bcheck**
+(`PLIRON_BCHECK_UBOUND=0` to disable): when `affine()` fails, try
+`clifpeep::vmax` — a data-dependent index with a proven unsigned
+ceiling (`uload8`/`uload16` loads, `uextend`, `band` masks)
+synthesizes a constant `Aff{m:0, hi:bound}` so the guard is
+`tymax < len` — exactly LLVM's versioning. vmax itself gained
+`uload*` bounds and both-operand `band` recursion (depth-capped);
+it's `pub(crate)` for bcheck. Bound filter `<= 0xFFFF` avoids
+dead clones (u32-range bound never passes a real slice len).
+**Merge-flag: touched native's `src/bcheck.rs` again** (~50
+lines: `ubound`/`ubound_on` + the `None if ubound_on()` arm).
+
+Result: hist 0.463 -> **0.410** x64, 0.458 -> **0.408** aarch64
+(1.44x -> 1.28x). Fast loop = `movzbl; addl $1,(cnt,idx,4);
+addq; cmpq; jb` — 5 insns/elem, check gone.
+
+Caveat — degenerate single-key hist regresses ~1.3-1.6x (the
+same store->load forwarding-replay hazard the partial gate
+protects; a single check doesn't pass through that gate).
+Measured `/tmp/hist_alt.rs`: unversioned ~0.72 uniform vs
+versioned alt4 **0.34** / alt2 **0.46** (beats stock ~0.5-0.7!),
+but same-key 1.9-2.5 vs 0.72 — on BOTH arches (not Rosetta
+noise). Multi-key wins are 2x+; kept ungated, matching LLVM's
+own unconditional versioning. Remaining 1.28x vs stock is the
+8x unroll: bcheck's clone is a *rotated* loop (exit test at
+header top, plain `jump` latch back) and punroll's chain model
+needs a `brif`-to-header latch — "nonlinear chain" bail. Rotated-
+loop unroll support is punroll-invasive; flagged for native.
+
+**matmul-64 — root cause: vectorization, not dispatch.**
+`[[u32;64];64]` triple loop; PLIRON_PUNROLL/JAM/LOOPVEC toggles
+all no-ops (0.32 regardless). Stock LLVM vectorizes the
+k-reduction: a[i] row -> ymm0-7 once per i, b-column vectors
+built per j via `vmovd`/`vpinsrd` lane-gathers at 0x100 stride,
+`vpmulld`/`vpaddd` accumulate (~2.4 insn-equiv/element). Ours is
+scalar `imull; leal` per k (~7 insns). The strided (gather)
+reduction is beyond loopvec — needs either gather support or a
+k<->j interchange to the unit-stride outer-product form
+(`c[i][j..8] += a[i][k]*b[k][j..8]`). Both are feature-level
+work; documented, not fixed.
+
+**chars — ~11 vs ~7 insns/char** (`s.chars().count()`). Stock
+ASCII iter: `movzbl; testb; jns` -> `incq ptr; incq cnt; cmpq;
+je` (7), multi-byte advance folded into `sbbq $-0x1`. Ours adds:
+`testq %rdi,%rdi` null test (MIR Option-niche check not folded),
+`leaq 0x1(%rdi),%rsi; movq %rsi,%rdi` cursor copy (SSA param,
+not coalesced), and a rotated-loop jmp-to-top. No `bt`/
+is_whitespace content — pure UTF-8 width dispatch; same family
+as native's bytes-filter work, noted not duplicated.
+
+Validation: build clean; test.sh green; Rosetta std 5/5 +
+unwind 3/3; PLIRON_VERIFY=1 clean on hist_alt, bigbench, std,
+unwind; UBOUND=0/1 A/B confirmed on both arches; suite otherwise
+unchanged (gather/scatter/dot_u32/sum_u8 wins hold, checksums
+match stock).
+
+## unroll landed: bound-param fix + rotated loops (x64 wt)
+
+The flagged blocker turned out to be *not* the chain shape —
+`looprot` already canonicalizes bcheck clones to brif-latch
+do-while before punroll runs. The real bail was the counting
+test's bound check: `a.len`/`cnt.len` arrive as entry-block
+params (`ValueDef::Param`, not an inst, not an h-param), and
+the bound had to be an inst dominating the entries or an
+unchanged header param. Extended to accept a param of any
+block that dominates `h` (an in-body block can't dominate the
+header, so loop-carried values still reject).
+
+Rotated (jump-latch) support went in anyway as belt-and-
+suspenders: `h: brif test -> body | exit` with a `jump h`
+latch reuses the same guard math verbatim (entry test of copy
+kk is `a0 + kk*s` = the `(k-2)*s` budget), copies 0..K-2 drop
+the test, the last copy keeps it (`brif -> copy-body | exit`),
+the latch jump becomes `jump hu`, h stays scalar remainder.
+Verified by building with PLIRON_LOOPROT=0 — hist stays
+0.235 with identical checksum.
+
+Also: small-body full-unroll cut raised 12 -> 16 insts so the
+bcheck clone's 13-inst `movz; addl (mem)` body gets K=8 like
+stock's loop instead of K=4.
+
+Result (x64/Rosetta): hist 0.41 -> **0.24** (stock 0.23,
+~1.04x — parity), gather 0.48 -> **0.32** (stock 0.40, win),
+scatter 0.45 -> **0.27** (stock 0.39, win). aarch64 hist
+0.230 vs stock 0.225 — parity there too (a64 stock build
+here is faster than the old comparison binary).
+matmul-64 0.24 (unrolled clone) vs 0.07 stock — still the
+strided-vectorization gap, unchanged diagnosis.
+
+**heads-up for native**: the merged ifconv inst cap 4->8
+(count-if work) regresses `chars().count()` ~2x on x64
+(0.44 -> 0.83; `PLIRON_IFCONV=0` restores it — the UTF-8
+width-dispatch tree gets if-converted to selects where the
+branch predicted well). aarch64 hit is milder (0.74 vs 0.65
+stock). Probably wants a profitability guard on the wider
+cap (e.g. only when the diamond feeds a count/reduction the
+vectorizer can use). Not reverted — native's file, their
+tradeoff; flagging.
+
+PLIRON_VERIFY=1 clean with and without LOOPROT; test.sh
+green; Rosetta std + unwind pass; checksums match stock.
+
+## Strided lane-gather vectorization landed (matmul-64 gap closed)
+
+The remaining matmul-64 gap was the k-reduction's strided B-column
+load (`b[k][j]` steps 256B/iter at N=64, 1KB at N=256) — loopvec
+only formed unit/descending streams. Three enabling pieces plus the
+gather itself went in on `wt/x64-codegen` (`a730090`, merged over
+shared HEAD 140eb02):
+
+- `upgrade_lagged` — rustc lowers the inner-loop pointers as
+  `Param::Other` one-iteration-lagged values (`q(t+1) = f(p(t))`
+  for affine `f` over `Step` params — bounds-check index and
+  next-iteration pointer precompute). All latches passing the same
+  affine value means `q` is itself a `Step` deferred by one;
+  `param_coeffs` decomposes the backedge value, fixpointed for
+  chains. matmul's k-loop header goes from `["S1","?","?","?"]`
+  (non-linear bail) to all-Step.
+- `Stream.stride` + `emit_vload` — byte strides that are a whole
+  element multiple >= 2*ebytes emit `vf` scalar `load.elem`s
+  `stride*ebytes` apart joined by `splat`+`insertlane` (LLVM's
+  `movd`/`vpinsrd` column idiom; x64 sinks each load into the
+  pinsr operand). Loads only; strided stores still bail.
+  `MAX_GATHER=2048` caps the stride (also bounds per-lane offsets
+  to ~6KB, i32-safe). Non-overlap preds and strength-reduced base
+  steps scale by the element stride. Const trips < `vf*UNROLL`
+  bail (vector clone could never execute).
+- `exit_bare` + do-while trips — post-tested loops previously
+  reserved a forced scalar iteration (`(iters-1) & -K`). When the
+  counting exit's target is arg-free and every in-body value it
+  reads maps to a resume-time value (header param -> last
+  iteration, backedge arg -> resume), the epilogue clones the exit
+  block and brifs `rem != 0` -> scalar / `rem == 0` -> exit clone,
+  allowing the full `iters & -K` count. `trips_idx`/`trips_ptr`
+  gained the `(ult, post_tested, current-iv)` arm:
+  `ceil(sat(bound - x0)/step) + 1` via `Ins::SatSub`/`Ins::Div`
+  (`ins_eval` is now `pub(crate)` for the trip gate).
+
+**Measured** (`/tmp/strided.rs` + `/tmp/bigbench.rs`, best-of-10,
+pliron vs stock `x86-64-v3` under Rosetta / `apple-m1` native;
+branch base 919ba07 = "scalar" column):
+
+| kernel | x64 base | x64 gather | x64 stock | a64 base | a64 gather | a64 stock |
+|--------|----------|------------|-----------|----------|------------|-----------|
+| matmul64 | 0.161 | **0.123** | 0.088 | 0.162 | **0.074** | 0.070 |
+| matmul256 | 10.40 | **9.97** | 10.64 | 10.25 | **9.95** | 9.88 |
+| colsum256 | 0.040 | 0.037 | 0.042 | 0.036 | 0.037 | 0.041 |
+
+matmul-64 x64: 1.83x-behind -> 1.39x; aarch64: 2.3x-behind ->
+**parity**. matmul-256 now ~parity/beats stock on both arches.
+
+**Measurement trap — `PLIRON_VEC=0` is not a scalar baseline.**
+`st.loopvec` also gates `PLIRON_IFCONV2`+`PLIRON_CPARM`, so VEC=0
+silently disables them. matmul-64 with VEC=0 measures 0.095 x64 /
+0.076 a64 ("clean" scalar), but the actual shipped scalar
+(ifconv2+cparm on, e.g. `PLIRON_VEC_SKIP=matmul`) is **0.160** —
+cparm's const-param fold reshapes the k-loop into a form ~2x
+slower scalar on both arches. The gather looked like a regression
+vs the VEC=0 number; vs the real baseline it's a clear win.
+A/B loopvec with `PLIRON_VEC_SKIP=<substr>` (per-function) rather
+than `PLIRON_VEC=0`.
+
+**cparm finding (flag for native wt).** Two independent symptoms:
+(1) the matmul-64 2x scalar regression above — cparm folds a
+const-fed header param in the bounds-check shape and the result
+punrolls/regallocs worse on both arches; (2) `harness/run.py
+--suite fuzz --fuzz-seeds 0:24` hits **13 `ifconv2 broke` ICEs**
+(verify: use of non-dominating value) — identical at 919ba07 and
+merged HEAD, `PLIRON_CPARM=0` clears them. Pre-existing, not from
+this change; needs a look on the native side.
+
+**Other kernels on merged HEAD** (x64 / a64 vs stock): gather
+0.334/0.270 vs 0.369/0.436 win, scatter 0.331/0.244 vs 0.376/0.438
+win, sum_u8 0.032/0.018 vs 0.174/0.054, dot_u32 0.111/0.055 vs
+0.165/0.055, cnt_aff 0.241/0.129 vs 0.434/0.127, prefix
+0.301/0.297 vs 0.327/0.297, hist ~parity, nth2_u64 0.147/0.149 vs
+0.168/0.081 (x64 win, a64 1.8x loss — bails loopvec on the
+early-exit gate, pre-existing), chars 0.579/0.587 vs 0.320/0.643,
+tokenize 2.65/2.48 vs 1.12/1.12.
+
+Validated: `PLIRON_VERIFY=1 ./test.sh` green; harness tier-0
+(smoke 9+2noref, determinism 10/10) green on merged HEAD; strided
+correctness `/tmp/gather_mm.rs` (const-generic mm/colsum/xpose,
+N=1..256 incl. non-multiples of 16 — full-matrix diff vs scalar)
+and `/tmp/gather_check.rs` (strides 1..128, u32/u64, do-while
+steps) ALL OK on both arches; fuzz ICEs are the pre-existing
+cparm set, unchanged by this work.
+
+## Windows x64 session (2026-11, x86_64-pc-windows-msvc, i7)
+
+Pull `4c10eb4 -> cef682d` (~499 commits). Windows harness fixes in
+`02d36af` (wait4->GetProcessMemoryInfo RSS, llvm-tools resolution from
+the pinned toolchain, COFF `.text$mn` size accounting, `subq`/`pushq`
+frame regexes, `RtlVirtualUnwind` decl, CONSTSINK aarch64 gate).
+
+### Frame accounting was a measurement artifact
+
+`frames.py` x86-64: LLVM's `__chkstk` frames counted only pushes (the
+indirect `subq %rax,%rsp` was missed — fixed by tracking `eax` through
+the call), and pliron's inline probe `subq $0x1000/touch/addq $0x1000`
+was double-counted. Bogus STK 2.114 -> honest ~1.55. Commit `ca3e899`.
+
+### x64 amode fold `e24d00f` (`PLIRON_X64_AMODEIADD`, default on)
+
+`iadd (ishl (iadd idx K) s) base` -> `disp += K<<s` in
+`isa/x64/inst.isle`. Verified in the real `iterw` bench binary — all 8
+unrolled loads use `movl 0xK(%r8,%rbp,4)` — but timing unchanged
+(~1.36x): the residual is block-param restores, not address material.
+
+### RIP sampler `harness/ripsample.py` (`3b35d48`)
+
+No-admin sampler (SuspendThread+GetThreadContext on the spawned child,
+~46k samples/10 s) — the measurement tool this box was missing:
+- `tokenize` 1.85x: hot byte-scan loop pays ~3 spill-slot accesses/byte
+  (cursor+data ptr live on stack); per-token path pays TLS fetch +
+  non-inlined 3-insn `is_some` call + duplicate compares. Matches the
+  documented "nonnull lost through stack slots" root cause — Mac-side
+  `memcpyopt` territory, don't duplicate.
+- `fib` 1.43x: hottest insns are prologue/epilogue slot save+reload;
+  loop carries `movl %ecx,%ecx` (uextend upper-bits not provably clean
+  at vcode level — `MCPBB` can't drop it).
+- `iterw`: `movq %r14,%rsi` block-param restore per element.
+
+### Tail-conv xmm save storm `9df5288` (`PLIRON_X64_TAILXMM`, default on)
+
+Windows x64 makes xmm6-15 callee-saved; SysV has none — so this gap is
+invisible on aarch64. pliron's internal ABI is `CallConv::Tail`; a Tail
+callee reported `SYSV_CLOBBERS`, so every WindowsFastcall caller of an
+internal fn clobbered all ten callee-saved xmm regs and saved xmm6-15
+(~160 B + 20 movdqu) even with no xmm live — `translate` saved all 10
+and used none (LLVM: saves 0). Now Tail calls on Windows report
+`SYSV \ xmm8-15` and Tail callees save xmm8-15 only when used; xmm6/7
+stay volatile (Tail float args/rets use xmm0-7) so the floor is 32 B.
+regex-syntax STK **1.556 -> 1.269** (`translate` 2152 -> 2024 B).
+Tests: `pliron-clif-opt/tests/x64_tail_winxmm.rs`.
+
+### Windows gate state
+
+4 FAILs, all verified pre-existing/environmental: `xfactsplugin` (MSVC
+fat-LTO unsupported — no relocatable link flavor), `xcguhome` (`nm`
+missing; toolchain ships `llvm-nm`), `edgemerge`/`loopalign` (diffs
+identical with knobs on/off). `corpus:syn`, `pgo`, `cmp3`, `fuzzreg`
+green.
+
+### Tail-conv fastcall-lane args `c02cb98` (`PLIRON_X64_TAILARGS`, default on)
+
+Continuation of the Tail xmm fix: stock `Tail` maps args SysV-style
+(rdi,rsi,rdx,rcx,r8,r9 / xmm0-7 per class), so every WindowsFastcall
+caller shuffled its rcx,rdx,r8,r9 args at each internal call — fib's
+recursive loop paid `leal -1(%rsi),%ecx; movl %ecx,%edi` where LLVM
+writes the arg straight into ecx. Now Tail args take the fastcall lanes
+by absolute position (rcx,rdx,r8,r9 then rsi,rdi; xmm0-3 then xmm4/5),
+verified on a mixed 7-arg signature incl. the stack spillover and
+`retq $0x10` callee-pop. Float args/rets capped at xmm5, so xmm6/7 join
+the callee-save set; `TAIL_WINDOWS_ARGS_CLOBBERS` = SysV \ xmm6-15.
+`tail_winargs()` requires `tail_winxmm()` — TAILXMM=0 restores the old
+ABI wholesale. Results: fib 33.7 -> 31.4 s (LLVM 23.25; **1.45 ->
+1.35**), `translate` 2024 -> 1992 B, STK **1.269 -> 1.218**. Gate: same
+4 environmental FAILs plus `unit`/`jt_backedge_stale` which needs an
+aarch64 clif-check (SupportDisabled on Windows) — all pre-existing.
+
+Residual fib gap: the loop still pays `movl %ecx,%ecx` (uextend with
+upper bits not provably clean at the def) and a block-param move per
+trip — regalloc/value-cleanliness territory, not ABI.
+
+### tokenize: tiny-callee XCGU + what item-(2) turned out to be `80b1022`
+
+`PLIRON_XCGU_TINY` (default 8 MIR stmts, 0 disables): closures made
+entirely of <=N-stmt bodies don't spend the `ours.len()` copy cap. The
+`Split::next` machinery in tokenize had been copied + inlined all along,
+but `str::IsNotEmpty::call_mut` (size 3, the `!s.is_empty()` filter
+predicate) lost the cap lottery to BFS admission order — a non-inlined
+3-insn call plus TLS fetch per token. After the exemption the copy
+emits, the call *and* the TLS fetch vanish from the hot loop:
+**tokenize 4.87 -> 4.13 ms (~15%; ~1.77x -> ~1.50x LLVM)**.
+
+Post-inline disasm of the byte-scan loop (0x4c810-0x4c87b): the
+`Option<&str>` niche fold **fired** — `testq %rcx,%rcx` on a scalar
+pointer is the is_some test; the Option never reaches memory. So the
+PARITY "nonnull lost through stack slots" item is *mostly captured by
+inlining* for this kernel — mid-end enum scalarization would add
+nothing here. What remains per byte:
+
+- 3x `cmpq %r8,%r11` where one suffices — `icmp eq i,len` consumed by
+  `brif` + 2 clamp-`cmove`s; vcode emits a fresh `cmp` per consumer
+  even though no flag-writer intervenes. Fix = dead-flag-recompute
+  peephole (vcode flag-liveness: drop `cmp/test a,b` when the identical
+  flag state is live and operand vregs are unmodified). Bounded, gated,
+  x64; est. 2 insns/byte of ~13 in the scan loop. NOT yet implemented —
+  flag-liveness across movs needs care (must prove operand vregs
+  unwritten between the two cmps).
+- clamped-index `cmove` pairs (the `min(i,len)` checked-access idiom)
+  — structurally fine once the redundant cmps die.
+- loop-invariant spill/reload on the per-token path only (fine).
+
+fib residual (unchanged by XCGU work): `movl %ecx,%ecx` uextend whose
+upper bits aren't provably clean (Tail ABI can't assume clean i32
+upper bits on args/blockparams) + one block-param move per trip.
+Plausible direction: a cleanliness fixpoint over block params (all
+incoming edges clean-32 => param clean), gated; or make Tail i32 args
+guarantee clean upper bits as part of the conv (ABI contract — needs
+the same audit as TAILARGS).
+
+### `movl %ecx,%ecx` self-move elision `f185213`
+
+fib's recursive call paid `movl %ecx,%ecx` per arg: `gen_move` emits
+`movl` for <=32-bit vregs (a byte shorter, exact since upper bits are
+undefined) and a same-preg result slipped past MCP — `is_move` only
+matched 64-bit moves, deliberately, since a `movl` self-move *can* be
+a real zero-extend. Fix: `is_move` matches `movl_mr` (the move form)
+only when src==dst preg; `movl_rm` (`movzx`'s real zext) stays
+unmatched, as do non-self `movl`s (they must not join MCP's 64-bit
+value-class tracking). `movl_rm` self-moves were already dropped by a
+vcode pair-fusion; this closes the `gen_move` gap. fib's call
+sequence is now `addl $-1,%ecx; callq` — arg passed in place.
+
+Investigated the remaining tokenize overhead post-XCGU_TINY: the
+byte-scan loop's 3x `cmpq i,len` per byte come from one `icmp eq`
+consumed by `brif` + 2 clamp `cmove`s — vcode emits a fresh cmp per
+consumer though no flag-writer intervenes (movzbq/leaq don't touch
+flags). Fix shape: a vcode emit-level "dead flag recompute" pass —
+track last flag-writing compare + operand pregs via `preg_ops`;
+drop a `cmp/test` with identical opcode+operands when only
+flag-preserving insts (moves/lea/nop/cmov — whitelist, not blacklist)
+intervene and operand pregs are unmodified. Designed, not landed —
+flag-liveness is miscompile-risky and needs careful inst coverage.
+
+### FLAGDUP landed — `cmp`/`test` re-recompute elision (emit-level)
+
+The dead-flag-recompute pass designed above is in
+`machinst/vcode.rs`'s emit loop: tracks last flag-setting compare as
+`(key, preg_a, preg_b)`; an identical later compare is skipped when
+only whitelisted flag-preserving insts intervene and no operand preg
+was redefined (defs checked via `preg_ops`, edits included). New
+`MachInst::flag_kind`; whitelist uses a generated `mnemonic()` on the
+x64 assembler enum. Default on, `PLIRON_FLAGDUP=0` kills it; bisect
+aids `PLIRON_FLAGDUP_{BISECT,FORMS,FN,LOCAL,TRACE}` (see
+PLIRON_PATCH.md #122).
+
+**cmp3 miscompile + fix.** First gate run: sort test failed — `c`
+descending within equal `(a,b)` groups (checksum break, deterministic
+under `PLIRON_FLAGDUP` on; `=0` passes). Bisection path, worth
+recording because process-global `PLIRON_FLAGDUP_BISECT` was useless
+(rustc hash randomization + parallel lowering shuffle the global
+elision counter between identical compiles — same N gave different
+binaries): `PLIRON_FLAGDUP_FORMS=rc` alone reproduced, then
+`PLIRON_FLAGDUP_FN`+`PLIRON_FLAGDUP_LOCAL` (function-local elision
+counter, stable) bisected it to `quicksort<O3a>` elision #47 — a
+`cmpb %cl,%al` in block311 whose tracked gap contained
+`leal 2(%rdx),%edx`. The vcode says `lea`, but `emit_lea` shrinks
+dst==base forms to `add` (`addl $2,%edx`, 1 byte shorter) — a hidden
+flag write. `flag_kind` now calls `lea_encodes_as_add` mirroring
+`emit_lea`'s shrink conditions; those `leal`/`leaq` are `Other`.
+All four cmp3 legs green after.
+
+Audit notes for the record (holes checked while hunting):
+- `MovToPReg`/`MovFromPReg`/uninit pseudo-insts: `reg_fixed_nonallocatable`
+  dsts are rsp/rbp-class only — can't be cmp operands — but classified
+  `Other` anyway (conservative).
+- Implicit-operand writers `cbw`/`cwde`/`cdqe`/`cwd`/`cdq`/`cqo` were
+  initially whitelisted; rax/rdx defs are invisible to `preg_ops` —
+  removed from whitelist.
+- `cmp*_rm` vs `cmp*_mr` encode inverted subtractions — checked: the
+  dedup key carries the variant tag, no cross-reuse.
+- Pair fusion merges defs into `preg_ops`; squashed insts skip the
+  flag update; `flag_twin` is aarch64-only (inert on x64).
+- Stack->stack edit path: panics unimplemented, not a silent hole.
+
+Unit tests `pliron-clif-opt/tests/x64_flagdup.rs` (same-block reuse,
+operand rewrite, intervening flag writer). The lea->add regression
+itself is regalloc-shape-dependent and can't be forced from CLIF —
+pinned by the cmp3 e2e stanza.

@@ -366,9 +366,12 @@ impl PrettyPrint for AMode {
             }
             &AMode::RegScaledExtended { rn, rm, extendop } => {
                 let shift = shift_for_type(size_bytes);
+                // PLIRON: the index reg is W for every extend but
+                // uxtx/sxtx (uxtb/uxth were unreachable before
+                // `enc_ldst_reg` learned the full option field).
                 let size = match extendop {
-                    ExtendOp::SXTW | ExtendOp::UXTW => OperandSize::Size32,
-                    _ => OperandSize::Size64,
+                    ExtendOp::SXTX | ExtendOp::UXTX => OperandSize::Size64,
+                    _ => OperandSize::Size32,
                 };
                 let r1 = pretty_print_reg(rn);
                 let r2 = pretty_print_ireg(rm, size);
@@ -377,8 +380,8 @@ impl PrettyPrint for AMode {
             }
             &AMode::RegExtended { rn, rm, extendop } => {
                 let size = match extendop {
-                    ExtendOp::SXTW | ExtendOp::UXTW => OperandSize::Size32,
-                    _ => OperandSize::Size64,
+                    ExtendOp::SXTX | ExtendOp::UXTX => OperandSize::Size64,
+                    _ => OperandSize::Size32,
                 };
                 let r1 = pretty_print_reg(rn);
                 let r2 = pretty_print_ireg(rm, size);
@@ -393,6 +396,11 @@ impl PrettyPrint for AMode {
             &AMode::SPPostIndexed { simm9 } => {
                 let simm9 = simm9.pretty_print(8);
                 format!("[sp], {simm9}")
+            }
+            &AMode::PostIndex { rn, simm9 } => {
+                let reg = pretty_print_reg(rn);
+                let simm9 = simm9.pretty_print(8);
+                format!("[{reg}], {simm9}")
             }
             AMode::Const { addr } => format!("[const({})]", addr.as_u32()),
 
@@ -419,6 +427,11 @@ impl PrettyPrint for PairAMode {
                 } else {
                     format!("[{reg}]")
                 }
+            }
+            &PairAMode::PostIndex { reg, simm7 } => {
+                let reg = pretty_print_reg(reg);
+                let simm7 = simm7.pretty_print(8);
+                format!("[{reg}], {simm7}")
             }
             &PairAMode::SPPreIndexed { simm7 } => {
                 let simm7 = simm7.pretty_print(8);

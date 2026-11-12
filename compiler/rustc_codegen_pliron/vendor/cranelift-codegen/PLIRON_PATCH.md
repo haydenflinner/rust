@@ -4,11 +4,15 @@ Vendored (like `vendor/regalloc2`) only for small x64 backend changes we want
 tight control over; each is marked `PLIRON:` in the source. Submit upstream
 once proven out on the stage2 benchmark, then drop this copy.
 
-1. `src/isa/x64/abi.rs`: leaf functions with no calls, clobbers, stack slots
-   or stack arguments get no `push rbp; mov rbp, rsp` / `mov rsp, rbp; pop rbp`
-   (aarch64 already omits the frame this way). Skipped when
-   `preserve_frame_pointers` is set, i.e. `PLIRON_OMIT_FP=0` or a target that
-   requires frame pointers.
+1. `src/isa/x64/abi.rs`: every x64 function, not only leaves, gets no
+   `push rbp; mov rbp, rsp` / `mov rsp, rbp; pop rbp` and addresses its frame
+   RSP-relative (as LLVM does with frame pointers off). `machine_env_inner`
+   then frees RBP as an allocatable callee-saved register
+   (`PLIRON_NO_FREE_RBP` keeps it reserved). A frame is still built for a tail
+   call with more stack args than incoming args, and when
+   `pliron_force_fp()` asks for one; the frame pad keeps RSP 16-aligned at
+   call sites. Skipped entirely when `preserve_frame_pointers` is set, i.e.
+   `PLIRON_OMIT_FP=0` or a target that requires frame pointers.
 2. `src/isa/x64/lower.isle` (+ `jump_table_size` made `pure` in
    `src/prelude_lower.isle`): a `br_table` whose index is `band x, k` with
    `k < table size` skips the `cmp; cmov` bounds clamp. Our `dense_switch`
@@ -21,6 +25,118 @@ once proven out on the stage2 benchmark, then drop this copy.
    `R_X86_64_GOTTPOFF` in `vendor/cranelift-object`; both of those crates are
    vendored only for this.
 
+4. aarch64 `udot` (FEAT_DotProd): new `VecALUModOp::Udot` variant (same
+   encoding as `sdot` plus the unsigned bit), `udot` helper in
+   `isa/aarch64/inst.isle`, and a `lower.isle` rule folding the
+   `iadd_pairwise(uwiden* lo) + iadd_pairwise(uwiden* hi) + acc` tree —
+   the shape our loopvec emits for `u8 * u8 → i32` widening dot products.
+5. aarch64 `mla`/`mls`: new `VecALUModOp::{Mla,Mls}` variants (same
+   `vec_rrr_mod` encoding shape as `sdot` but with element-size bits; `.2d`
+   excluded — integer `mla`/`mls` have no i64-lane form), `mla`/`mls` helpers
+   in `inst.isle`, and `lower.isle` rules folding vector `iadd(acc, imul a, b)`
+   in either operand order plus `isub(acc, imul a, b)` (non-commutative, one
+   order only). The two `iadd` orders sit at distinct priorities (10/11) so
+   the ISLE overlap checker can prove them disjoint from each other and from
+   the scalar `madd`/`dot` folds; `iadd(imul, imul)` matches only the first,
+   leaving the second product as the accumulator operand.
+7. aarch64 logical-op shifted-operand fusion: `lower.isle` rules folding
+   `band`/`bxor` of i32/i64 with an `ishl`/`ushr`/`sshr`/`rotr`/`rotl`
+   immediate operand into `and`/`eor` with a shifted register operand
+   (`eor x, y, z, ror #k`, as LLVM emits for SipHash rounds). New
+   `rotr_from_u64` extern in `lower/isle.rs` + decl in `inst.isle`.
+   `rotl x, k` lowers as `ror x, bits-k`. `bor` deliberately skipped: ten
+   priorities can't fit below `extr_32_or_64`'s 5 without shadowing it.
+   ROR is only valid in the logical (shifted register) encoding — never
+   extend this to `iadd`/`isub` (their shifted-register form has no ROR).
+6. aarch64 `smlal`/`umlal` widening MAC: new `VecRRRLongModOp::{Smlal8,16,32}`
+   variants (`umlal` already existed for 8/16/32), helpers, and `lower.isle`
+   rules folding `iadd(acc, iadd(imul(widen_lo a, widen_lo b),
+   imul(widen_hi a, widen_hi b)))` into `smlal`+`smlal2` at priorities
+   12-15. Lane-exact because the inner `iadd` is elementwise; loopvec emits
+   this shape for widening dot products at i8→i16/i16→i32/i32→i64, i.e. the
+   widths with no `sdot`-family instruction.
+7. aarch64 `shuffle` rotation → `ext`: `lower.isle` rule (priority 7) plus
+   the `vec_rotate_imm4_from_immediate` extractor in
+   `isa/aarch64/lower/isle.rs` — a mask `bytes[i] = (n+i) mod 16` rotates a
+   single vector by `n` bytes, which is `ext a, a, n`. All mask bytes are
+   < 16 so the second operand is never referenced. Turns the loopvec
+   descending-stream lane reversal for two-lane vectors (e.g. `u64x2`) into
+   one instruction instead of a mask load + `tbl`.
+8. aarch64 `shuffle` full lane reversal → `rev64`+`ext`: `lower.isle` rules
+   (priority 8) for the i8x16/i16x8/i32x4 reversal masks. `rev64` flips the
+   element order within each 64-bit group and `ext #8` swaps the halves —
+   two instructions, no literal-pool mask and no `tbl` table register
+   dependency. Used by loopvec's descending streams; identical to what LLVM
+   emits for `shufflevector` reversals.
+9. aarch64 widening adds: new `VecRRRLongOp::{Saddw,Uaddw,Saddl,Uaddl}8/16/32`
+   variants (`enc_vec_rrr_long` generalized from a `bit14` flag to the full
+   six-bit opcode field — `uaddw`/`uaddl` live at opcodes `0b000100`/`0b000000`,
+   next to `umlal`/`umull`). `lower.isle` rules fold `iadd(acc, widen(x))` →
+   `uaddw`/`saddw` (+`2` for the high half) in both operand orders,
+   `iadd(widen a, widen b)` of equal halves → `uaddl`/`saddl`, and
+   `iadd(acc, iadd(widen_lo x, widen_hi x))` → `uaddw`+`uaddw2` chained on
+   `acc`, at priorities 20-24 (above the `smlal`/`umlal` block; each operand
+   order needs its own priority since the orders overlap on
+   `iadd(uwiden,uwiden)`). loopvec's widening reductions emit
+   acc-chained `iadd(acc, widen half)` trees into per-half accumulators —
+   the exact shape LLVM produces for `sum += (x as u64)*(x as u64)`.
+
+10. aarch64 `ldp`/`stp` fusion at emission: new `MachInstEmit::fuse_with_next`
+    hook (default `None`), called from `VCode::emit` when the next block item
+    is the next instruction — no intervening regalloc edit, whose moves could
+    clobber either inst's registers. The AArch64 impl folds two adjacent
+    `UnsignedOffset` loads/stores of equal size and flags on the same base
+    register into `LoadP64`/`StoreP64`/`FpuLoadP64`/`FpuStoreP64`/
+    `FpuLoadP128`/`FpuStoreP128` with a `PairAMode::SignedOffset` amode
+    (offsets may be in either order; `rt` takes the lower slot). The second
+    inst is squashed to `Nop0`, keeping inst indices stable for srclocs and
+    regalloc edits; its operands are pre-applied so the fused inst carries
+    physical registers. Loads require distinct destination regs (`ldp` with
+    `rt == rt2` is unpredictable).
+
+11. aarch64 pair fusion across pure-ALU gaps: a second
+    `MachInstEmit::pair_fusion_crossable` hook whitelists pure
+    register-dataflow insts (no memory, control flow, traps, calls or hidden
+    state). `VCode::emit` scans up to 8 insts ahead for a fusable partner
+    (regalloc edits still stop the scan). Post-alloc use/def regs are
+    recorded per inst during allocation application — `get_operands` skips
+    already-physical regs, so they cannot be collected after the fact. The
+    fused pair emits at one of two slots: early (partner moves up — unsafe
+    when a gap inst writes a reg the partner touches or reads one it
+    defines, or when the partner reads this inst's defs since pair uses
+    precede defs) or late (this inst moves down — symmetric hazard set on
+    this inst's regs). The `fmul; str` interleave produced by
+    demand-driven lowering fuses via the late placement, yielding
+    `ldp/fmul/stp` blocks for vectorized map loops.
+
+12. x64 `psadbw`: new CLIF op `x86_psadbw` (`i8x16,i8x16 -> i64x2`, added in
+    `vendor/cranelift-codegen-meta/src/shared/instructions.rs`), plus
+    `x64_psadbw` in `isa/x64/inst.isle` and a `lower.isle` rule (the splat-0
+    operand folds to `xmm_zero`). The encoding itself is added in vendored
+    `cranelift-assembler-x64-meta` (`instructions/avg.rs`); codegen-meta's
+    assembler.isle generator emits `x64_psadbw_a_or_avx` automatically.
+    loopvec emits `iadd(acc, x86_psadbw(chunk, splat 0))` for unsigned
+    u8→u64 widening sums — one instruction per 16 bytes instead of a
+    14-unpack widen tree.
+
+13. direct-use side-effect sinking (`src/machinst/lower.rs`):
+    `compute_use_states` additionally returns `value_direct_uses` — raw
+    argument-position use counts, *not* coarsened by the transitive
+    `Multiple` propagation. The side-effect branch of
+    `get_value_as_source_or_const` accepts a def as `UniqueUse` when either
+    upstream's `value_ir_uses == Once` holds, or the value has exactly one
+    direct use, that use is `cur_inst` itself, and nothing has already
+    materialized the value (`value_lowered_uses == 0`). Upstream's `Once`
+    is poisoned to `Multiple` whenever a consumer's result fans out (e.g.
+    a scalar `fadd` accumulator feeding both backedge and exit args), so
+    `load; fadd` could never fuse into `addss (mem), %xmm` in a reduction
+    loop. The two extra tests are load-bearing: `cur_inst`-is-user rejects
+    probes that reach the value through a still-live pure sub-pattern
+    (`(store (iadd (load l) k) addr)` matching `l`), and the
+    `lowered_uses` test rejects sinking after an earlier-lowered inst
+    legitimately put the value in a register — fusing then would leave
+    that register's definition unemitted.
+
 ## x64 PIC calls use PLT32
 
 `CallKnown`/`ReturnCallKnown` emit `R_X86_64_PLT32` instead of `R_X86_64_PC32`
@@ -28,3 +144,1750 @@ when `is_pic` is set (`isa/x64/inst/emit.rs`). Together with the backend marking
 direct-call `FuncRef`s colocated (`PLIRON_PLTCALL`), calls to symbols from other
 CGUs become `call rel32` (the linker resolves PLT32 directly when the definition
 is local, else through the PLT) instead of a GOT load plus `call *reg`.
+
+14. aarch64 `add`/`lsr` fusion (`src/isa/aarch64/lower.isle`): `iadd` with
+    a logical-right-shift immediate operand lowers to `add x, y, z, lsr #k`
+    (priorities 20/21, above the `iadd_imul` folds at 7 but below the
+    imm12 rules). Hashbrown's probe-index `off + (hash >> 3)` pattern.
+
+15. `PLIRON_PRECOMPILE` debug hook (`src/context.rs`): dumps each func's
+    CLIF inside `compile_stencil` after `optimize()` — the exact form
+    `compile_function`/isel consumes, unlike the backend-side `PLIRON_CLIF`
+    `final` dump which precedes `remove_constant_phis`/egraph.
+
+16. Loop-header 16-byte alignment (`src/machinst/vcode.rs`, every ISA, not
+    only x64): blocks
+    targeted by back-edges in the final emission order get `gen_nop`
+    padding before their label binds, like LLVM's `.p2align 4` loop tops.
+    `PLIRON_ALIGN=0` disables. `PLIRON_ALIGN_MAXB=<bytes>` caps it:
+    loops whose emitted body exceeds the cap get no pad (a body bigger
+    than a few fetch lines gains nothing from the 16-byte head). A
+    companion fix lives in vendored
+    `cranelift-object` (`backend.rs`): `define_function_inner` maxes the
+    ISA's `function_alignment().preferred` (32 on x64) into symbol
+    alignment — the buffer minimum is usually 1, so without it functions
+    land at arbitrary offsets and buffer-relative 16-alignment means
+    nothing in the final image.
+
+17. x64 `icmp` memory-operand compares (`src/isa/x64/inst.isle`): a
+    sinkable `load` on the LHS of `icmp` is swapped to the RHS (`cmp reg,
+    [mem]` + `intcc_swap_args`); against a constant it instead lowers to
+    `cmp r/m, imm` via new `x64_cmp_mem` helper; `is_nonzero` of a sinkable
+    load (or `uextend` of one) lowers to `cmp $0, mem` instead of
+    materializing for `test reg, reg`. Both forms use
+    `sinkable_load_exact` (narrow loads read at their own width) so byte
+    scans like `is[i]`/`cmpb $0, mem; jne` fold to a single memory compare.
+
+18. Alias-chain hardening (`src/ir/dfg.rs`): `compact_aliases` rewrites
+    each alias to point at its fully-resolved terminal (skipping chains
+    that dead-end at reserved/tombstoned targets) so per-use
+    `resolve_aliases`/`value_def` calls stay O(1) after merge-heavy
+    passes. `try_value_def` returns the shallow def without chasing
+    aliases and `None` for invalid/reserved entries; `try_resolve_aliases`
+    returns `None` on invalid, tombstone-ended, or cyclic chains instead
+    of panicking — pipeline carry logic iterates all values and must not
+    panic on stale pairs.
+
+19. `Context::egraph_safe` (`src/context.rs`): the ISLE prelude's
+    `ty_smin`/`ty_smax`/`ty_mask`/`ty_lane_mask` `expect` ≤64 — any
+    >64-bit scalar (rustc's routine i128) or >64-lane vector panics the
+    whole egraph pass. `optimize` and the pipeline's opt-in egraph step
+    skip functions containing such values. `PLIRON_COMPILE_EGRAPH=0`
+    disables the compile-path egraph entirely for A/B measurement —
+    it still earns ~7-13% runtime on hash/string kernels as of the
+    last benchmark, so it stays on by default.
+
+20. Encoding-aware ALU-immediate remat (`src/opts/remat.isle`,
+    `src/opts.rs`, `src/prelude_opt.isle`): the ALU-op-with-`iconst`
+    remat rules fired unconditionally, marking e.g. `bxor v, 0x7465...`
+    for re-emission at every use block. A remat only pays when the
+    immediate folds into the target operand — otherwise the constant
+    still needs a register *and* the op re-executes per use (hmget's
+    lookup loop re-xored a hasher key with a full-width constant every
+    iteration). `imm64_addsub_imm` gates iadd/isub on the 12-bit
+    (optionally shifted) add/sub immediate form; `imm64_logic_imm`
+    gates band/bor/bxor on logical-immediate encodability (replicated
+    element pattern that is one cyclic run of set bits). Conservative
+    on targets with wider immediate fields — only a neutral remat is
+    lost.
+
+21. `PLIRON_STATS=1` also prints per-function `EgraphPass` stats in
+    `egraph_pass` (`src/context.rs`; previously only reachable via
+    `log::debug!`). Used to size egraph's contribution: scoped-GVN hits,
+    alias-eliminated loads (~0 — nothing emits `alias_region` metadata),
+    licm hoists, and `elaborate_remat` clone counts.
+
+    A loop-aware variant of `maybe_remat_arg` (pin outer-loop constants /
+    redirect in-loop constant clones to the preheader) was implemented
+    and benchmarked, then reverted: the eliminated per-iteration `movz`s
+    were ~free while the pinned live ranges spilled measurably worse
+    (hashmap `main`: 96 → 121-178 stack ops; upstream won or tied every
+    A/B). Upstream's per-use-block cloning is already the pressure-
+    optimal placement; remat wins have to come from *what* gets marked
+    (patch 20's encodability gate), not *where* clones land.
+
+22. `black_box` instruction (`cranelift-codegen-meta` shared
+    `instructions.rs` + a `lower.isle` rule per ISA): a unary op over any
+    scalar/vector type marked `can_store` + `other_side_effects`, so no
+    optimization may fold `a` back to `x`, eliminate it, or move memory
+    ops across it — the CLIF equivalent of LLVM's
+    `asm("" : "r,~{memory}" :: v)` used for `core::hint::black_box`.
+    Each ISA lowers `(black_box x)` to `x`, aliasing the result vreg to
+    the input's: zero machine instructions emitted. The vendored
+    interpreter evaluates it as the identity. pliron's `black_box`
+    intrinsic lowering emits `call __pliron_bb*`/`__pliron_bbm` ops that
+    `src/lower.rs` rewrites into this instruction (the call shape keeps
+    pliron's own IR opts opaque); wasm keeps a volatile load fallback.
+
+23. `VCode::emit` `preg_ops` table hoisted out of the per-block loop
+    (`machinst/vcode.rs`): it was allocated `insts.len()`-sized per
+    block, making emit O(blocks × insts) memset on many-block
+    functions (16k-block match dispatch: 6.3s in `VCode emission`
+    → ~0.1s). Entries for a block's insts are repopulated by the
+    eager `apply_allocs` pass before hazard checks read them, so
+    cross-block leftovers are unreachable. Also adds the
+    `PLIRON_EPROF=1` per-function emit-phase timers
+    (`eprof frame=/loop=/items=/apply=/fuse=/inst=/allocs=/island=/obr=/fin=`),
+    gated so no `Instant` calls run when unset, and a `self_times()`
+    accessor on `timing::PassTimes` plus the `timing` feature enabled
+    in `Cargo.toml` so `src/lower.rs` can report `emit:<pass>`
+    pseudo-steps under `PLIRON_TIMING`/`PLIRON_TRACE_FILE`.
+||||||| dd0fb97
+24. x64 wide-vector boolean ops (`vendor/cranelift-assembler-x64-meta/
+    src/instructions/wide.rs`, `src/isa/x64/lower.isle`): the lane-generic
+    `sse_and`/`sse_and_not`/`sse_or`/`x64_xor_vector`/`bnot`/`bitselect`
+    rules match 256/512-bit vectors but emit xmm-width instructions —
+    `Xmm` wraps an allocated ymm/zmm reg unchecked, so the high lanes
+    were silently dropped. New `vpand`/`vpandn`/`vpor`/`vpxor` ymm and
+    `vpandd`/`vpandnd`/`vpord`/`vpxord` zmm forms plus `vpcmpeqb` ymm /
+    `vpternlogd` zmm wide all-ones; `lower.isle` rules at priorities
+    20/21 emit them for `band`/`bor`/`bxor`/`bnot`/`bitselect` on
+    256/512-bit vectors. The lane-generic `sse_*`/`x64_xor_vector`/
+    `bnot`/`bitselect`/`pblendvb` fallbacks are guarded to ≤128-bit
+    types so any other wide use fails to lower instead of truncating.
+    `ty_bits` (`src/isle_prelude.rs`) saturates at `u8::MAX` for
+    >255-bit types instead of panicking. Covered by
+    `pliron-clif-opt/tests/widevec_lower.rs`.
+
+25. x64 wide-operand types (`src/isa/x64/inst/args.rs`,
+    `src/isa/x64/inst.isle`, `src/isa/x64/lower/isle.rs`,
+    `src/isa/x64/lower.isle`,
+    `cranelift-assembler-x64-meta/src/dsl/format.rs`,
+    `cranelift-assembler-x64-meta/src/generate/operand.rs`,
+    `cranelift-assembler-x64-meta/src/instructions/wide.rs`):
+    new `xmm_m256`/`xmm_m512` DSL locations generating `XmmMem256`/
+    `XmmMem512` ISLE operand types (`size:256`/`512` in
+    `newtype_of_reg!`), with `xmm_to_xmm_mem_*`,
+    `synthetic_amode_to_xmm_mem_*`, `writable_xmm_to_xmm_mem_*` and
+    `xmm_mem_*_to_xmm_mem` converters. Every wide instruction in
+    `wide.rs` now takes an operand of its true access width — ymm
+    instructions take `xmm_m256`, zmm `xmm_m512` — while 128-bit
+    lane-chunk ops (`vextractf128`/`vinsertf128`/`vextractf32x4`/
+    `vinsertf32x4`, `vcvtph2ps`/`vcvtps2ph`/`vpmovzxwd` at Y, the
+    `*ph` X forms) keep `xmm_m128`. This closes the latent hole where
+    a 128-bit `RegMem` operand could be passed to a ymm/zmm
+    instruction and read out of bounds. All wide `lower.isle` rules
+    use the matching-width converter. `widevec_lower.rs`
+    `float_ops_*` covers the sibling's vmovups/fadd/fmul/fma path.
+    `put_in_xmm_mem_256`/`_512` (`src/isa/x64/lower/isle.rs`) enable
+    load folding into wide operands: they delegate to
+    `put_in_reg_mem` (sinkable load → amode) but skip
+    `put_in_xmm_mem`'s u128 const-pool path, which can't
+    materialize a >128-bit constant; bound-Value operands in the
+    wide `lower.isle` rules are passed bare so the fold fires.
+    `fold_load_256` checks a single-use load folds into `vaddps`'s
+    memory operand.
+
+26. x64 wide-vector full op coverage (`src/isa/x64/lower.isle`,
+    `src/isa/x64/lower/isle.rs`, `src/isa/x64/inst.isle`,
+    `src/isa/x64/inst/mod.rs`, `src/prelude.isle`,
+    `vendor/cranelift-codegen-meta/src/isa/x86.rs`,
+    `cranelift-assembler-x64-meta/src/dsl/features.rs`): ISLE
+    lowerings for the full op set at 256/512 bits — int
+    add/sub/mul/min-max/sat-add/avg/mulhi/shifts/abs/neg for all
+    lane widths, `vpmullq` (avx512dq) for i64x8; f64x4/x8 and the
+    missing f32 wide float ops (min/max/sqrt/div/neg/abs/round);
+    `icmp`/`fcmp` masks (512-bit compares split into two 256-bit
+    halves — the DSL has no k-register location — reassembled via
+    `vinsertf64x4`); `select`, `splat` and `vconst` for all wide
+    types; `iconcat`/`isplit`. Byte/word ops at 512 are gated on
+    the new `has_avx512bw` ISA flag (CPUID.07H:EBX[30], added to
+    skylake-avx512/znver4/x86-64-v4 presets and `Feature::avx512bw`)
+    so they fall through to loud Unsupported instead of emitting
+    an encoding the host lacks. Helpers: `wide_lane_mask_amode`
+    (Generated const-pool mask vectors of arbitrary width),
+    `wide_shift_amt_128` (mask scalar count then movq to xmm),
+    `put_low128_in_xmm_mem` (sinkable-load folding of the low half).
+    Int `splat` uses `bitcast_gpr_to_xmm` — scalar ints live in
+    Int-class regs, not Xmm. Tests: `pliron-clif-opt/tests/
+    widevec_lower.rs` byte-checks each family at both widths.
+
+27. x64 wide lane ops and widening (`src/isa/x64/lower.isle`,
+    `src/isa/x64/lower/isle.rs`): `extractlane`/`insertlane` for
+    all wide int and f64 types — pull the 128-bit chunk containing
+    the lane down via `vextractf128`/`vextractf32x4` (chunk index
+    from the new `wide_lane_chunk128`/`wide_lane_sub128` helpers,
+    generalizing the f32-only `wide_lane_chunk`), run the existing
+    `pextr*`/`pinsr*` lane op, reinsert the chunk. f64 uses
+    `shufpd` for the in-chunk half-lane select (`wide_f64_sub_lane`
+    merges scalars by parity). `swiden_low/high` and
+    `uwiden_low/high` for `i16x16 -> i32x8` via `vpmovsxwd`/
+    `vpmovzxwd` ymm — the only wide widen CLIF can express
+    (inputs are capped at 16 lanes and outputs exclude i64, so
+    i8x32->i16x16, i32x8->i64x4 and any 512-bit widen are
+    unrepresentable and loud-fail on the verifier). `shuffle` is
+    i8x16-only and `gather`/`scatter` do not exist in this CLIF —
+    nothing to lower there.
+
+28. x64 dot-product opcodes (`src/isa/x64/lower.isle`,
+    `src/isa/aarch64/inst.isle`, `src/isa/aarch64/lower.isle`):
+    new CLIF opcodes `sdot` (signed i16xN pairwise dot -> i32xN/2,
+    pmaddwd), `udot` (unsigned x times signed y pairwise -> i16xN/2
+    saturating, pmaddubsw — x is the unsigned operand, matching
+    `udot x y` -> `vpmaddubsw x y`) and `udot_acc` (four-wide
+    u8x4N x i8x4N accumulate into i32xN, vpdpbusd). The opcode
+    definitions live in `vendor/cranelift-codegen-meta/src/shared/
+    instructions.rs` — see that crate's PLIRON_PATCH.md. `udot_acc`'s
+    byte operands are free typevars (the 4x lane relation to the
+    i32 accumulator is not expressible one derived level down), so
+    the lowering rules match concrete input types. aarch64's
+    internal `sdot`/`udot` ISLE terms were renamed `a64_sdot`/
+    `a64_udot` to free the names for the CLIF opcodes. VNNI gating:
+    `udot_acc` prefers the VEX AVX-VNNI form, falls back to the EVEX
+    AVX512-VNNI(+VL) forms; byte/word 512-bit forms gate on
+    `has_avx512bw`.
+
+29. x64 runtime-index swizzles (`src/isa/x64/lower.isle`): new CLIF
+    opcodes `vswizzle` (`a[i] = x[idx[i] mod N]` — a register-indexed
+    crossbar `shuffle`, sidestepping `shuffle`'s fixed `uimm128` mask)
+    and `vswizzle2` (`a[i] = (x++y)[idx[i] mod 2N]`, x86 `vpermt2*`
+    semantics — the index operand is the read-write register).
+    Definitions in `vendor/cranelift-codegen-meta` patch 2; index
+    operand is a free typevar (idx lane count/width relation to the
+    data vector is enforced by the concrete-type lowering rules).
+    Dword forms: `vpermd`/`vpermps` Y (avx2), X/Z (avx512f, +vl at
+    128); qword reg-index permutes are EVEX-only: `vpermq`/`vpermpd`
+    X/H/Z (avx512f, +vl at 128/256). `vswizzle2` X/H/Z `vpermt2d`/
+    `vpermt2q`/`vpermt2ps`/`vpermt2pd` (avx512f, +vl at 128/256).
+
+30. x64 VSIB gather/scatter (new CLIF opcodes `vgather`/`vscatter`;
+    definitions in cranelift-codegen-meta patch 3, parser arm in
+    vendored cranelift-reader, interpreter arms in
+    vendor/cranelift-interpreter). `src/isa/x64/lower.isle`: VEX
+    `vpgatherdd/dq/qq/qd` + `vgatherdps/dpd/qpd` at 128/256 (avx2)
+    fed a fresh all-ones mask (`vpcmpeqb`); EVEX `vpgather*`/
+    `vgather*` at 256/512 (avx512f) unmasked. `vscatter` is
+    EVEX-only (`vpscatterdd`/`vscatterdps`/`vpscatterqd`/
+    `vpscatterdq`/`vscatterqps`/`vscatterqpd`/`vscatterqpd` H/Z;
+    avx512f, +avx512vl for ymm-index). `src/verifier/mod.rs` +
+    `src/write.rs`: `Scatter` instruction-data arms. Trap to note:
+    the generated operand collector ties a `rw` write to use-index
+    0 (`read_write_xmm`), so the VEX gather's mask operand must be
+    declared first; the dst result comes out as `value_regs_get`
+    index 1.
+
+31. Wide vector emit support for load/store + sized type extractors:
+    `src/prelude.isle`/`src/isle_prelude.rs` add `ty_vec256`/`ty_vec512`
+    extern extractors (`ty_bits_u64` is a converter — it cannot appear
+    in rule patterns). `src/isa/x64/lower.isle`: generic `load`/`store`
+    rules for all 256-bit types at pri 5 → `x64_vmovups_ya`/`_yb_mem`
+    (avx2), all 512-bit types at pri 7 → `x64_vmovups_za`/`_zb_mem`
+    (avx512f); pri 7 keeps them disjoint from the pri-4 128-bit
+    concrete-type rules (same-priority rules with disjoint extractors
+    still collide in this ISLE).
+
+32. x64 wide-vector register-class gate (`src/isa/x64/inst/mod.rs`):
+    `rc_for_type` now rejects a vector type wider than
+    `WIDE_VECTOR_BITS` with `CodegenError::Unsupported`. Previously a
+    >128-bit value reaching codegen with the atomic at its 128 default
+    compiled "successfully": the ISLE wide rules emit ymm/zmm ops at the
+    operand's full width, but the vreg's Float class stayed xmm-canonical,
+    so class moves (`gen_move`) and spill slots kept only the low 128
+    bits — a silent low-lane-only miscompile for `bnot`/`bitselect`/
+    `band`/`bor`/`bxor` et al. Now the unsupported combination fails at
+    vreg allocation like any other unexpected SSA type. `src/lib.rs`
+    raises the ceiling in step with `X64_WIDE_VECTOR_BITS` when the
+    target has AVX2/AVX512F, so real compiles are unaffected; the gate
+    catches stray users that emit wide CLIF without the flag (test
+    harnesses, the `clif-check` replayer, or an out-of-sync mirror).
+    Regression test: `pliron-clif-opt/tests/widevec_gate.rs` asserts the
+    loud error at ceiling 128 and (on non-x86 hosts, where no wide ISA
+    exists) that wide `bnot`/`bitselect` never compile silently.
+
+33. aarch64 dead extension after `cset` (`src/isa/aarch64/lower.isle`):
+    `uextend`/`sextend` of an `icmp`/`fcmp` result is a no-op — the
+    `cset`/`fcset` materialization already writes a clean full-width 0/1.
+    New rules return `put_in_reg` of the compare instead of emitting
+    `MInst.Extend`. Visible as `cset; uxtb` pairs on every
+    bool-as-integer idiom (`(x == y) as i64`, `select c, 1, 0`).
+
+34. DFG alias epoch + write list (`src/ir/dfg.rs`): `alias_epoch`
+    counter bumped on every alias write (`change_to_alias`,
+    `replace_with_aliases`, `make_value_alias_for_serialization`);
+    tombstone writes and same-root retargets (`compact_aliases`,
+    `resolve_all_aliases`) don't bump since they create no new
+    resolvable pairs. `alias_dirty` records each write's `dest` in
+    order (duplicates kept), so `carry_aliases` scans only the
+    watermark backlog and `compact_aliases` walks writes instead of
+    the whole `values` table — the epoch early-out and
+    whole-`values()` scans were ~1.5% of bench pipeline time and the
+    backlog scan was ~2% of regex-syntax phaseB CPU.
+
+35. `imul.i8x16` x64 lowering (`src/isa/x64/lower.isle`, `inst.isle`,
+    `lower/isle.rs`): upstream leaves i8x16 multiplication unimplemented
+    (no `pmullb` exists). Lowered as even/odd byte split — `pand`/`psrlw`
+    into 16-bit lanes, `pmullw`, keep each product's low byte with a
+    pooled 0x00FF mask (`mask_00ff`), weave back with `psllw`+`por`.
+    Wider i8 lanes (i8x32/i8x64) still unsupported — no VEX/EVEX
+    `vpmullw` forms exist yet.
+
+36. aarch64 narrow-int compare/extend lowering (`src/isa/aarch64/inst.isle`,
+    `src/isa/aarch64/lower.isle`, `src/isa/aarch64/lower/isle.rs`):
+
+    - `imul_pow2p1_shamt`/`imul_pow2m1_shamt` externs + rules: `imul x, 2^n+1`
+      lowers to `add x, x, lsl #n`; `imul x, 2^n-1` to `lsl` + `sub`. Kills
+      the `movz` constant materialization and `madd`'s 3-cycle latency.
+    - `val_already_extended`: partial bool oracle answering "does this
+      value's register already hold the `ArgumentExtension`-extended form".
+      Covers 32/64-bit values, `uextend`/`sextend`, `icmp`/`fcmp` (cset
+      writes full-width 0/1), `uload8`/`uload16`/`sload8`/`sload16`,
+      narrow-typed `load` (`ldrb`/`ldrh` zero-extend — `Uext`-clean),
+      narrow `ireduce` (see below), and narrow `black_box`. NB: `(if (oracle))` in this ISLE only tests
+      that the partial call returned `Some` — a `Some(false)` result still
+      passes. Guards that need the bool value must use `if-let true` /
+      `if-let false`.
+    - `emit_icmp_narrow` + `put_in_reg_ext32_maybe`: for i8/i16 compares,
+      when `rm` is clean and `rn` is dirty, swap operands (and `intcc_swap
+      _args` the cond) so the dirty operand rides `cmp`'s fused extend slot
+      and no standalone `uxtb`/`sxtb` is emitted; the imm-compare path also
+      elides a redundant ext on a clean operand. Bumps the string-compare
+      kernels; LLVM gets the same operand cleanliness for free via `ldrb`
+      /`ldrh` black-box traffic.
+    - `lower (ireduce (fits_in_16 ..))` now materializes `uxtb`/`uxth`
+      instead of the wide passthrough, producing the clean narrow regs the
+      oracle advertises.
+    - `lower (black_box i8/i16)` emits `uxtb`/`uxth` when the operand's
+      high bits are dirty (oracle says not clean); clean inputs still pass
+      through with no inst.
+
+37. aarch64 `CSInc` MInst + adjacent/zero const select lowering
+    (`src/isa/aarch64/inst.isle`, `src/isa/aarch64/inst/emit.rs`,
+    `src/isa/aarch64/inst/mod.rs`):
+
+    - New `MInst.CSInc { rd, cond, rn, rm }` — the `(op,o2)=(0,1)` csel-family
+      encoding (`csinc rd, rn, rm, cc` = `rn` if cc else `rm + 1`), with emit,
+      reg-collect, and display arms, and a `csinc` ISLE helper.
+    - `lower_select_cond` rules: `select c, K+1, K` /
+      `select c, K, K+1` lower to one `csinc` off the shared materialized
+      base register (LLVM's `cinc` idiom) instead of two movs + `csel`;
+      `select c, 1, 0` / `select c, 0, 1` use `xzr` as the base so they
+      stay a single inst like `cset`; `select c, t, 0` / `select c, 0, e`
+      use `xzr` for the zero arm, dropping a `mov w_, 0` per select.
+      Priorities are staggered (adjacent 5/6 < zero-arm 7/8 < 0/1 9) so the
+      more-specific const pairs win; `u64_gt 0` keeps the adjacent rules off
+      the zero shapes.
+
+38. Egraph remat: no `iconst` marking, no remat into deeper loops
+    (`src/opts/remat.isle`, `src/egraph/elaborate.rs`):
+
+    - `remat.isle` no longer marks `iconst` (the `imm64_remat_cheap`
+      rule is gone). The elaborator clones a marked def into every
+      use block, so a deduped constant (e.g. `iconst 10` feeding a
+      digit-parse `imul`/`icmp` chain inside a loop) became a `movz`
+      per use block per iteration — strictly more dynamic work than
+      keeping the vreg live; under real pressure regalloc spills
+      either way. op-with-imm remat stays: it re-executes the op but
+      folds the immediate into the encoding.
+    - `maybe_remat_arg` takes `&LoopAnalysis` and refuses to remat
+      when `insert_block` sits in a deeper loop than the arg's block
+      — that trades the def's single execution for per-iteration
+      work, which even a one-inst materialization loses.
+
+39. aarch64 i128 add/sub with provably-zero high half rides `xzr`
+    (`src/isa/aarch64/lower.isle`):
+
+    `iadd.i128`/`isub.i128` against `uextend` or `iconcat .., iconst 0`
+    now lower the high half to `zero_reg` (`adc`/`sbc`/`ngc` with `xzr`)
+    instead of materializing `mov xN, #0` per use. Priority 40/41 keeps
+    them above the generic i64-pair rules; zero-hi-right outranks
+    zero-hi-left so both-extended inputs resolve deterministically.
+
+    The `uextend` variants take the operand via `put_in_reg_zext64`, not
+    `put_in_reg`: narrow values live in X registers whose bits above the
+    value width are garbage (a 32-bit `lsl`/`eor` leaves them set), so
+    the raw register is not the zero-extension the `uextend` promised
+    (rustlantis seed 24 miscompiled `-65535` as `-5439487`).
+
+40. `#[inline]` on hot DFG/Layout readers (`src/ir/dfg.rs`,
+    `src/ir/layout.rs`): dev-profile builds have no LTO, so every
+    `value_def`/`resolve_aliases`/`inst_args`/`Insts::next` call from
+    pliron-clif-opt was a real cross-crate function call.
+    `ValueData::from` alone measured ~6% leaf samples in the opt
+    pipeline. Annotated the small leaf readers + the two `ValueData`
+    packed-conversion `From` impls + `Values`/`Blocks`/`Insts`
+    iterator `next`/`next_back`. No behavior change.
+
+41. Fused resolve+def accessors (`src/ir/dfg.rs`):
+    `resolved_value_def`, `try_resolved_value_def`, `resolve_and_def`,
+    all built on `resolve_to_data` — the alias walk hands back the
+    resolved entry's decoded `ValueData`, so the ubiquitous
+    `value_def(resolve_aliases(v))` pattern costs one map hit + one
+    decode instead of two. ~95 opt-crate call sites converted.
+    Panic/Option semantics identical to the unfused pair.
+
+42. More `#[inline]` on hot cross-crate readers (`src/ir/dfg.rs`,
+    `src/ir/instructions.rs`, `src/ir/types.rs`, `src/ir/function.rs`):
+    `Insts`/`Blocks` `Index`/`IndexMut`, free `maybe_resolve_aliases`/
+    `resolve_aliases`, `BlockCall::block`, `BlockArg::decode_from_value`,
+    `branch_destination`/`_mut`, `Type::index`/`from_repr`,
+    `Function` `Deref`/`DerefMut`. A fresh profile of
+    `cargo rustc -p pliron-clif-opt` through the backend put these at
+    ~11k/233k leaf samples combined. Same no-LTO rationale as #40.
+
+43. `#[inline]` on generated `InstructionData` methods
+    (`cranelift-codegen-meta/src/gen_inst.rs`): `opcode`, `arguments`,
+    `arguments_mut`, `typevar_operand` — the generated code is all
+    non-generic, so every `inst.opcode()`/arg read from the opt crates
+    was an outlined call.
+
+44. aarch64 packed-f16 support (`src/isa/aarch64/lower.isle`,
+    `inst.isle`, `inst/emit.rs`, `inst/mod.rs`): NEON fp16 is universal
+    on Apple Silicon but upstream had no lowering for it. Adds scalar
+    `fpromote.f32`/`fdemote.f16` (`fcvt s,h`/`fcvt h,s` via new
+    `FPUOp1::Cvt16To32`/`Cvt32To16`), fp16 three-same encodings for
+    `VecALUOp` fadd/fsub/fmul/fdiv/fmax/fmin and `VecALUModOp`
+    fmla/fmls on `f16xN`, `FpuMoveFromVec` Size16 (`dup h, v.h[i]`),
+    an `fcvtn2` ISLE helper, and rules for the vendored packed-half
+    casts (`fvpromote_f16`/`_lo`/`_hi` -> `fcvtl`/`fcvtl2`,
+    `fvdemote_f16_pair` -> `fcvtn` + `fcvtn2`). Used by the pliron
+    lowerer's CubeCL path when `types::NATIVE_F16`/`F16C` are set.
+
+45. Exact `size_hint` on the layout iterators (`src/ir/layout.rs`):
+    `BlockNode` gains a per-block inst `count` and `Layout` gains a
+    `num_blocks` counter (maintained in append/insert/remove/split),
+    feeding `Blocks`/`Insts` `size_hint`/`ExactSizeIterator`. Passes
+    that snapshot `layout.block_insts(b).collect()`/`blocks().collect()`
+    were hitting `spec_from_iter_nested` growth — a ~1% leaf —
+    because the linked-list iterators reported `(0, None)`. The serde
+    round-trip rebuilds counts through the public insert path.
+
+46. `LoopAnalysis::is_in_loop` O(1) (`src/loop_analysis.rs`): `compute`
+    now also assigns each loop an Euler-tour interval `[tin, tout)` over
+    the loop forest (`assign_loop_intervals`); `is_in_loop` tests
+    `tin[lp] <= tin[innermost(block)] < tout[lp]` instead of finger-
+    walking the parent chain. The opt pipeline calls it per
+    (loop, block) pair inside `layout.blocks()` filters — O(loops ×
+    blocks × depth) per pass — ~40k/2.65M leaf samples in the rustc
+    profile.
+
+47. Seedable `cfg`/`domtree` in `Context::optimize` (`src/context.rs`):
+    the initial `compute_cfg`/`compute_domtree` pair is now guarded by
+    `is_valid()` — the pliron pipeline moves its own exact analyses
+    (built by `Analysis` on the final IR) into the context before
+    `compile`, so emit no longer rebuilds them per function. Paths
+    that mutate the function after seeding (the narrow-vector
+    `veclegalize` retry in pliron-clif-lower) must `clear()` both.
+
+48. Sub-128-bit vector ops in wide xmm regs (`src/isa/x64/lower.isle`):
+    an F32X2/F16X4 value lives in the low 64 bits of an xmm and only its
+    real lanes are observable, so the packed 128-bit op is used and the
+    high lanes carry unobservable garbage. Adds F32X2
+    fadd/fsub/fmul/fdiv/fsqrt/fneg/fabs/fmin/fmax rules, an `x64_round`
+    F32X2 arm (ceil/floor/nearest/trunc), F32X2 arms on all eight
+    vfmadd/vfnmadd/vfmsub/vfnmsub 213/132 decls (fma.f32x2 arrives via
+    the type-polymorphic fmadd rules), f32x2 pshufd extractlane +
+    f32x4_insertlane reuse, xmm `fvpromote_f16`/`fvdemote_f16` arms for
+    <4 x f16> <-> <4 x f32> (F16C), f16x4 pshuflw/pinsrw lane ops, and
+    F16X4 vaddph-family arms for AVX512-FP16 hosts. Lets
+    pliron-clif-lower's `simd_leaves` admit these 64-bit leaves; the
+    fmin/fmax helpers copy the F32X4 NaN-safe sequences verbatim.
+
+49. Per-function wide-xmm gating (`src/machinst/abi.rs`,
+    `src/isa/x64/abi.rs`): `Callee` records `has_wide_vector` (any CLIF
+    value whose vector type is >256 bits) computed in `new` from
+    `f.dfg.values()`, and `machine_env()` calls a new defaulted
+    `ABIMachineSpec::get_machine_env_for(has_wide, flags, call_conv)`.
+    On x64 it forces the hi=false env for functions with no >256-bit
+    values: when `wide_vector_bits() >= 512` offered all 32 zmm regs to
+    every function, regalloc parked narrow (<=256-bit) vregs in
+    zmm16-31 under pressure — those functions never need the regs for
+    their own ops — and the parked values read back corrupted
+    (observed: lanes 12-15 of each 64-byte region returned the
+    slot's chunk-0 bytes). Functions that actually manipulate 512-bit
+    data keep the wide env, so zmm codegen stays profitable where it
+    is used. The `high_xmm_regs()`/`WIDE_VECTOR_BITS` knobs are
+    unchanged — they cap the maximum, this patch gates it per fn.
+
+50. `src/machinst/blockorder.rs`: the chained-order successor pick prefers
+    a block that is itself a loop latch (its terminator reaches back to a
+    dominator — `is_latch`) over a non-latch of the same rank; in-count
+    breaks remaining ties as before. Placing the latch right after the
+    loop head puts the hot continuation on the not-taken edge of the
+    head's `brif`, so each iteration pays only the latch's own back-edge
+    branch instead of an extra taken branch to reach the arm block
+    (LLVM's latch-before-head shape; ~25% on a per-element
+    `filter().count()` loop). `PLIRON_BCHAIN_DEBUG` prints pick
+    decisions.
+
+51. OnceLock-cached `PLIRON_*` env reads (`src/context.rs`,
+    `src/machinst/{vcode,lower,compile,abi,blockorder}.rs`,
+    `src/isa/aarch64/lower.rs`, `src/isa/x64/abi.rs`): debug/gate
+    env vars that were re-read via `std::env::var{,_os}` per inst,
+    per block, or per function are now read once into `OnceLock`
+    statics (`PLIRON_POSTIDX_DEBUG`, `PLIRON_COMPILE_EGRAPH`,
+    `PLIRON_POSTOPT`, `PLIRON_LUDEBUG`, `PLIRON_REMATSINK_DEBUG`,
+    `PLIRON_STATS`, `PLIRON_PRECOMPILE`, `PLIRON_ALIGN`,
+    `PLIRON_LOWER_DEBUG`, `PLIRON_FN_DUMP`, `PLIRON_FP_FNS`,
+    `PLIRON_FP_RANGE`, `PLIRON_PREVCODE`, `PLIRON_RA2_VERBOSE`,
+    `PLIRON_RA2_EDITS`, `PLIRON_BCHAIN_DEBUG`, `PLIRON_NO_FREE_RBP`,
+    `PLIRON_HI_ALWAYS`). `std::env::var` takes the process env lock
+    per call — a backend-codegen profile showed ~11% of samples in
+    `getenv`/lock waits even after the workspace-side reads were
+    cached.
+
+52. Conditional domtree recompute after the egraph (`src/context.rs`,
+    `src/egraph/mod.rs`): `EgraphPass::run` now returns
+    `remove_pure_and_optimize`'s `cfg_maybe_changed`. The pass already
+    recomputes `cfg` itself when it rewrites a terminator and
+    `eliminate_unreachable_code` maintains it through block removal, so
+    `Context::egraph_pass` no longer recomputes `cfg` unconditionally
+    and recomputes `domtree` only when edges actually moved — about
+    1.4s of analysis rebuilds per bench build was unconditional.
+
+53. Flat CSR `ControlFlowGraph` (`src/flowgraph.rs`): the per-block
+    `bforest::Map`/`Set` edge storage is replaced by packed arrays
+    (`edges` + `succ_off`/`succs` + `pred_off`/`preds`) built by two
+    sort+dedupe passes. Iteration order is unchanged — successors in
+    block order, predecessors in branch-inst order. `compute`/`clear`
+    retain Vec capacity, so the tens of CFG rebuilds per function in
+    pliron's pipeline stop regrowing bforest node pools (the single
+    largest allocator leaf in the pipeline profile, ~3.5% of samples
+    via `visit_block_succs`/`add_edge`). `recompute_block` patches the
+    edge list and rebuilds (still O(E); nothing calls it hot).
+
+54. `ControlFlowGraph::build` counting-sorts (`src/flowgraph.rs`): the
+    two whole-edge-list `sort_unstable` calls (by `(from, inst, to)`
+    then `(to, inst)`) are replaced by O(E + B) counting scatters keyed
+    on block index — histogram + prefix-sum offsets + scatter into
+    `scratch`/`edges`, then per-block segment sorts by `(inst, to)` /
+    `inst` (a block names at most a handful of destinations, so these
+    stay tiny). Output order is unchanged; `edges` still ends grouped
+    by destination. CFG build time on the corpus roughly halved.
+
+55. Multi-use `iadd` amode sharing (`src/isa/aarch64/inst.isle`,
+    `src/isa/aarch64/lower/isle.rs`, `src/prelude_lower.isle`,
+    `src/machinst/isle.rs`, `src/machinst/lower.rs`): new amode rules
+    keep a multi-use `iadd` load/store base whole (`UnsignedOffset` /
+    `Unscaled` on its own register) instead of decomposing it into a
+    reg+reg amode — the sum is materialized for its other uses anyway,
+    so decomposing only kept the operands' registers live as well and
+    emitted a redundant address computation per load. Enables the
+    generic reg+imm path (and `ldp`/`stp` pairing) for shared
+    `base + index` addresses. `PLIRON_AMODESHARE=1` enables
+    (`Lower.value_has_multiple_uses` is exposed to ISLE for the guard;
+    the gate lives in `amode_share_ok` on the aarch64 isle context).
+
+56. Liveness- and pressure-aware amode sharing gate
+    (`src/machinst/lower.rs`, `src/isa/aarch64/lower/isle.rs`): the
+    multi-use-`iadd` amode rules from #55 now require
+    `Lower::amode_shareable` — share when the sum is genuinely needed
+    as a value (a use that cannot fold into an addressing mode;
+    `compute_use_states` builds `value_non_amode_use` in the same
+    inst scan, `arg_is_mem_addr` identifies the address arg of plain
+    loads/stores), or when the all-address fanout is ≤3 AND the
+    block's live-in count is ≤ `PLIRON_AMODESHARE_PRESS` (default 5).
+    The pressure proxy counts cross-block arg uses per block and
+    rolls the max up per value (`value_max_pressure`) — a kept base
+    would hold a register across those blocks, and measured
+    regressions (sortw +5%, hashmap +2.6% unbounded) live in
+    high-pressure blocks while the win (sieve −5.5%) lives in
+    low-pressure ones. Default on (PRESS=5): paired medians give
+    sieve −5.5% / parse_only −3% wins with sortw/hashmap hot fns
+    byte-identical to OFF; `PLIRON_AMODESHARE=0` disables.
+    Extension: a multi-use `iadd` whose operand is an `imul` result is
+    always shareable, regardless of the pressure cap — decomposing it
+    pays a fresh `mul` per access, while keeping it whole lowers to a
+    single `madd` shared by every use (the Brotli
+    `HqZopfliBackwardReferences` node-walk paid a `mul` plus a base
+    reload per store). The pressure cap still applies to plain
+    `iadd reg, reg` sums.
+57. `DominatorTree::try_dominates` is false across blocks unless both
+    are reachable in the tree (`src/dominator_tree.rs`). Unreachable
+    and newer-than-the-tree blocks keep default preorder numbers, and
+    `block_dominates` answered yes for any two of them: a dead loop's
+    latch def "dominated" its header, `remove_trivial_params` aliased
+    the header param to `iadd param, 16`, and the def cycle hung
+    `clifpeep::lin_flat` (rustc UI `test-case-on-use-item-129765.rs`
+    with `--test`). Callers only lose transforms on dead code.
+58. `iconst_bounds` reports a bad controlling type instead of
+    `unreachable!()` (`src/verifier/mod.rs`): upstream assumes every
+    `iconst` is i8..i64 and panics on anything else, which aborted the
+    per-step verifier before it could name the pass that emitted the
+    bad inst (rustlantis seeds 65/89 — `iconst.i128` out of lcse/bandk).
+59. `DataFlowGraph::resolve_all_aliases` moves value labels from an alias
+    onto the value it resolves to instead of dropping them
+    (`src/ir/dfg.rs`). Our CLIF passes replace values by aliasing them, so
+    upstream's rule lost most variables' labels (`-g` at `-O`, see
+    `pliron-clif-lower/src/dwarf.rs`). Labels never affect code.
+60. `VCode::extend_debug_locations` (`src/machinst/vcode.rs`): value-label
+    ranges continue past the end of the vreg's liveness until the location
+    is overwritten (a def, a call clobber or a regalloc move into it), the
+    label's next assignment, or the block end; a block whose predecessors
+    all precede it in layout starts with the locations they agree on.
+    LLVM's LiveDebugValues, roughly: a dead value's register still holds
+    it. Debug info only. `PLIRON_DBGEXT=0` restores upstream ranges.
+61. Cold-arg rebind copy (`src/isa/aarch64/lower.isle`
+    `iadd_coldcopy_*`, `umulhi_zero`, `src/isa/aarch64/inst/emit.rs`):
+    `iadd x, (umulhi 0, 1)` lowers to a 64-bit `Inst::Mov` into a fresh
+    vreg, a bare `umulhi 0, 1` to `mov #0`, and emitting a 64-bit `Mov`
+    with `rd == rm` writes no bytes. pliron's
+    `coldargs` emits that form under `PLIRON_COLDCOPY=1`, replacing the
+    `umulh` + `add` per cold call arg with a `mov` that regalloc often
+    makes a self-move.
+
+62. aarch64 clean narrow ints (`PLIRON_NARROWEXT`, default on, `=0` off;
+    `src/isa/aarch64/{inst.isle,lower.isle,lower.rs,lower/isle.rs}`,
+    `src/machinst/{lower.rs,isle.rs,abi.rs}`). `narrow_uext_clean` (Rust,
+    budget 16) extends the `val_already_extended` oracle (patch 36) to
+    canonical narrow `iconst`s, `band` with one clean operand, and
+    `bor`/`bxor` of two clean operands (all exact 32-bit `and`/`orr`/`eor`;
+    the `bic`/`orn`/`eon` forms need a `bnot` operand, never clean), plus
+    blockparams whose every incoming blockcall arg is clean
+    (`build_clean_blockparams` — a per-function greatest-fixpoint sweep,
+    memoized in `Lower::narrow_clean_params`, sound coinductively so
+    loop-carried `y = phi(clean, band(y, k))` phis qualify) and call
+    results whose signature return slot declares `uext`. Users:
+    - `Lower::gen_return` asks the new `LowerBackend::narrow_ret_uext_clean`
+      for each i8/i16 `uext` return and passes `skip_uext` to
+      `gen_copy_regs_to_retval`, dropping the ABI `uxtb`/`uxth` (309 of
+      381 on regex-syntax were after `and #k`, `mov #k` or `cset`);
+    - `uextend_clean` (priority -2; the general `uextend` rule moved to -3):
+      `uextend` of a clean narrow value is a passthrough;
+    - `is_nonzero` rule 4: a clean i8/i16 tests with `cbnz w` instead of
+      `tst #0xff` / `uxth`;
+    - `is_nonzero` rules 5/6 (`narrowext_tst_mask`): a single-use narrow
+      `ireduce` or `band (ireduce y), k` tests the unmasked source —
+      `tst y, #W-1` / `tst y, #k&W-1` — instead of materialising the
+      value's `uxtb`/`uxth`/`and` (LLVM's `tst w, #0xff` shape). `y` goes
+      in via `lo_reg`, not `put_in_reg`: an `ireduce.i8 (i128)` source is
+      a register pair and only its low half is ever tested (rustlantis
+      seed 21920, fixed 2026-11-11);
+    - `band_ireduce_imm` (priority 30): `band (ireduce x) k`, canonical `k`,
+      masks `x`'s register directly, so the `ireduce`'s `uxtb` (patch 36)
+      is not materialized. `x` goes in as a plain register (`alu_rr_imm_logic`
+      / `alu_rrr`): through `alu_rs_imm_logic_commutative` an `ishl.i64 y, 34`
+      defining `x` folded into `and w, w, w, lsl #2`, its amount masked by the
+      narrow type (rustlantis seed 12309, fixed 2026-10-27).
+    - call args: `Lower::gen_call_args`/`gen_return_call_args` take a
+      `skip_uext` bitset (`call_arg_uext_skips` maps the call's narrow
+      operands through `value_regs` and asks the new
+      `LowerBackend::narrow_arg_uext_clean`); `ABIMachineSpec::
+      gen_call_args` then takes a clean i8/i16 `uext` register slot's
+      source reg as-is, dropping the `uxtb`/`uxth` before the call
+      (172 of 1447 on regex-syntax; stack slots still widen);
+    - narrow compare of `isub`/`iadd`-by-constant against a constant
+      (`narrow_addsub_cmp` + `emit_icmp_addsub_k`, `emit_icmp` rules
+      10/11): for eq/ne the constant is rolled (`(c∓j) mod W == k` is
+      `c == (k±j) mod W` — one `cmp` on `c`, the arithmetic goes dead);
+      for the unsigned relations the unmasked 32-bit `sub c, j` (the
+      `iadd` j ≥ W/2 form rewritten to `sub c, W-j`) orders identically
+      to the masked result against `k` whenever the bound `j + k' ≤ W`
+      (`Sub`) or `k' ≤ j` (`Rewrite`) holds, so the operand's
+      `uxtb`/`uxth` is never materialized. `put_in_reg_uext_narrow_maybe`
+      still widens a dirty operand before the sub/cmp — the bounds are
+      checked against `c & mask` either way (886 uxtb/uxth and 1510
+      insns off rust-html-rewriter's benchmark, -6144 B __text).
+    `PLIRON_NARROWEXT_MASK=<bits>` (default all) keeps only some users live,
+    for bisecting: 1 extra facts, 2 return, 4 `uextend`, 8 `cbnz`, 16 `band`,
+    32 narrow `ushr`-of-clean (a narrow `lsr` result is always canonical)
+    plus `bor`/`band`/`bxor` with a constant `ushr` operand folding to
+    `orr`/`and`/`eor ..., lsr #k` when the shifted value is clean,
+    64 `ireduce` passthrough when `wide_uext_clean` proves the wide
+    source already zero above the destination width (small-const `select`
+    arms, narrower `uextend`s, masked `band`s, top-byte `ushr`s),
+    128 `ireduce` source fusions (`ireduce (ushr x, k)` → one `ubfm`,
+    `ireduce` of a single-use `load` → narrow `uload`, byte/halfword
+    `store`/`istore8`/`istore16` of an `ireduce` stores the wide
+    register), 256 `ireduce` consumer sinks: `ushr` of a narrow `ireduce`
+    by a constant → `ubfx` on the wide register, `ireduce (ireduce x)`
+    extends once, and `select` arms that are `ireduce`s read the wide
+    source directly (the low bits are exact and a `select` result is
+    modelled dirty anyway), 512 call-arg `uext` skip, 1024 narrow
+    `iadd`/`isub`-by-const `icmp`-vs-const fusions and the same fold on
+    a `br_table` bounds check (`uextend (iadd c, -s)` index →
+    `sub c, s; cmp c-s, N` when `s + N <= W`), 2048 blockparam and
+    `uext`-declared call-result cleanliness (the oracle extensions
+    above; −315 uxtb/uxth and −2112 B `__text` on rust-html-rewriter's
+    benchmark). A dirty-source
+    passthrough variant of 256 was tried and reverted: it converted one
+    shared `uxtb` into one extension/test per fusing use and grew
+    regex-syntax `.text`.
+
+63. Shared `br_table` split-edge blocks (`PLIRON_EDGEDEDUP`, default on,
+    `=0` off; `src/machinst/blockorder.rs`, `src/machinst/lower.rs`). Table
+    entries passing the same block call (target and args) map to one
+    `CriticalEdge` lowered block instead of one identical `mov*; b` block
+    each. `lower_branch_blockparam_args` skips the repeated successor so
+    regalloc2 sees each CFG edge once (a repeat would read as a critical
+    edge); repeated successors carry no args. The jump table itself keeps
+    one entry per case, now pointing at the shared label.
+
+66. Edge-block tail merging, `PLIRON_EDGEMERGE=1|2` (default mode `1`,
+    `=0` off; `src/machinst/vcode.rs` `emit` and `edge_merge_key`, plus
+    `MachBuffer::alias_label` in `src/machinst/buffer.rs`). Before
+    emission, every block that is only regalloc edits (moves, spills,
+    reloads) and an operand-less jump is keyed by (edits, successor,
+    indirect-target flag). The first block in emission order with a key is
+    emitted. A later block with the same key (a dup) is not emitted, and
+    its label becomes an alias of the first copy's label. Predecessor
+    branches and jump-table entries resolve through the alias, and
+    MachBuffer folds `b.c L; b dup; L:` into `b.!c canon`. With `=1`, a
+    hot dup is kept when its predecessor is the block emitted just before
+    it (the dup is that block's fallthrough) or when its successor comes
+    next: merging it would add a taken branch on that path (+9% on
+    `tokenize`). `=2` merges every dup. The entry block and loop heads are
+    never merged. Merging is off under `machine_code_cfg_info`, which
+    needs every block's start offset. Under `-g` merging stays on: the
+    jump of a dropped block has no offset, like a cold-block inst, so `-g`
+    changes no code. On regex-syntax, `=1` removes 1,291 `b`s and 14.7 KB
+    of `__text`, and `=2` removes 1,716 `b`s and 20.4 KB
+    (docs/history/2026-10-27-branches.md).
+67. Shared epilogue, `PLIRON_EPIMERGE=1|2` (default mode `2`, `=0` off;
+    `src/machinst/vcode.rs`). The first `return` that merges binds a label
+    in front of its epilogue. Each later merging `return` jumps to that
+    label in place of its own copy. `=2` merges every epilogue of 2 or more
+    insts — the `ldp x29, x30, [sp], #N; ret` form included (−453 `ret`s,
+    −1,728 B `__text` on rust-html-rewriter's benchmark). `=1` merges an
+    epilogue of 5 or more insts, or any epilogue in a cold block: `fib`'s
+    3-inst base-case return is hot (+8% when merged). Frameless `ret`
+    stays inline, and return calls are not changed.
+68. Eager bare-jump label aliasing, `PLIRON_BJALIAS` (default `1`,
+    `=0` off;
+    `src/machinst/vcode.rs` `emit`). A block that is a single
+    operand-less `b label` with no regalloc edits emits nothing:
+    `MachBuffer` aliases its label to the target — but only lazily, once
+    the block's `b` reaches the buffer tail. Forward branches to the
+    block have by then left the branch-purgatory window, so a `b` to a
+    bare-jump block whose true target lands on the next instruction
+    survives as a dead `b .+4` (rust-html-rewriter carried 616 of them).
+    With `=1`, emission computes the bare-jump blocks up front, resolves
+    chains of them to the final non-bare successor (cycles — `b .` and
+    mutual loops — keep their code), aliases their labels, and skips
+    their emission like an edge-merged dup. Every branch to such a block
+    then resolves to the real target while it can still fold at the
+    tail: 616 dead `b`s drop to 7 (−1,024 insns, −1,130 `b`s on
+    rust-html-rewriter). The entry block, `noret_dead` blocks (which
+    bind a label without code), and `machine_code_cfg_info` compiles are
+    excluded. The remaining dead `b`s are odd landing-pad/edge pairs.
+
+Fix: `iadd_ushr_right`/`iadd_ushr_left` (the add-with-`lsr` folds from
+a47132a) matched any scalar width up to 64 bits. An i8/i16 operand's
+register has unspecified bits above its width, which `lsr #k` shifts into
+the sum; plain `ushr` lowering zero-extends first. They now require
+`ty_32_or_64`, like the `band`/`bxor` shifted-operand rules (fuzz seeds
+1939 and 3441; tests/narrowlsr).
+
+- `src/machinst/abi.rs`: `pliron_last_frame()` returns the frame breakdown
+  (stack slots, spill slots, clobber saves, outgoing args) of the last
+  function the thread compiled, for `PLIRON_FRAME_INFO`. Debug aid only.
+- `src/opts/remat.isle` (+ `pliron_remat_saddr` in `prelude_opt.isle` and
+  `opts.rs`): rematerializes `stack_addr` per use (default on since
+  2026-10-27; `PLIRON_REMAT_SADDR=0` turns it off)
+  block, as LLVM's RA does for frame indices, instead of keeping one
+  GVN'd frame address live across calls.
+- `PLIRON_REMATCALL` (default on since 2026-10-27, `=0` turns it off; `src/egraph/elaborate.rs`,
+  `src/opts/remat.isle`, `pliron_remat_call` in `prelude_opt.isle` and
+  `opts.rs`; `egraph::elaborate` made `pub(crate)` for the switch): marks
+  one-instruction `iconst`s (`imm64_remat_cheap`) for remat again, and the
+  elaborator's two loop rules in `maybe_remat_arg` (never into a deeper
+  loop, never into another block of the def's loop) give way when the
+  use block's innermost loop contains a call (`Elaborator::call_loops`,
+  one pass over the blocks). A constant hoisted above such a loop
+  otherwise lives across its calls in a callee-saved register or a spill
+  slot: regex-syntax reloaded spilled 0/1/-1/element sizes 778 times (with
+  `PLIRON_COLDCOPY=1`; 1,319 without).
+  Call-free hot loops keep the old rules. docs/history/2026-10-27-spills.md.
+- `PLIRON_REMATLOOP` (default off since 2026-10-28, `=1` restores; same
+  `maybe_remat_arg`): rematerializing into another block of the def's own
+  loop. Default-off avoids a second per-trip copy of e.g. `byte - '0'`
+  past the digit test (parse_only); sieve layout-checked
+  (docs/history/2026-10-27-slow-kernels.md).
+
+64. Deferred narrow jump tables (`PLIRON_JT_NARROW`, default on since
+    2026-10-28, `=0` off; docs/history/2026-10-27-jump-tables.md).
+    `src/machinst/buffer.rs`:
+    `MachDeferredJumpTable` records, `can_defer_jump_table`,
+    `defer_jump_table`, and `emit_deferred_jump_tables`, which `finish`
+    runs after the last island — every label is bound and nothing can move
+    — to write each table at the end of the function with 1-, 2- or 4-byte
+    unsigned entries `(target - lowest target) / unit`, the narrowest that
+    fits, then patch the dispatch's table address, base address and entry
+    load. Labels go through `resolve_label_offset`, so aliased (jump-only)
+    targets resolve to their final block. `src/machinst/vcode.rs`: per
+    block in emission order, a sound bound on everything still to come
+    (every inst and regalloc edit at worst-case size plus a veneer,
+    constant re-emission and island jump; epilogues; 4 bytes per CFG edge;
+    padding), so deferral happens only where both placeholders provably
+    stay in pc-relative range; otherwise the stock inline table is used.
+    `isa/aarch64/inst/emit.rs` (`JTSequence`): `adr; ldr{b,h,} [uxtw];
+    adr; add lsl #2; br`, one instruction more than the stock sequence,
+    table out of `__text`'s hot path. `isa/x64/inst/emit.rs`
+    (`JmpTableSeq`): `lea; movz{bl,wl}/movl (NOP-padded); lea; add; jmp`,
+    unit 1, the default as the last entry as before. `PLIRON_JT_WIDTH=2|4`
+    forces a minimum width (tests). Tests: `pliron-clif-opt/tests/jt_narrow*.rs`
+    (run the machine code; x86-64 under Rosetta with
+    `--target x86_64-apple-darwin`).
+
+65. No trap after a noreturn call (`TrapCode::NORETURN_CALL`, user code
+    250; only pliron's lowering emits it, under `PLIRON_NORETTRAP`
+    (default on; `=0` off); docs/history/2026-10-27-noreturn-trap.md).
+    `src/ir/trapcode.rs`: the constant. `src/machinst/mod.rs`: provided
+    `MachInst::{trap_code, elide_noreturn_continuation,
+    noreturn_continuation}`, implemented for aarch64 (`Udf`, `Call`,
+    `CallInd`) and x64 (`ud2`, `CallKnown`, `CallUnknown`).
+    `src/machinst/buffer.rs`: `last_call_ret_addr`. `src/machinst/abi.rs`
+    + `isle.rs`: `TryCallInfo::continuation_elide`; both ISA emitters
+    skip the inline continuation trap when it is set.
+    `src/machinst/vcode.rs` (`emit`), each only when another block follows
+    in emission order (the last block keeps its trap, so a return address
+    never points past the function; LLVM drops these traps under
+    `NoTrapAfterNoreturn` and likewise keeps one where the call would end
+    the function):
+    - a `NORETURN_CALL` trap whose previous inst in its block is a regular
+      call, and which sits exactly at that call's return address (no
+      regalloc edit, pad or island in between), is not emitted;
+    - a `try_call` whose continuation is a lone `NORETURN_CALL` trap gets
+      `continuation_elide`: nothing after the `bl`/`call`;
+    - `noreturn_dead_blocks`: blocks reached only through such a
+      `try_call`'s normal-return edge (the lone trap block, or the
+      split-edge block in front of it; one forward walk from the entry)
+      bind their label and emit nothing. Off under
+      `machine_code_cfg_info`.
+    `PLIRON_NORETUDF` (default on; `=0` off) additionally drops the
+    last-block `NORETURN_CALL` trap: the call's return address then
+    points past the function, but unwind lookups use `ret_addr - 1`,
+    which still lands on the `bl` (LLVM emits no trap there either).
+    −1.1 KB and −323 `udf`s on regex-syntax. Covered by `optin:` gate
+    runs of `noret`, `unwind` and `unwindstd`.
+    Tests: `pliron-clif-opt/tests/noret_trap.rs` (trap and call-site
+    records; x86-64 under Rosetta with `--target x86_64-apple-darwin`).
+
+66. Egraph elaboration: loop stack by loop nest (`PLIRON_ELABLOOPS=1`,
+    opt-in; `src/egraph/elaborate.rs`, `Elaborator::start_block`). The
+    elaborator pops a loop's `LoopStackEntry` as soon as the domtree
+    preorder visits a block outside that loop. A loop's exit block is
+    dominated by the header, so it can come before the rest of the body
+    among the header's domtree children; every body block visited after
+    it then sees no entry for its own loop and its invariants are placed
+    in the body instead of the hoist block (parse_only's `ptr + len` end
+    pointer recomputed per digit: 9 instructions per digit instead of 8).
+    Under the knob, `start_block` rebuilds `loop_stack` from the block's
+    loop nest (`innermost_loop` → `loop_parent`), using the entry
+    recorded when each header was visited (`loop_entries`; headers
+    dominate their bodies, so the entry exists, and the hoist block still
+    dominates the body, so the scope depth it carries is still open).
+    Test: `pliron-clif-opt/tests/elabloops.rs`.
+
+68. aarch64 `fvdemote_f16` to a 64-bit `f16x4` (`src/isa/aarch64/lower.isle`):
+    one `fcvtn v.4h, v.4s` (matching x64's `(multi_lane 16 4)` arm). CubeCL's
+    4-lane f16 lines are an `F16X4` leaf under `types::NATIVE_F16`; without
+    the rule every such kernel panicked in the JIT ("should be implemented
+    in ISLE"). Test: `pliron-clif-opt/tests/f16x4_demote_aarch64.rs`.
+
+69. aarch64 scalar f16<->f32 `fcvt` encoding (`src/isa/aarch64/inst/emit.rs`):
+    #44's `FPUOp1::Cvt16To32`/`Cvt32To16` had bits 20:15 = 000000/000011
+    (`fmov h,h` / `fsqrt s,s`) instead of 000100/000111, so every scalar
+    f16 widen/narrow produced garbage (the vcode text still said `fcvt`).
+    Test: `pliron-clif-opt/tests/aarch64_f16_cvt_encoding.rs` (checks the
+    emitted words).
+
+70. aarch64 `brif (band (ireduce y), 2^k)` / `brif (icmp eq (band (ireduce y), 2^k), 0)`
+    (`src/isa/aarch64/lower.isle`, `PLIRON_TBNZ_IREDUCE=1`, opt-in): `tbnz`/`tbz`
+    on `y`'s own register. The i8/i16 `ireduce` rule (patch 36) materializes
+    `uxtb`/`uxth`, which only clears bits a single-bit test never reads
+    (`bl f; uxtb w3,w2; tbnz w3,#0`, 149 sites in regex-syntax; -172 `uxtb`).
+    Test: `pliron-clif-opt/tests/tbnz_ireduce.rs` (two fail with the knob off).
+
+71. aarch64 rotate folding into logic ops only for single-use rotates
+    (`src/isa/aarch64/lower.isle` `*_ror_op`/`*_rol_op`, `rot_fold_ok` in
+    `src/isa/aarch64/lower/isle.rs`; `PLIRON_RORFOLD_MULTI=1` restores the
+    old rule). Upstream folds `bxor/band x, (rotr y, k)` into `eor/and x, y,
+    ror #k` whatever the rotate's other uses; with another use the `ror` is
+    emitted anyway, so the fold duplicates it and puts a shifted-operand op
+    (2-cycle latency on Apple cores, 1 for the plain op) on the dependency
+    chain. LLVM folds only single-use shifts (`isWorthFoldingALU`).
+    blake3's compression: 1.39x -> 1.13x LLVM's
+    (docs/history/2026-10-31-tune-heldout.md). Test:
+    `pliron-clif-opt/tests/rorfold_multi_use.rs` (the multi-use case fails
+    with the old rule).
+
+72. aarch64 unsigned-carry idiom (`src/isa/aarch64/lower.isle`
+    `iadd_carry_*`, `carry_cinc_on` in `src/isa/aarch64/lower/isle.rs`;
+    `PLIRON_CARRYCINC=0` disables): `iadd x, (select (icmp ult (iadd a b), a|b), 1, 0)`
+    and the `uextend` form lower to `cmn a, b; cinc x, hs` (LLVM's
+    `adds`/`cinc`) instead of `add; cmp; cset; add`. The sum keeps its own
+    `add` for other uses. In a multi-word add the carry is loop-carried, so
+    the chain drops from four dependent instructions to two:
+    num-bigint-dig's Montgomery loop, blind-sig 0.88 s -> 0.67 s (LLVM
+    0.54 s). Test: `pliron-clif-opt/tests/carry_cinc.rs` (fails with the
+    rule off).
+
+73. `remat_sink` (`src/context.rs`, the post-egraph clone of
+    `symbol_value`/`func_addr`/`tls_value` into loop use blocks) now runs on
+    x86-64 only: there the clone is one RIP-relative `lea`, on aarch64 it is
+    `adrp` + `add` per iteration (pulldown-cmark's escape-table scan; LLVM
+    hoists). `PLIRON_REMATSINK=1` sinks on every target, `=0` nowhere. The
+    pliron-side `splink` address cloning and `licm`'s skip of symbol
+    addresses changed the same way (`PLIRON_SPLINK_ADDR=1`,
+    `PLIRON_LICM_SYM=0`). Test: `pliron-clif-opt/tests/symaddr_loop.rs`
+    (fails with `PLIRON_REMATSINK=1`).
+
+74. aarch64 64-byte loop placement (`src/machinst/vcode.rs`,
+    `MachInst::fixed_inst_size`, `MachBuffer::require_alignment`;
+    `PLIRON_ALIGN64=0` disables): with fixed-size instructions, a loop
+    whose estimated size (instructions + regalloc edits) fits in 64 bytes
+    and would straddle a 64-byte line gets its head padded to the next
+    line, and the function asks for 64-byte alignment so the offset is
+    absolute. The kernel A/B saw chars_ascii at 1.77x with byte-identical
+    code whose 36-byte loop crossed a 64-byte boundary.
+
+75. Call arguments detached from the ABI's fixed registers
+    (`src/machinst/lower.rs` `arg_detach`; `PLIRON_ARGCOPY=0` disables):
+    the call-side twin of `ret_detach`. An argument whose value has other
+    uses (or is a block param) is copied into a fresh vreg before the call.
+    Otherwise regalloc2 merges the value into a bundle whose requirement
+    is the argument register everywhere (`compute_requirement` ->
+    `FixedReg`); every call clobbers it, so the bundle splits into minimal
+    pieces with the gaps on the stack. serde_json's `serialize_str` stored
+    and reloaded its string base every byte of the escape loop because the
+    base was also `memcpy`'s `x1`; 64 -> 42 stack accesses in the function.
+    LLVM gets this from a `COPY` to the physical register at the call.
+
+76. Rematerialization at reloads (`src/machinst/vcode.rs` `remat_def`,
+    `MachInst::rematerialize`; aarch64 `MovWide`, `LoadExtNameNear`,
+    `LoadExtNameGot`; `PLIRON_REMAT=0` disables): a reload of a vreg whose
+    definition is a single register-free instruction (a constant or a
+    symbol address) re-executes that definition into the target register
+    instead of loading the spill slot. Needs the destination vreg of each
+    edit (vendored regalloc2 `Output::edit_vregs`). serde_json's escape
+    table address was reloaded from the stack every byte; with 75 the loop
+    has no stack traffic (42 -> 32 in the function). Test for 75 and 76:
+    `pliron-clif-opt/tests/ra_callarg_remat.rs` (fails with either off).
+
+77. Dead spill stores of rematerialized values (`src/machinst/vcode.rs`
+    `dead_slots`; `PLIRON_REMAT_STORE=0` keeps them), plus `orr rd, xzr,
+    #imm` (bitmask immediates) in aarch64 `rematerialize`. With 76 a
+    constant's reloads re-execute its definition, but its spill store at
+    the definition stayed. A slot whose every read is a rematerialized
+    reload (no plain reload, no instruction operand in it; checked per
+    slot because regalloc2 shares a slot across a spillset's vregs) gets
+    no stores. Off when debug value labels exist (they may name the slot).
+    regex's `Utf8Sequences::next`: 136 -> 111 spill stores; held-out
+    geomean 1.280 -> 1.264 (5 rounds, interleaved). Test:
+    `pliron-clif-opt/tests/ra_callarg_remat.rs` `no_stores_into_remat_only_slots`.
+
+78. Opt-in constant sinking into calling loops (`src/context.rs`
+    `const_sink`, aarch64, `PLIRON_CONSTSINK=1`): a one-instruction
+    constant used in a loop that contains a call, but defined outside
+    it, gets a copy just inside the outermost such loop (the use block,
+    or the preheader of the call-free loop the use sits in). pliron's
+    licm hoists every constant out of every loop; across a call each
+    then needs a callee-saved register or a spill slot. Held-out A/B
+    (5 rounds): 1.274 vs 1.264 without; stays off. The aarch64
+    `ImmLogic` bitmask-immediate oracle is `#[cfg(feature = "arm64")]`
+    gated so non-arm64 hosts still compile (it reports false there).
+
+79. Opt-in rematerialization-aware spill weights (`PLIRON_RA2_REMATW=1`;
+    `VCode::compute_remat_vregs`, vendored regalloc2 `Function::is_remat`):
+    a bundle whose vregs are all single-def rematerializable values gets
+    upstream's linear weight, halved (LLVM `weightCalcHelper`), instead
+    of pliron's long-range sqrt favor. Held-out A/B: 1.271 vs 1.264
+    without (and 1.283 combined with 78 and `PLIRON_CSTDEDUP=0`); stays off.
+
+80. 64-bit integer vector shifts on aarch64 (`src/isa/aarch64/lower.isle`):
+    upstream's `ishl`/`ushr`/`sshr` vector rules match only 128-bit types,
+    so `ushr.i32x2` (zmij's `vshr_n_u32`) failed with "should be
+    implemented in ISLE". The same rules now also match `ty_vec64_int`
+    (I8X8, I16X4, I32X2) on the `.8b/.4h/.2s` arrangements; the emitter
+    already set the Q bit from the size. Priorities -10..-12: ISLE cannot
+    prove the two extern type extractors disjoint. Test: simdshift's
+    `neon` (`ushr.2s`), `narrow` and `varshift` (`dup` + `ushl`/`sshl`).
+
+81. aarch64 `rematerialize` also takes vector and FP immediates
+    (`VecDupImm` = `movi`/`mvni`, `VecDupFPImm`, `FpuMoveFPImm`). Every q
+    register is caller-saved, so a splat constant live across a call
+    spilled: serde_json's `skip_to_escape` stored its three escape-scan
+    masks and reloaded them in every scan block (28 -> 8 stack accesses).
+
+82. aarch64 callee saves at fixed offsets after one `sp` adjustment
+    (`src/isa/aarch64/abi.rs` `flat_save_slots`; `PLIRON_A64_FLATSAVE=0`
+    keeps upstream's pushes). Upstream pushes each pair with
+    `stp ..., [sp, #-16]!` and pops with `ldp ..., [sp], #16`: every one
+    writes `sp` back, a serial chain through `sp` on every call. Same
+    frame layout and unwind offsets; used when the frame record is set up
+    (FP-based CFA) and the incoming-arg area is not resized for tail calls;
+    the clobber area and fixed frame share one `sub` when all slots stay
+    in `stp`'s +504 range. Measured (dynstack.py): prologue/epilogue was
+    the largest excess sample class (pulldown +171, serde_json +114);
+    held-out geomean 1.292 -> 1.269.
+
+83. vcode disassembly names the CLIF block (or critical edge) each block
+    lowers (`block7: ; block158`), so `clif-check codegen` can weight code
+    by CLIF loop depth.
+
+84. Opt-in shrink-wrapping (`PLIRON_SHRINKWRAP=1`, aarch64):
+    `VCode::pliron_shrink_wrap` picks the save block (nearest common
+    dominator of blocks that need the frame, climbed off cycles until every
+    block reachable from it is dominated by it); the frame record stays at
+    entry, callee saves and frame allocation move to that block
+    (`Callee::gen_prologue_setup`/`gen_prologue_body`), and a return outside
+    it gets `gen_epilogue_frame_only`. `MachInst::pliron_frame_free`
+    (aarch64 whitelist) marks instructions that may run before the saves.
+    `Context::shrink_split` (CLIF, before lowering) makes the save block's
+    live-ins block params, clones constants into it and duplicates small
+    shared return blocks; the vendored regalloc2 `Function::no_param_merge`
+    keeps those params from merging back with their inputs. Correct on the
+    full test suite; applies to 2 of 26 hot functions; neutral in two
+    held-out A/Bs, so off.
+
+85. Loop-exit constants on the exit edge (`src/context.rs`
+    `exit_const_sink`, post-egraph; `PLIRON_EXITCONST=0` disables). The
+    egraph rematerializes a constant in the block that uses it; a branch
+    argument's user is the branch, so a loop latch passing `(255, 0, 0, 0)`
+    to its exit block materialized them every iteration. A constant whose
+    every use is an argument of one exit edge (target outside the source
+    block's innermost loop) moves into a new edge block that jumps to the
+    target. pulldown-cmark's `parse_block` scan: latch `add; cmp; b.lo`
+    instead of five instructions. Test: `pliron-clif-opt/tests/loop_exit_codegen.rs`.
+
+86. Shared amodes need two direct uses (`src/machinst/lower.rs`
+    `amode_shareable`; `PLIRON_AMODESHARE_DIRECT=0` restores the old test).
+    `value_ir_uses` is propagated through results, so a single-use
+    `base + index` whose loaded value has two uses read `Multiple` and was
+    kept whole (`add x5, x19, x27; ldurb w5, [x5]` instead of
+    `ldrb w5, [x19, x27]`).
+
+87. Opt-in load rematerialization (`src/context.rs` `load_remat`,
+    `PLIRON_LOADREMAT=1`, `PLIRON_LOADREMAT_DIST`): a `notrap` load is
+    re-issued before a use more than DIST instructions after the previous
+    copy, within one block, when no store/call/side effect intervenes.
+    blake3's `compress_pre`: 67 -> 11 stack loads, 16 -> 10 stores, but no
+    runtime change (its time is the round functions' dependency chains,
+    not the spill traffic the profile samples land on), so it stays off.
+
+88. aarch64 low-half vector extracts (`src/isa/aarch64/lower.isle` bitcast
+    rules 8, 9): `bitcast.<64-bit vec> (extractlane.i64 (bitcast.i64x2 v)
+    0)` is `v`'s register (no `mov x, v.d[0]; fmov d, x`), and when `v`
+    is an `unarrow` only its low half is narrowed (`sqxtun`, no
+    `sqxtun2`). memchr's movemask through pliron's `vtrunc`: 8 -> 4
+    instructions.
+
+89. aarch64 `shrn` (`VecShiftImmOp::Shrn`, `inst.isle`/`emit.rs`/`mod.rs`,
+    encoding test in `emit_tests.rs`): shift right narrow, low half; `size`
+    is the destination arrangement. `lower.isle` extractlane rule 4: the
+    4-bits-per-byte movemask `extractlane.i64 (bitcast.i64x2 (unarrow
+    (band (ushr m, 4) 0x00ff..) _)) 0` (splat or `vconst` mask) is `shrn
+    v.8b, m.8h, #4; fmov x, d` instead of `ushr; and; sqxtun; sqxtun2;
+    mov` (pliron's `bytescan`).
+
+90. Emit-time post-index sweep (`machinst/vcode.rs`): a chain element
+    at offset 0 whose writeback step is 0 (a load and a store at the base
+    before `add base, base, #c`) stays a plain access instead of
+    `ldr x, [base], #0` (a writeback micro-op for nothing). Not at a
+    nonzero offset: chain offsets are from the original base, which
+    earlier writebacks have advanced by that offset.
+
+91. Flag twins (`machinst/vcode.rs` emit-time sweep, before pair fusion;
+    `MachInst::flag_twin_candidate`/`flag_twin`/`nzcv_free`, aarch64 in
+    `inst/emit.rs`; `PLIRON_FLAGTWIN=0` disables). `add d, a, b` followed
+    in its block by `adds xzr, a, b` (or `sub`/`subs xzr` with the same
+    operand order, and the `#imm12` forms) becomes `adds d, a, b` and the
+    compare is squashed. Lowering cannot keep flags live across
+    instructions, so a sum stored as a value and tested for its carry
+    computed twice: num-bigint-dig's `mac_with_carry` in montgomery's
+    inner loop, `add; str; cmn; csinc` -> `adds; str; csinc`. Every inst
+    in between must be `nzcv_free` (no flag reads or writes) and not
+    write `a`/`b`; `d` may not be `a` or `b`; no regalloc edit in between.
+    Test: `pliron-clif-opt/tests/flag_twin_codegen.rs`.
+92. Unchecked jump tables (`PLIRON_SWITCH_KEEPDEAD=0` disables; extern
+    `jump_table_default_dead` in `prelude_lower.isle`/`machinst/isle.rs`,
+    rules in `x64/lower.isle` and `aarch64/lower.isle`, `checked` field on
+    aarch64 `JTSequence`): a `br_table` whose default block starts with
+    `trap user2` (pliron's `unreachable`) has an out-of-range index as UB,
+    so it skips the bounds clamp (x64 `cmp; cmov`; aarch64 `cmp; b.hs;
+    csel; csdb`, replaced by one `mov`). Test:
+    `pliron-clif-opt/tests/switch_dead_default.rs`.
+93. Reload CSE (`PLIRON_RELOADCSE=0` disables, `machinst/vcode.rs` `reload_cse`, run
+    with reload PRE as `post_alloc` at emission and under
+    `PLIRON_RELOADPRE_CHECK=1`'s checker): regalloc2 reloads a spilled
+    value before each use, often into a fresh register, so one stretch of
+    code loads the same slot several times (pulldown's
+    `handle_inline_pass1`: `[sp, #0x3c0]` into four registers). Tracking
+    which registers hold which slot through each block, and into a block
+    from its only predecessor, a reload into a register already holding
+    the slot is dropped and one into another register becomes a register
+    move. Rematerialized values are skipped. pulldown: 206 stack loads
+    become moves.
+94. Spill CSE (on since 2026-11-02, `PLIRON_SPILLCSE=0` disables; in `reload_cse`): a spill of a
+    register already known to hold that slot's value is dropped, and the
+    register/slot facts flow into every block as the intersection over
+    its predecessors, iterated optimistically to a fixpoint (nothing is
+    rewritten unless it settles within 8 rounds), so they survive loop
+    headers. Dropping a reload or a store leaves the register and slot
+    contents unchanged, so the facts don't depend on the rewrites.
+    pulldown with its `parse_line` closure inlined
+    (`PLIRON_INLINE_FREEMUL=12`): the special-byte scan loop reloaded a
+    loop invariant and stored it straight back every iteration. pulldown:
+    394 spill stores dropped (2,936 -> 2,542); checker clean.
+95. Extra allocatable integer registers (opt-in, measured neutral;
+    `PLIRON_X17=1`, `PLIRON_X30=1`; `aarch64/inst/regs.rs`
+    `x17_allocatable`/`x30_allocatable`, `aarch64/abi.rs`
+    `get_machine_env`/`get_regs_clobbered_by_call`/`compute_frame_layout`,
+    `aarch64/inst/emit.rs` `LoadAddr`, `aarch64/inst/mod.rs` veneers).
+    Cranelift reserves x16 and x17 as emit scratch and never allocates
+    the link register: 26 integer registers to LLVM's 29. x17's
+    post-regalloc users are the prologue's stack-limit check and probe
+    loop (nothing is live there), `LoadAddr`'s large-offset path (now
+    uses `rd`, or x16 when `rd` is the base) and the 26-bit branch veneer
+    (now saves x17 below sp around its use). x30 is clobbered by every
+    call, and a function that allocates it sets up the frame record so the
+    prologue saves it and the epilogue restores it before `ret`. Not
+    safe with `get_return_address`, which pliron emits only for wasm.
+    Tuning geomean: x17 1.006, x30 1.007, both 1.001 (montgomery loses
+    one spill pair; register count is not what limits these benches).
+96. Alignment knobs (opt-in, measured neutral or worse): `PLIRON_LOOPALIGN=<bytes>`
+    (power of two, default 16; `machinst/vcode.rs` loop heads, which ask
+    the function for that alignment above 32) and `PLIRON_FNALIGN=<bytes>`
+    (aarch64 preferred function alignment, default 32,
+    `aarch64/inst/mod.rs`). Across 3 function orders x 4 stack pads:
+    loop heads at 32/64 cost regex 2.5%/4% (NOPs on inner-loop entry);
+    64-byte functions are within noise.
+97. regalloc2 decision logging hook (debug): `lib.rs` re-exports
+    `regalloc2::set_explain` as `ra_set_explain`; `machinst/compile.rs`
+    dumps the pre-regalloc VCode when regalloc2's explain flag is set, so
+    pliron's `PLIRON_RA_EXPLAIN=<symbol substring>` shows a function's
+    VCode next to its allocation decisions (vendored regalloc2 patch log).
+98. Chain-based block placement with static branch probabilities (on by
+    default since the 2026-11-03 batch, `PLIRON_PLACE=0` restores the
+    lowering order; `machinst/placement.rs`, hooked in `VCode::emit`
+    where cold blocks were already sunk). Edge probabilities in the
+    Ball-Larus style (cold or trapping target 1/33, back edge 124/128,
+    loop exit 4/128, CLIF hint 4/36, else even); block frequencies by
+    packaged loops (`1 / (1 - back-edge mass)`, capped 4096 per loop);
+    MachineBlockPlacement-style chains per loop innermost first (hottest
+    successor, skipped when a hotter predecessor is still unplaced; ties
+    to a successor with no other unplaced predecessor; fallback to the
+    hottest block whose predecessors are all placed, else the first
+    unplaced in RPO), loop chains as units in the function chain, cold
+    blocks last. Empty jump-only blocks (label-aliased at emission) are
+    placed last and chains see through them. `PLIRON_PLACE_ROT=1` rotates
+    loop chains by a branch-cost model (worse: a taken jump per loop
+    entry that `looprot`'s guard avoids). Chain heads are aligned like
+    loop heads unless entered by a conditional fallthrough, directly or
+    through an empty edge block (the pad turned regex `follow_epsilons`'s
+    hot fallthrough into a taken branch plus a jump, +24% on the
+    function). `PLIRON_PLACE_DEBUG=1` dumps the graph, frequencies and
+    order. Branch hints: `Layout::set_unlikely_arm`/`unlikely_arm`
+    (`ir/layout.rs`), forwarded by `BlockLoweringOrder::is_unlikely_succ`
+    (`machinst/blockorder.rs`); pliron's `brhint` step sets them (compare
+    cascades on one value, zero tests). Tuning A/B, 3 layouts x 3 rounds x
+    2 pads: placement alone 0.996-1.013 of base (regex +5-10% from the
+    cascade split and the padded head), with hints and the padding rule
+    0.993-0.995 (blind-sig -2%, pulldown -1%, json -0.6%, regex and
+    blake3 neutral). Full held-out (8 programs, 5 rounds x 3 layouts x 2
+    pads, release dylib): 1.111 -> 1.104 (html-rewriter -2.3%, json
+    -3.2%, blind-sig -1.4%, regex +2%); gate and 400 fuzz seeds clean
+    with the flags on, so placement and `brhint` were flipped on.
+
+    Addendum (11-03): `nzcv_free` now includes the post-index
+    `LoadPost`/`StorePost` forms (patch 90). The sweep stopped at a
+    writeback store between the `add` and its `cmn` (montgomery's inner
+    loop once the zip pointers refold onto the index, `PLIRON_IVREFOLD2`),
+    leaving the carry recomputed: blind-sig +7% on the tuning set.
+
+99. Block frequencies for the register allocator (opt-in,
+    `PLIRON_RA2_FREQ=1|2`; `machinst/placement.rs` `frequencies`,
+    `machinst/vcode.rs` `compute_block_freq` / `block_freq` /
+    `RegallocFunction::block_hotness`, called from `compile.rs` before
+    `run_with_ctx`): patch 98's loop forest, edge probabilities and
+    packaged-loop block frequencies are split out of `place` into
+    `analyze`, and before regalloc the same graph (successors, cold marks,
+    `brhint` arms) gives every block its frequency relative to the entry.
+    regalloc2 uses it as the spill-weight hot bonus instead of
+    `1000 * 4^depth` (vendor/regalloc2/PLIRON_PATCH.md
+    `PLIRON_RA2_FREQ`). Cold and unlikely blocks fall below the entry's
+    weight; loops get their real nesting weight even where the lowering
+    order's block indices made a cold rejoin look like a back edge.
+
+100. One writeback per post-index chain (`machinst/vcode.rs` emit-time
+    sweep, default since 11-03, `PLIRON_POSTIDX_ONEWB=0` restores the chain; `MachInst::mem_offset_ok` /
+    `set_mem_offset`, aarch64 in `inst/emit.rs`). The sweep's telescoping
+    writebacks (`str [b], #4; str [b], #4; str [b], #4; str [b], #8` for
+    brotli's 20-byte `BrotliInitZopfliNodes` fill) make every access's
+    address wait on the previous access's writeback, and the next
+    iteration's first access on the last: a 4-cycle loop recurrence
+    through the base where the deleted `add` cost one (the fill ran at
+    196 profile samples against LLVM's 86). With the knob the last
+    offset-0 member takes the whole bump `#C` and the members after it are
+    re-addressed to `[base + (o - C)]` (`stur`'s signed 9-bit, else a
+    scaled unsigned offset; pairs by scaled 7-bit); members before it keep
+    their offsets. LLVM's loop-strength reduction lays the loop out the
+    same way (`stur [x10, #-16]; stur [x10, #-8]; str wzr, [x10], #20`).
+    When a re-addressed offset does not encode the chain is left alone
+    (the `add` stays) rather than telescoped. Patch 90's load-and-store
+    at offset 0 keeps its shape: the writeback lands on the store, the
+    last offset-0 member. Test: `pliron-clif-opt/tests/postidx_onewb.rs`.
+    rust-compression: HqZopfli's post-index stores 18 -> 5, the binary's
+    2109 -> 1395; held-out 0.980 [0.974, 0.991] of base on compression,
+    geomean 0.997 [0.992, 1.001], no program worse.
+
+101. Unencodable memory offsets stay a register base (default since
+    11-03, `PLIRON_BIGOFF=0` disables; `amode_fold_ok` in `aarch64/inst.isle` rules 1/2 of `amode`,
+    extern in `lower/isle.rs`). `amode` folds every `iadd base, K` into
+    the access offset and `amode_no_more_iconst`'s base case then
+    materializes an offset past `simm9` / scaled `uimm12` with
+    `mov`+`movk` at every access: miniz_oxide's `compress_inner` read
+    three `Box` fields at `d + 0x10018..0x10028` per byte, 224 `movk`
+    in the function, LLVM none (it hoists `d + 0x10000`). With the knob
+    the fold is refused when the sum would not encode, so the `iadd`
+    (which pliron's lcse has split into `base + hi`, `hi` a multiple of
+    4096, hoisted and shared — `clifpeep::amode_off_fits`/`set_bigoff`,
+    `pliron-clif-opt/tests/bigoff.rs`) is one register and the access
+    keeps its small immediate. Off, nothing changes. Held-out: alone,
+    compression 0.989 [0.981, 0.995] and json 0.984 [0.976, 0.996] of
+    base; with patch 100, compression 0.962 [0.954, 0.972], json 0.978
+    [0.966, 0.990], geomean 0.993 [0.988, 1.003], nothing significantly
+    worse. Without the lcse
+    split a single-use unencodable `iadd` would cost one more
+    instruction than the materialized fold, which is why the knob gates
+    both sides together.
+
+102. Migrated clifpeep rewrites as egraph rules (`opts/pliron.isle`,
+    listed in `cranelift-codegen-meta/src/isle.rs`; `pliron_rules_on`
+    extern in `opts.rs`; default since 11-04, `PLIRON_EGRAPH_RULES=0`
+    disables). First batch:
+    addnorm's constant chains on an additive spine (`(x + k1) + k2`,
+    the three `isub` mixes) and icmpk's constant across an equality
+    (`(x ± k) ==/!= c`, `(a - b) ==/!= 0`, `-x ==/!= c`). Tests:
+    `pliron-clif-opt/tests/egraph_rules.rs`. The pipeline's mid-pipeline
+    `egraph` step (and its second round, `PLIRON_EGRAPH2`) are default
+    since 11-04 too, with `egraph::Stats::renames` (patch 104) feeding
+    pliron's fact carry.
+
+103. `BlockCall::update_args` (`ir/instructions.rs`) returns on an empty
+    value list. The egraph pass frees the lists of instructions it
+    drops from the layout; `DataFlowGraph::resolve_all_aliases` walks
+    every instruction in the dfg, so pliron's `apply_param_drops` (cparm,
+    right after the egraph step) indexed `[1..]` of a zero-length list
+    and panicked on the first crate built with `PLIRON_EGRAPH=1`.
+
+104. `egraph::Stats::renames` and `Context::egraph_renames`: the egraph
+    pass records every `(survivor, original, is_clone)` value pair it
+    creates (GVN merges and rule rewrites in `remove_pure_and_optimize`,
+    skeleton merges, elaboration clones and remat clones) and the
+    context hands them to the client after the pass. pliron carries its
+    value-keyed facts (derived, non-null, noalias, frozen, deref) across
+    them: clones outright, merges under its site rule (an unconditional
+    carry on merges gave a GVN survivor's earlier uses a `!nonnull`
+    site fact: regex segfaulted). Without it the egraph step lost the
+    inbounds mark on brotli's byte-compare pointer and that loop ran
+    2.3x slower (docs/codegen-plan.md "Direction").
+
+105. aarch64 scaled-amode recovery for doubled/multiplied indices
+    (`src/isa/aarch64/inst.isle` `amode_no_more_iconst`): the egraph's
+    `ishl y, 1` → `iadd y, y` strength reduction hid the scaled-index
+    pattern upstream rule 6/7 keys on, so `base + 2*i` addressing (e.g.
+    miniz_oxide's halfword-table indexing) materialized a standalone
+    `add` plus a reg+reg amode. New rules fold `iadd x, (iadd y, y)`
+    (either operand order) into `amode_reg_scaled` when
+    `ty_bytes == 2`, and `iadd x, (imul y, C)` when `C == ty_bytes` —
+    the same `lsl #1`/`lsl #2`/`lsl #3` single-insn form LLVM emits.
+    `emit.rs::enc_ldst_reg` keeps its uxtw/sxtw/sxtx/lsl whitelist with
+    a note: the ldst-register option field rejects uxtb/uxth/sxtb/sxth
+    (verified — they trap on Apple Silicon), so i16-typed indices fall
+    through to `RegScaled` on the already-extended value.
+    `args.rs::PrettyPrint` now prints the W/X index width correctly for
+    the wider extendop space (relevant to `add`-with-extend forms,
+    where those ops ARE legal).
+
+106. aarch64 bitfield fusion (`PLIRON_BFUSE`, default on, `=0` off):
+    `(x>>k)&m`, `(x&m)<<k`, `(x<<k)&m'` and `ushr (band x, field<<k), k`
+    lower to one `UBfm` (`ubfx`/`ubfiz`); `y | ((x&m)<<k)` and
+    `y | ((x<<k)&m')` lower to `Bfm` (`bfi`) when `y`'s field bits are
+    provably zero. New `Inst::UBfm`/`Bfm` variants emit through the
+    existing `enc_bfm` (UBFM opc 0b10, BFM 0b01); `Bfm` carries a tied
+    `rd_in` like `MovK`. Disjointness is a bounded known-bits walk
+    (`bf_known_zero` in `lower/isle.rs`): iconst, band/bor/bxor,
+    ishl/ushr by const, uextend, uload8/16/32, compares, ireduce,
+    black_box; a miss answers "not disjoint" and the `orr` stays. The
+    `bor` rules sit above `extr_32_or_64` but can't steal a rotate — an
+    `extr` operand's live bits are exactly the field, so disjointness
+    always fails there. `PLIRON_BFUSE=0` restores the decomposed code.
+    LLVM emits the same `ubfiz`/`bfi` pairs for UTF-8 codepoint
+    assembly (`is_mostly_utf8`): 2 insns where we had 6.
+    Fix (fuzz seed 6279): the `(x<<k)&m` rules encoded `imms` with the
+    `ubfx` convention (`bf_field_imms` = `k+w-1`) instead of `ubfiz`
+    (`bf_field_ubfiz_imms` = `w-1`), so a standalone
+    `band (ishl x, k), m` emitted the wrong field — `w = 64-2k` or
+    wider flipped the UBFM to `ubfx x, #64-k, ...` outright. Usually
+    hidden because `ushr (band x, m), k` absorbs such a `band` first;
+    `dem64`'s `ireduce.i32` passthrough exposed it.
+
+107. aarch64 `cmn` for negative compare immediates (`PLIRON_CMN`,
+    default on, `=0` off): `emit_icmp` on a 32/64-bit `icmp x, -c`
+    emits `cmn x, c` (`AluRRImm12 AddS` into the zero register) when
+    the negated immediate fits imm12 — one insn where `movn`+`cmp`
+    otherwise materializes. `imm12_from_negated_value` already
+    sign-extends by the iconst's type, so i32 immediates stored
+    zero-extended are handled. Zero is excluded: `icmp x, 0` stays on
+    the `is_nonzero` path. Motivating case: `sextload`'s `x <s -64`
+    UTF-8 continuation bound.
+    `Inst::AluRRImm12` pretty-print now aliases flag-setting ops into
+    the zero register: `adds xzr, rn, #i` prints `cmn rn, #i` and
+    `subs xzr, rn, #i` prints `cmp rn, #i` — matches the disassembler
+    reading of the same encoding.
+
+108. `PLIRON_PREVCODE` name match (`machinst/compile.rs` +
+    `src/lib.rs`, `pliron-clif-lower`): rustc-lowered CLIF functions
+    carry a generic `UserFuncName`, so a substring match on `f.name`
+    never fires for real symbols. The matcher now also consults the
+    `PLIRON_FN_NAME` thread-local, and `lower.rs` populates it when
+    `PLIRON_RA2_STATS` *or* `PLIRON_PREVCODE` is set (previously only
+    the former — `PLIRON_PREVCODE=<symbol>` matched nothing).
+
+109. `PLIRON_OUTCOPY=1` (runtime, opt-in; `machinst/lower.rs`
+    `out_detach` + `pending_out_movs`): result-side twin of
+    `arg_detach`. A multi-use call result's `FixedReg` def pins its
+    whole merged bundle to the return register for its full extent;
+    `out_detach` substitutes a fresh tmp into `defs` and queues
+    `mov result, tmp` in `pending_out_movs`, which `finish_ir_inst`
+    appends to `ir_insts` so it lands right after the call. Single-use
+    results keep the direct def (their pin is free — the range ends at
+    the use). try_call results are deliberately untouched: they are
+    edge-delivered (`BlockArg::TryCallRet`), short-range already, and a
+    block-tail mov after a terminator is invalid vcode — their pin
+    propagation is handled by regalloc2's `PLIRON_RA2_NOPINMERGE`
+    merge guard instead. Measured neutral on the motivating function
+    (the pin there spread through merges, not the def itself); kept
+    opt-in for workloads with long-lived plain-call results.
+
+110. aarch64 `ldp`/`stp` on regalloc spill/reload edits
+    (`PLIRON_EDITPAIR`, default on, `=0` off): spill/fill traffic is emitted as
+    `Edit::Move` items in `VCode::emit`, invisible to the inst-level
+    `fuse_with_next` scan. The emit loop now peeks at the next item
+    when it is also an `Edit`, generates both memory insts
+    (respecting `dead_slots` and the remat path), and emits the fused
+    pair when `fuse_with_next` accepts. Crate-wide: +194 pairs with
+    slot pairing on (+504 were already adjacent naturally).
+
+111. aarch64 fp-relative pair fallback (`pair_amode` in
+    `isa/aarch64/inst/emit.rs`): when both accesses resolve to
+    `stack_reg()` and the pair base exceeds `SImm7Scaled` range
+    (±512 B), retry with `off - sp_to_fp()` — the top of the spillslot
+    area sits just below the clobber area, so high-index slots are
+    within simm7 of fp even in huge frames (every spilling function
+    establishes fp since `fixed_frame_storage_size > 0` forces
+    `setup_area_size = 16`). Unlocks `ldp`/`stp` on deep-frame spill
+    pairs: `BrotliCreateHqZopfliBackwardReferences` emits real
+    `stp/ldp [x29, #-0x..]` pairs (2202 -> 2164 insns). Pairs with
+    `PLIRON_RA2_SLOTPAIR` in vendored regalloc2, which repacks
+    pairing-edge chains to the top of the spillslot area.
+
+112. `PLIRON_MCP` (runtime, default on, `=0` off; `VCode::emit`):
+    post-allocation copy propagation — an LLVM MachineCopyPropagation
+    analogue. A per-emitted-block map preg -> value-class: `mov d,s`
+    propagates s's class to d (and is skipped when d already holds
+    it), any other operand def freshens the dest's class, calls and
+    block boundaries clear the map. Only allocatable Int-class pregs
+    participate: Float-class movs have mixed widths (`fmov d` zeroes
+    the upper half, `fmov v` copies 128 bits) so one class cannot
+    express equality for both, and non-allocatable regs (sp/fp/lr/xzr)
+    take writes that never appear as operand defs (SP writeback amodes
+    in prologue/epilogue code). Both dests of a fused `ldp` edit pair
+    are freshened — the `k += 2` skip would otherwise leave the second
+    edit's dest stale (this was a real miscompile found by fuzz seed
+    5042: a restore mov was deleted and a store used stale data as its
+    base). ~214 dead movs crate-wide on rust-compression; held-out
+    A/B neutral (0.999 [0.981,1.017]); gate green and a 400-seed fuzz
+    sweep clean before the default-on flip.
+
+113. aarch64 `cmp; ccmp` compare-chain fusion (`PLIRON_CCMP`, default on, `=0` off; `isa/aarch64/inst.isle` + `lower.isle` +
+    `lower/isle.rs`): `band`/`bor` of two integer compares, and
+    `select` of a compare against a constant arm, lower as one
+    `cmp; ccmp` flag chain — the `a && b` / `a || b` idiom LLVM emits
+    (~421 `ccmp` on html-rewriter vs our prior 163 div-check uses).
+    `ccmp u,v,#nzcv,cc` applies the secondary compare only when the
+    guard held on the primary's flags and forces a constant NZCV
+    otherwise; `nzcv_for_cond` picks the constant by enumerating the
+    16 flag states. The secondary compare is restricted to 32/64-bit
+    operands (plain reg/reg `ccmp`); the primary may be anything
+    `emit_icmp` lowers. Both operand orders are tried (band/bor have
+    no canonical order). The externs are total — when they decline
+    they build exactly what the generic rules would (`is_nonzero` of
+    the combination, or `and`/`orr`/`select`), so `PLIRON_CCMP=0` is
+    byte-identical. Pairs with `PLIRON_FOLDCOMMON` in pliron-clif-opt,
+    which creates the `brif`-consumed `band`/`bor` shape upstream.
+    html-rewriter: +44 ccmp, −73 cset, −46 cmp, −36 and (−10 static
+    net, regalloc churn absorbs the rest); 12-round runtime wash.
+
+114. `PLIRON_MCPBB` (runtime, default on, `=0` off; `VCode::emit`): extends
+    `PLIRON_MCP` across block boundaries — each block's exit value-class
+    map is recorded, and a block's entry map is seeded from the
+    intersection of the exit states of its already-emitted CFG preds; a
+    pred emitted later (backedge) or merged/skipped (`None` out-state)
+    empties the seed conservatively. Blocks merged by `PLIRON_EDGEMERGE`
+    or `PLIRON_BJALIAS` alias their label to a canonical block, so their
+    preds' edges enter the canon too: the seed also intersects those
+    (`canon_dups`). Missing that miscompiles — `syn`'s
+    `fixup::FixupContext::precedence` (and `tests/edgemerge`'s
+    `restore`) has a jump-table edge block and an ordinary edge block
+    carrying the same `mov` restore merged into one copy; the canon's
+    own pred happened to satisfy the restore's dead-move condition while
+    the jump-table edge arrived with the register clobbered, and the
+    dedup'd copy left the continuation reading the table index as a
+    pointer (SIGSEGV in generated code). Also drops `mov x,x` no-ops at
+    both emit sites (`Edit::Move` same-preg metadata moves and inst-level
+    `Mov{Size64}` self-moves — `is_move` only matches 64-bit, so 32-bit
+    `w` self-moves still correctly freshen). syn rlib: −471 emitted
+    `mov`s (56636 vs 57107), all deleted insns movs.
+
+115. `try_postindex` dominator-bound use relaxation (`isa/aarch64/lower.rs`;
+    lazy `postindex_cfg_dt` on `Lower` in `machinst/lower.rs`). The
+    fusion's profitability gate rejected a candidate whenever `base`
+    had any use in another block — even a use that provably executes
+    *before* the fused access on every path. A use of `base` in a
+    dominator `ub` of the fusion block where `base` is *bound* (param
+    of `ub`, or result of an inst in `ub`) is inside a binding epoch
+    that ends before `block` runs: re-entering `ub` re-binds `base`,
+    so the use can never observe the post-writeback vreg and no
+    reuse-def copy is wasted. This is the canonical `ldrb [ptr];
+    ptr' = ptr + 1` decode-loop shape, where `ptr` is a header param
+    consumed by the header's own exit test — fusion fired on it
+    (`ldrb w1, [x23], #1` on chars_alpha). Any other out-of-block use
+    keeps the old reject. `PLIRON_POSTIDX=0` still disables the whole
+    fusion.
+
+116. Post-egraph cursor-bump hoisting (`src/context.rs` `bump_hoist`,
+    `PLIRON_BUMPHOIST`, default on, `=0` off). The compile-path egraph's
+    elaborator sinks pure insts into use blocks: a loop cursor's
+    `iadd p, k` lands in a successor block, splitting the `load [p]` /
+    `p+k` adjacency patch 115's post-index fusion needs. For each block
+    param `p` used as a load/store base in its own block `h`, a
+    dominated `iadd p, k`/`isub p, k` moves back next to `h`'s
+    terminator — but only the *cursor* bump (its result must appear in
+    the site block's terminator args, i.e. it feeds the next
+    iteration's base); cold-path bumps like a decode arm's `p+2` stay
+    home, since hoisting them would compute them unconditionally on the
+    hot path. If the egraph also sank the bump's `iconst` into a
+    non-dominating block, a fresh `iconst` is materialized at the hoist
+    point. Phase 2 then makes `p` die after its memory op: duplicate
+    `p ± k` bumps in `h` fold to one (`resolve_all_aliases` afterwards,
+    since lowering's use counts key the raw arg value), and every other
+    use of `p` is rewritten to a remat `isub q,k`/`iadd q,k` at the top
+    of the using block — `q` the kept bump's result, which dominates
+    those blocks because `p` does. On `chars_alpha`'s ASCII loop the
+    hoisted `p+1` restores the fusion patch 115 needed:
+    `ldrb w10, [x23], #0x1`.
+
+117. aarch64 `x + (a cc b ? 1 : 0)` to `csinc` (`PLIRON_CINC`, opt-in,
+    `=1` on; `isa/aarch64/lower.isle` `iadd_cinc_{r,l}` +
+    `iadd_cinc_for` in `isa/aarch64/lower/isle.rs`): a single-use
+    `iadd x, uextend(icmp cc a b)` lowers to `cmp a, b; csinc x, x, !cc`
+    (LLVM's `cinc`) instead of `cmp; cset; add` — one instruction and
+    one register shorter, same flag work. The extern declines to the
+    plain `add` when the `icmp` has other uses (its `cset`
+    materializes anyway, so the fused compare would be a second
+    `cmp`), or when `emit_icmp` did not produce a single
+    flag-setting inst (`ProducesFlagsTwiceSideEffect`, const-folded
+    compares). `csinc` increments on the false arm, so the rule
+    inverts `cc`. The rules sit below `carry_cinc` (priorities 69/68
+    vs 70-77): the unsigned-carry shape is a subset of this pattern
+    and the extern's decline path emits a plain `add`, which would
+    shadow them. Test: `pliron-clif-opt/tests/aarch64_cinc.rs`.
+
+118. x64 amode: fold `(idx + K) << s` into the load/store displacement
+    (`isa/x64/inst.isle` `amode_imm_reg_reg_shift_iadd_shl_{lhs,rhs}{,2}`,
+    priorities 3-6 over the plain `ishl` rules; `PLIRON_X64_AMODEIADD=0` disables): pliron lowers indexed
+    addressing as `iadd (ishl (iadd idx K) s) base`, which used to
+    materialize `idx+K` in a register (`leaq` per element in unrolled
+    loops). Now `K<<s` joins the amode's imm32, checked with
+    `i64_try_into_i32` + `i32_checked_add`, so `[base + idx*4 + 4*K]`
+    is one memory operand like LLVM's.
+
+119. x64 Windows `CallConv::Tail` xmm8-15 callee-saves (`PLIRON_X64_TAILXMM=0`
+    disables; `isa/x64/abi.rs` `tail_winxmm`/`is_tail_windows_xmm_save`/
+    `TAIL_WINDOWS_CLOBBERS`, `pliron_set_x64_windows` thread-local set
+    from the ISA triple in `isa/x64/mod.rs::compile_vcode`): pliron's
+    internal ABI is `Tail`, and a Tail callee reported the SysV clobber
+    set, so every WindowsFastcall caller of an internal function
+    clobbered all ten callee-saved xmm regs and saved xmm6-15 (~160 B,
+    20 movdqu) even with no xmm values live. On Windows, Tail calls now
+    report `SYSV_CLOBBERS \ xmm8-15` and Tail callees save xmm8-15 when
+    they use them — same contract as the Windows ABI, so callers keep
+    live xmm8-15 across internal calls and save nothing they don't use.
+    xmm6/7 stay volatile (Tail float args/rets use xmm0-7), so the floor
+    is 32 B. regex-syntax STK ratio 1.556 -> 1.269. Test:
+    `pliron-clif-opt/tests/x64_tail_winxmm.rs`.
+
+120. x64 Windows `CallConv::Tail` fastcall-lane args (`PLIRON_X64_TAILARGS=0`
+    disables; same file, `tail_winargs` — requires `tail_winxmm` so the
+    callee-save filter and call-site clobber set can't disagree):
+    `get_intreg_for_arg`/`get_fltreg_for_arg` map Tail args by absolute
+    position to the fastcall lanes (rcx,rdx,r8,r9 then rsi,rdi;
+    xmm0-3 then xmm4/5) instead of the SysV order — a WindowsFastcall
+    caller passes its first four args straight through with no shuffles.
+    Float args/rets then never touch xmm6/7 (`get_fltreg_for_retval`
+    caps at xmm5), so `is_tail_windows_xmm_save` adds them to the
+    preserved set and `TAIL_WINDOWS_ARGS_CLOBBERS` (SysV minus xmm6-15)
+    reports them unclobbered at Tail call sites. i128 halves still take
+    consecutive absolute positions; args past index 5 spill to the
+    stack as before. `translate` frame 2024 -> 1992 B; STK 1.269 ->
+    1.218. Same test file.
+
+121. x64 `is_move` now also matches a `movl_mr` *self*-move
+    (`isa/x64/inst/mod.rs`). `gen_move` emits `movl` for <=32-bit vregs;
+    when regalloc places source and destination in the same preg the
+    emitted `movl %r, %r` is dead — low 32 bits unchanged, and upper
+    bits of narrow vregs are undefined so no consumer can read them.
+    Only the equal-preg case matches: `movl_rm` (`movzx`'s real
+    zero-extend, whose self-move is load-bearing) is deliberately not a
+    move, and a non-self `movl` must not join MCP's 64-bit value-class
+    tracking, which models full-width equality. fib loop drops the
+    `movl %ecx,%ecx` arg self-move (isub result already in the arg
+    lane); gated by the same `PLIRON_MCP` switch that runs the block.
+
+122. x64 dead flag-recompute elision (`machinst/vcode.rs` emit loop;
+    `PLIRON_FLAGDUP=0` disables). One `icmp` feeding several consumers
+    lowers to a fresh `cmp`/`test` per consumer even when nothing
+    between writes flags or redefine the operands. During emit, vcode
+    tracks the last flag-setting compare as `(key, preg_a, preg_b)` —
+    key distinguishes `cmp` from `test`, `*_rm` from `*_mr`, and
+    opcode/size — and skips an identical compare when only
+    flag-preserving insts intervene and neither operand preg is
+    redefined. Classification is a new `MachInst::flag_kind`
+    (`machinst/mod.rs`): `Cmp`/`Test` (updates state), `Neutral`
+    (flag-preserving — checked against the operand defs so a neutral
+    inst rewriting a tracked operand clears state), `Other` (clears).
+    `Neutral` is whitelist-by-mnemonic (moves, `lea`, `cmov`, `setcc`,
+    `nop`, sign/zero-extends...) via a generated `mnemonic()` on the
+    assembler enum (`cranelift-assembler-x64-meta/src/generate.rs`) —
+    not a blacklist, so unmodeled insts (calls, terminators, prologue
+    insts, fixed-preg pseudos) conservatively clear. Implicit-operand
+    writers (`cbw`/`cwde`/`cdqe`/`cwd`/`cdq`/`cqo` — rax/rdx defs
+    invisible to `preg_ops`) are excluded from the whitelist. Block
+    boundaries reset via the `bind_label` sites, and every RA edit
+    (`Move`, fused spill/reload/remat pairs) clears state if it writes
+    either tracked preg — edits route through the same `do_emit`
+    funnel. Bisect aids: `PLIRON_FLAGDUP_BISECT=N` (first N elisions
+    only), `PLIRON_FLAGDUP_FORMS=rc,rt,ic,it` (reg-reg cmp/test,
+    reg-imm cmp/test), `PLIRON_FLAGDUP_FN=<substr>`/`!<substr>`
+    (per-function, deterministic unlike the process-global counter),
+    `PLIRON_FLAGDUP_LOCAL=N` (function-local elision budget),
+    `PLIRON_FLAGDUP_TRACE` (prints each elision + running total).
+
+    cmp3 miscompile: `lea` was whitelisted, but `emit_lea` shrinks
+    `lea` to flag-writing `add` when the destination equals the base
+    (`ImmReg`) or base/index (`RegReg`, scale-1, offset-0) —
+    `leal 2(%rdx),%edx` emitted as `addl $2,%edx` clobbered the flags a
+    still-elided `cmpb` relied on, flipping sort order. `flag_kind`
+    now calls `lea_encodes_as_add` (`isa/x64/inst/mod.rs`, mirroring
+    `emit_lea`'s shrink conditions) and classifies those `leal`/`leaq`
+    as `Other`. Regression: `tests/cmp3` e2e stanza (the lea->add
+    shape is regalloc-dependent, not CLIF-controllable);
+    `pliron-clif-opt/tests/x64_flagdup.rs` covers same-block reuse,
+    operand rewrite, and intervening flag writers.
+
+123. Edge-move hoisting at conditional-branch tails (`machinst/vcode.rs`
+    emit loop; opt-in `PLIRON_EDGEHOIST=1`). A `b.cc T, F` whose edge E
+    is a pure move+jump block (a split critical edge, typically a loop
+    back-edge) pays an unconditional `b H` per trip on top of the
+    conditional. Hoist E's regalloc edits ahead of the branch, retarget
+    it at E's destination H, and let the exit block fall through —
+    `moves; b.cc H`, one taken branch, the shape LLVM's
+    MachineBlockPlacement picks. Both orientations are tried
+    (`taken=E` directly, `not_taken=E` after `invert_cond_br`), via new
+    `MachInst` hooks `cond_br_targets` / `set_cond_br_taken` /
+    `invert_cond_br` / `uncond_br_target` (`machinst/mod.rs`, x64 and
+    aarch64 impls). Safety: E must be a single `jmp` with no params and
+    no non-edit items, not an indirect-branch target, not already
+    merged; `edgehoist_demanded` walks the other successor and its
+    successors (bounded, 8 blocks, per-block use-before-def) collecting
+    every location read at entry — a hoisted `to` colliding, or a
+    live-in value bound to a successor param that can't be named
+    locally, rejects the candidate; a `to` colliding with a preg the
+    branch itself reads (aarch64 cbz/tbz) also rejects. E merges away
+    only when physically adjacent AND single-CFG-pred AND free of
+    EDGEMERGE/BJALIAS duplicates (`canon_dups`) — a dedup'd edge block
+    shares E's label, so merging E would route the dup's preds to H
+    skipping the shared moves (the selmul `Option::fmt` miscompile).
+    Bisect aids: `PLIRON_EH_TRACE`, `PLIRON_EH_FN=<substr>`/`!<substr>`,
+    `PLIRON_EH_LOCAL=N` (function-local budget), `PLIRON_EH_BISECT=N`
+    (global, nondeterministic across parallel lowers). Regressions:
+    `optin:cmp3`/`optin:elabloops`/`optin:selmul` gate stanzas.
+
+124. Call-crossing guard in `lastuse_schedule` (`context.rs`; default
+    on, `PLIRON_LUCALLX=0` restores). The pass moves a pure producer to
+    just before a later RMW use to expose destructive two-address
+    forms; when the move crosses a `call` it stretches the value's live
+    range across a register clobber, typically forcing it into a
+    callee-saved register — worse than the copy the RMW saves (fib's
+    `next` was scheduled pre-call, overlapping the loop-carried param
+    and blocking the back-edge param merge; with the guard the update
+    stays post-call, `cur` keeps one register, `addl $-2` in place —
+    LLVM's loop shape). A cached per-block `call_pre` prefix count
+    (rebuilt with `pos`) makes the check O(1) per candidate.
+
+125. Cross-block flag-state propagation + conditional-move folding
+    (`machinst/vcode.rs` emit loop; opt-in `PLIRON_FLAGX=1`,
+    `PLIRON_FLAGX_TRACE` diagnostics). FLAGDUP's tracked compare and a
+    `(mask, value)` known-EFLAGS-bit pair propagate to a successor that
+    has exactly one CFG predecessor — the pred's exit state is
+    snapshotted per block (`exit_flags`, keyed by block index, taken at
+    its terminator's entry) so layout order doesn't matter. A
+    conditional-branch pred additionally proves flag bits on each edge
+    (`MachInst::flag_branch` → `FlagBranch{taken,not_taken,taken_bits,
+    fall_bits}`; x64 `JmpCond` via `cc_proven_bits`: e.g. `jz`-taken
+    pins ZF, `jb`-taken pins CF, `jbe`-fallthrough pins CF=ZF=0;
+    compound signed ccs pin nothing). In-block flag effects then apply
+    as usual (`Cmp` rewrites everything, `Other`/operand rewrites
+    clear). Two consumers: the propagated compare lets FLAGDUP kill a
+    re-issued `cmp` across the boundary, and `MachInst::flag_cc_eval`
+    (`cc_eval_flag` over CF=1,ZF=2,SF=4,OF=8,PF=16) decides a
+    `cmov`'s cc — `Some(false)` elides it (a proven-false cmov is a
+    no-op). `cmov` with a memory source still performs the load, so
+    only register-source `cmov{w,l,q}` forms may fold (checked
+    per-variant against `GprMem::is_memory`). Regressions:
+    `pliron-clif-opt/tests/x64_flagdup.rs`
+
+    Status: **superseded by `EDGESEL`, stays opt-in.** Post-EDGESEL
+    corpus check (all bench kernels + std deps): 1516 cross-block
+    propagations, **0** `FLAGX elide` cmov folds, and identical
+    FLAGDUP elide counts (98) with `PLIRON_FLAGX=0` vs `=1` — the
+    CLIF-level pass already folds the selects/cmovs this was built
+    to kill, so the emit-level machinery finds nothing to do. Kept
+    behind `PLIRON_FLAGX=1` for future shapes that reach emit with
+    edge-pinned conditions.
+    (`edge_cc_folds_cmov`, `multi_pred_keeps_cmov`) and the
+    `optin:cmp3`/`optin:elabloops`/`optin:selmul` gate stanzas.
+
+126. Call-arg zero-extension skipping for i32 (`PLIRON_ARGUEXT=1`,
+     opt-in). The shared `skip_uext` machinery queried
+     `narrow_arg_uext_clean` only for i8/i16 call operands; a new
+     `LowerBackend::arg_uext_skip_bits` (default 16) lets x64 raise the
+     cap to 32, and `call_arg_uext_skips` takes the max as a parameter.
+     x64's `narrow_arg_uext_clean` answers with `arg_uext_clean32`: an
+     i32 operand is "clean" when its register already holds the
+     zero-extended form, which every 32-bit-writing producer gives for
+     free on x86-64. `clean32` walks the producer cone (budget 8):
+     passthroughs (`ireduce` of a dirty i64, `copy`/`black_box`
+     aliases, blockparams, call results without `uext` on the return
+     slot) are dirty, everything else writes a 32-bit GPR.
+     `clean_upper32` answers the i64 side for `ireduce` sources
+     (`iconst <= u32::MAX`, `uextend` of <=i32, `uload32`, `band` with
+     one clean half, `bor`/`bxor` with both, `ushr` by >=32). The
+     `clean` gate in `machinst/abi.rs` widened `ty_bits <= 16` to
+     `< word_bits` — the skip list itself is now the width gate. No
+     observed wins on the corpus yet (our own signatures don't mark
+     u32 args `uext`); kept opt-in for extern-ABIs that do.
+
+127. Call-arg detach on direct uses only (default-on;
+     `PLIRON_ARGDIRECT=0` restores the transitive test).
+     `arg_detach` copied any arg whose
+     `value_ir_uses == Multiple` into a fresh vreg so the ABI's
+     fixed-register use doesn't pin the value's whole bundle. But
+     `value_ir_uses` propagates `Multiple` transitively through the
+     producer cone of a multiply-used value — a call *result* that
+     feeds a multi-used accumulator back-marks the call's args — so
+     single-use args were detached too, costing a `mov` per call
+     (fib's `leal -1(%r12), %eax; movl %eax, %ecx; call`). A value
+     used only by this call dies at the call; pinning it to the arg
+     register is free, so the copy is pure waste. ARGDIRECT gates the
+     `ValueDef::Result` case on `value_direct_uses[v] > 1` (the
+     non-transitive map) — block params still always detach. Read per
+     call inst so tests can toggle within one process. Fib's
+     recursive loop now matches LLVM's shape exactly
+     (`leal -0x1(%r12), %ecx; call`). Regression:
+     `pliron-clif-opt/tests/x64_argdirect.rs`; gate clean with
+     `PLIRON_ARGDIRECT=1` (four pre-existing environmental failures:
+     Windows fat-LTO, missing `nm`, catch_unwind/SEH, loop-align).
+
+128. Diamond-arm chain placement (default-on; `PLIRON_CHAINJOIN=0`
+     restores the in-count preference).
+     `BCHAIN`'s fallthrough pick scores each successor by rank, then
+     latch, then predecessor count — so a brif whose successors are
+     `arm` + `join` (the join's other predecessor being the arm) picks
+     the join: it has more preds, and inside a loop it dominates the
+     latch, earning the rank-2 spine bonus. The arm is then deferred
+     to the far end of the function and every trip through it pays
+     two taken branches (`jcc` out, `jmp` back) — `iter().filter`'s
+     keep-block cost a `ja`+`jmp` per kept element in `iterw`
+     (~1.40x vs LLVM). CHAINJOIN detects the diamond — a sibling
+     successor of `block` is also a predecessor of `succ`, and is a
+     viable chain target itself (non-cold, not a back edge, idom
+     dominated by `block`) — and caps the join's rank at 1 while
+     tie-breaking for non-joins, yielding `block, arm, join` with
+     both edges fallthrough. A cold-arm diamond keeps the join
+     preference. iterw's filter loop now matches LLVM's shape and
+     runtime (~1.0x). Read per function so tests can toggle within
+     one process. Regression:
+     `pliron-clif-opt/tests/x64_chainjoin.rs`.
+
+129. Small-multiplier `lea` for `imul x, d` (default-on;
+     `PLIRON_X64_IMULEA=0` keeps `imul`). LLVM strength-reduces `x·d` for
+     `d ∈ {3,5,9}` to `lea (x, x·(d-1))` — 1c vs `imul`'s 3c, one
+     inst. The `·2^k` tail of `d·2^k` multipliers is NOT handled
+     here: emitting `lea` + `shl` for `x·(d·2^k)` measured slower
+     than the `imul` + consumer `lea` pair it replaced (~320ms vs
+     ~300ms on parse_only) because it inserts an inst LLVM never
+     needs — LLVM instead folds the `·2^k` into the *consumer's*
+     addressing mode. So `clifpeep::mulea_sweep` (post_sweep stage,
+     same gate) splits `imul x, d·2^k` into `imul x, d` +
+     `ishl …, k` only when every use is an `iadd`: x64's existing
+     `to_amode_add` then folds the `ishl` into `base + idx<<k`.
+     `parse::<u32>`'s `acc·10 + digit` emits `leal (%r,%r,4)` +
+     `leal -0x30(%r,%rdx,2)` — LLVM's exact shape. The rule itself:
+     `pliron_mul_lea_d` extractor (pure, `imulea_enabled()` env
+     check) matching a `u64_from_iconst` multiplier of 3/5/9 at
+     priority 10, emitting `x64_lea` over
+     `Amode.ImmRegRegShift(0, x, x, log2(d-1))`. Multi-use or
+     non-`iadd`-fed `d·2^k` products keep `imul`. Regression:
+     `pliron-clif-opt/tests/x64_mulea.rs`.
+
+130. Single-use gate on the `iadd x, K` displacement fold
+     (default-on; `PLIRON_X64_SUAMODE=0` = stock unconditional fold).
+     `to_amode_add_const_fold_iadd_*` folded a constant `iadd`
+     operand into the lea/load displacement regardless of how many
+     uses the sum had. When the sum feeds something else too it is
+     materialized regardless, and the fold then keeps the *addend*
+     live next to the materialized result — `parse::<u32>`'s
+     `char - 0x30` is used by the digit range check and by
+     `acc*10 + digit`, and the folded `leal -0x30(char, acc*2)`
+     kept the raw char live across the check (extra live range in
+     an unrolled loop; ~283ms vs ~270ms on the parse bench). The
+     stock four rules are replaced by two using the
+     `pliron_iadd_su_iconst` extractor (pure, both operand orders):
+     under the gate it declines when `value_single_direct_use` is
+     false, so the sum materializes and the lea reads its register
+     — `leal -0x30(%rdx), %r10d` + `cmpl` + `leal (%r10,%rdx,2)`,
+     LLVM's exact shape. The use count is `value_direct_uses`
+     (direct, not the transitive `value_ir_uses`). New accessor:
+     `Lower::value_single_direct_use` (machinst/lower.rs).
+     Regression: `pliron-clif-opt/tests/x64_suamode.rs` (+ `_off`).
+
+131. Loop-side fallthrough placement (default-on; `PLIRON_LOOPFT=0`
+     disables).
+     When a brif's two arms are a leaf/return block and a block that
+     can reach a back-edge latch, prefer the loop arm as the
+     fallthrough: loop work stays on the straight-line fetch path
+     while the leaf arm takes the out-of-line spot. Recursive hot
+     loops otherwise pay a taken front-end redirect per non-leaf
+     call — fib measured ~1.4x slower with the (more frequent) leaf
+     arm inline, then ~1.0x (LLVM parity) once the loop arm fell
+     through. Both mechanisms that pick fallthrough successors get
+     the same signal, computed once per function by reverse BFS:
+     `BCHAIN`'s chain pick gains a `reaches_latch` tie-break after
+     `latch` (back-edge sources seeded from `is_latch`), and
+     `PLACE`'s edge-weight key gains `reach_loop` between `w` and
+     `!unplaced_other` (blocks reaching `innermost.is_some()`).
+     Ties only — explicit edge weights still dominate. Regression:
+     `pliron-clif-opt/tests/x64_loopft.rs`.

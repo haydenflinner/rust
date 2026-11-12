@@ -16,7 +16,7 @@ use crate::{
         inserter::{BlockInsertionPoint, IRInserter, Inserter, OpInsertionPoint},
         listener::RewriteListener,
     },
-    linked_list::{ContainsLinkedList, LinkedList},
+    linked_list::ContainsLinkedList,
     location::Located,
     op::Op,
     operation::Operation,
@@ -223,7 +223,7 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
         {
             new_op.deref_mut(ctx).set_loc(op.deref(ctx).loc());
         }
-        let new_values = new_op.deref(ctx).results().collect();
+        let new_values = new_op.deref(ctx).results(ctx).collect();
         self.replace_operation_with_values(ctx, op, new_values);
     }
 
@@ -239,7 +239,7 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
         );
 
         // We need to collect the results first to avoid `RefCell` borrowing issues.
-        let results: Vec<_> = op.deref(ctx).results().zip(new_values).collect();
+        let results: Vec<_> = op.deref(ctx).results(ctx).zip(new_values).collect();
         for (res, new_res) in results {
             self.get_listener_mut()
                 .notify_value_use_replacement(ctx, res, new_res);
@@ -268,7 +268,7 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
     fn erase_operation(&mut self, ctx: &mut Context, op: Ptr<Operation>) {
         // We don't rely on `Operation::erase` below to erase sub-entities
         // because we want the listener to be notified for each erased sub-entity.
-        let regions = op.deref(ctx).regions().collect::<Vec<_>>();
+        let regions = op.deref(ctx).regions(ctx).collect::<Vec<_>>();
         for region in regions.into_iter().rev() {
             self.erase_region(ctx, region);
         }
@@ -374,12 +374,12 @@ impl<L: RewriteListener> Rewriter for IRRewriter<L> {
             }
             OpInsertionPoint::AtBlockEnd(_target_block) => None,
             OpInsertionPoint::BeforeOperation(op) => Some(op),
-            OpInsertionPoint::AfterOperation(op) => op.deref(ctx).get_next(),
+            OpInsertionPoint::AfterOperation(op) => op.get_next(ctx),
             OpInsertionPoint::Unset => panic!("Cannot split block at unset insertion point."),
         };
         let mut current_op_opt = first_op_opt;
         while let Some(current_op) = current_op_opt {
-            let next_op = current_op.deref(ctx).get_next();
+            let next_op = current_op.get_next(ctx);
             rewriter.move_operation(ctx, current_op, OpInsertionPoint::AtBlockEnd(new_block));
             current_op_opt = next_op;
         }

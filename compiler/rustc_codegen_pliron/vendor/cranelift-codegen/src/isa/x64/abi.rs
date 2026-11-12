@@ -71,6 +71,54 @@ impl X64ABIMachineSpec {
 
 impl IsaFlags for x64_settings::Flags {}
 
+// PLIRON: shared env picker for `get_machine_env{,_for}`; `hi_in` lets a
+// caller further narrow the allocatable set (see patch 49).
+fn machine_env_inner(flags: &settings::Flags, _call_conv: isa::CallConv, hi_in: bool) -> &MachineEnv {
+    // PLIRON: when frame pointers are omitted, RBP is unused by the frame
+    // and becomes a callee-saved allocatable register like any other.
+    static NO_FREE_RBP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static HI_ALWAYS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let free_rbp = !flags.preserve_frame_pointers()
+        && !*NO_FREE_RBP.get_or_init(|| std::env::var_os("PLIRON_NO_FREE_RBP").is_some());
+    // PLIRON_HI_ALWAYS diagnostic: force the hi env even for functions
+    // with no >256-bit values (A/B the patch-49 gate).
+    let hi = (hi_in || *HI_ALWAYS.get_or_init(|| std::env::var_os("PLIRON_HI_ALWAYS").is_some()))
+        && super::inst::high_xmm_regs();
+    match (flags.enable_pinned_reg(), free_rbp, hi) {
+        (true, false, false) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, false, false);
+            &MACHINE_ENV
+        }
+        (true, false, true) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, false, true);
+            &MACHINE_ENV
+        }
+        (true, true, false) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, true, false);
+            &MACHINE_ENV
+        }
+        (true, true, true) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true, true, true);
+            &MACHINE_ENV
+        }
+        (false, false, false) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, false, false);
+            &MACHINE_ENV
+        }
+        (false, false, true) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, false, true);
+            &MACHINE_ENV
+        }
+        (false, true, false) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, true, false);
+            &MACHINE_ENV
+        }
+        (false, true, true) => {
+            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false, true, true);
+            &MACHINE_ENV
+        }
+    }
+}
 impl ABIMachineSpec for X64ABIMachineSpec {
     type I = Inst;
 
@@ -719,14 +767,22 @@ impl ABIMachineSpec for X64ABIMachineSpec {
 
         // Adjust the stack pointer downward for clobbers and the function fixed
         // frame (spillslots, storage slots, and argument area).
+        let frameless = frame_layout.setup_area_size == 0;
         let stack_size = frame_layout.fixed_frame_storage_size
             + frame_layout.clobber_size
             + frame_layout.outgoing_args_size;
         if stack_size > 0 {
             let rsp = Writable::from_reg(regs::rsp());
-            let stack_size = i32::try_from(stack_size)
+            let stack_size_i = i32::try_from(stack_size)
                 .expect("`stack_size` is too large to fit in a 32-bit immediate");
-            insts.push(Inst::subq_mi(rsp, stack_size));
+            insts.push(Inst::subq_mi(rsp, stack_size_i));
+            if flags.unwind_info() && frameless {
+                // Without a frame pointer the unwinder must track the
+                // allocation to keep CFA correct.
+                insts.push(Inst::Unwind {
+                    inst: UnwindInst::StackAlloc { size: stack_size },
+                });
+            }
         }
 
         // Store each clobbered register in order at offsets from RSP,
@@ -754,9 +810,14 @@ impl ABIMachineSpec for X64ABIMachineSpec {
             ));
 
             if flags.unwind_info() {
+                // With a frame pointer, save offsets are relative to the frame
+                // base at the bottom of the clobber area (see
+                // `UnwindInst::DefineNewFrame`). Without one they are relative
+                // to post-prologue RSP.
+                let clobber_offset = if frameless { off + clobber_offset } else { off };
                 insts.push(Inst::Unwind {
                     inst: UnwindInst::SaveReg {
-                        clobber_offset: off,
+                        clobber_offset,
                         reg: r_reg,
                     },
                 });
@@ -776,8 +837,14 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         // Restore regs by loading from offsets of RSP. We compute the offset from
         // the same base as above in clobber_save, as RSP won't change between the
         // prologue and epilogue.
-        let mut cur_offset =
+        let clobber_offset =
             frame_layout.fixed_frame_storage_size + frame_layout.outgoing_args_size;
+        // PLIRON: accumulate the *relative* offset like `gen_clobber_save`
+        // does, and add `clobber_offset` when addressing. Aligning the
+        // absolute offset instead would disagree with the save side whenever
+        // the clobber-area base isn't itself 16-aligned, silently shifting
+        // vector saves.
+        let mut cur_offset = 0;
         for reg in &frame_layout.clobbered_callee_saves {
             let rreg = reg.to_reg();
             let ty = match rreg.class() {
@@ -791,7 +858,10 @@ impl ABIMachineSpec for X64ABIMachineSpec {
 
             insts.push(Inst::load(
                 ty,
-                Amode::imm_reg(cur_offset.try_into().unwrap(), regs::rsp()),
+                Amode::imm_reg(
+                    (cur_offset + clobber_offset).try_into().unwrap(),
+                    regs::rsp(),
+                ),
                 Writable::from_reg(rreg.into()),
                 ExtKind::None,
             ));
@@ -873,19 +943,26 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         // We allocate in terms of 8-byte slots.
         match rc {
             RegClass::Int => 1,
-            RegClass::Float => vector_scale / 8,
+            RegClass::Float => vector_scale.max(super::inst::wide_vector_bits() / 8) / 8,
             RegClass::Vector => unreachable!(),
         }
     }
 
+    // PLIRON: only allow zmm16-31 in a function that actually has a
+    // >256-bit vector value. Parking a narrow (<=256-bit) vreg in the high
+    // registers miscompiles — lanes 12-15 of the last f32x4 chunk of each
+    // 64-byte region corrupt — so only functions with real 512-bit data
+    // keep the wide env and stay profitable (see PLIRON patch 49).
+    fn get_machine_env_for(
+        has_wide: bool,
+        flags: &settings::Flags,
+        call_conv: isa::CallConv,
+    ) -> &MachineEnv {
+        machine_env_inner(flags, call_conv, has_wide)
+    }
+
     fn get_machine_env(flags: &settings::Flags, _call_conv: isa::CallConv) -> &MachineEnv {
-        if flags.enable_pinned_reg() {
-            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(true);
-            &MACHINE_ENV
-        } else {
-            static MACHINE_ENV: MachineEnv = create_reg_env_systemv(false);
-            &MACHINE_ENV
-        }
+        machine_env_inner(flags, _call_conv, true)
     }
 
     fn get_regs_clobbered_by_call(
@@ -894,6 +971,10 @@ impl ABIMachineSpec for X64ABIMachineSpec {
     ) -> PRegSet {
         match (call_conv_of_callee, is_exception) {
             (isa::CallConv::Tail, true) => ALL_CLOBBERS,
+            // PLIRON: on Windows, Tail callees preserve xmm8-15 (or xmm6-15
+            // when `tail_winargs` frees xmm6/7 from the arg set).
+            (isa::CallConv::Tail, false) if tail_winargs() => TAIL_WINDOWS_ARGS_CLOBBERS,
+            (isa::CallConv::Tail, false) if tail_winxmm() => TAIL_WINDOWS_CLOBBERS,
             // Note that "PreserveAll" actually preserves nothing at
             // the callsite if used for a `try_call`, because the
             // unwinder ABI for `try_call`s is still "no clobbered
@@ -934,10 +1015,20 @@ impl ABIMachineSpec for X64ABIMachineSpec {
             // The `winch` calling convention doesn't have any callee-save
             // registers.
             CallConv::Winch => vec![],
-            CallConv::Fast | CallConv::SystemV | CallConv::Tail => regs
+            CallConv::Fast | CallConv::SystemV => regs
                 .iter()
                 .cloned()
                 .filter(|r| is_callee_save_systemv(r.to_reg(), flags.enable_pinned_reg()))
+                .collect(),
+            // PLIRON: on Windows, Tail adds xmm8-15 to the callee-save set
+            // so callers of internal functions don't pay the save storm.
+            CallConv::Tail => regs
+                .iter()
+                .cloned()
+                .filter(|r| {
+                    is_callee_save_systemv(r.to_reg(), flags.enable_pinned_reg())
+                        || (tail_winxmm() && is_tail_windows_xmm_save(r.to_reg()))
+                })
                 .collect(),
             CallConv::WindowsFastcall => regs
                 .iter()
@@ -956,18 +1047,34 @@ impl ABIMachineSpec for X64ABIMachineSpec {
         // Compute clobber size.
         let clobber_size = compute_clobber_size(&regs);
 
-        // Compute setup area size: RBP + return address. PLIRON: leaf functions
-        // with nothing on the stack skip `push rbp; mov rbp, rsp` (as aarch64
-        // already does), unless frame pointers must be preserved.
+        // Compute setup area size: RBP + return address. PLIRON: when frame
+        // pointers are not required, omit `push rbp; mov rbp, rsp` entirely and
+        // address everything RSP-relative (as LLVM does). The only remaining
+        // need for RBP is tail calls with more stack args than incoming args:
+        // gen_clobber_save resizes the incoming arg area through the FP.
+        //
+        // This must cover every function that could run under
+        // `!preserve_frame_pointers`, because get_machine_env frees RBP for
+        // regalloc in that mode -- if any function still built a frame, an
+        // RBP allocation would corrupt its frame base.
         let frameless = !flags.preserve_frame_pointers()
-            && function_calls == FunctionCalls::None
-            && incoming_args_size == 0
-            && tail_args_size == 0
-            && clobber_size == 0
-            && fixed_frame_storage_size == 0
-            && stackslots_size == 0
-            && outgoing_args_size == 0;
+            && tail_args_size == incoming_args_size
+            && !crate::machinst::abi::pliron_force_fp();
         let setup_area_size = if frameless { 0 } else { 16 };
+
+        // With a frame pointer, `push rbp` absorbs the odd 8 bytes of the
+        // pushed return address and `stack_size` is a multiple of 16. Without
+        // one, the frame must carry those 8 bytes itself so RSP is 16-aligned
+        // at call sites (entry RSP is always 8 mod 16). The pad goes at the
+        // *top* of the frame (inside `clobber_size`), not in
+        // `outgoing_args_size`: the clobber area base must stay 16-aligned or
+        // vector saves land on odd offsets that `UWOP_SAVE_XMM128`'s
+        // 16-byte-unit offset can't represent.
+        let mut clobber_size = clobber_size;
+        if frameless && function_calls != FunctionCalls::None {
+            let total = fixed_frame_storage_size + clobber_size + outgoing_args_size;
+            clobber_size += (8u32.wrapping_sub(total)) % 16;
+        }
 
         // Return FrameLayout structure.
         FrameLayout {
@@ -1035,6 +1142,22 @@ impl From<StackAMode> for SyntheticAmode {
 }
 
 fn get_intreg_for_arg(call_conv: CallConv, idx: usize, arg_idx: usize) -> Option<Reg> {
+    // PLIRON: on Windows, `Tail` int args use the fastcall lanes by
+    // absolute position, then rsi/rdi — a WindowsFastcall caller already
+    // has the first four args in place. `arg_idx` keeps the mapping
+    // injective when a lane holds a float arg instead.
+    if call_conv == CallConv::Tail && tail_winargs() {
+        return match arg_idx {
+            0 => Some(regs::rcx()),
+            1 => Some(regs::rdx()),
+            2 => Some(regs::r8()),
+            3 => Some(regs::r9()),
+            4 => Some(regs::rsi()),
+            5 => Some(regs::rdi()),
+            _ => None,
+        };
+    }
+
     let is_fastcall = call_conv == CallConv::WindowsFastcall;
 
     // Fastcall counts by absolute argument number; SysV counts by argument of
@@ -1056,6 +1179,21 @@ fn get_intreg_for_arg(call_conv: CallConv, idx: usize, arg_idx: usize) -> Option
 }
 
 fn get_fltreg_for_arg(call_conv: CallConv, idx: usize, arg_idx: usize) -> Option<Reg> {
+    // PLIRON: `Tail` float args mirror the int lanes on Windows — xmm0-3
+    // by absolute position, then xmm4/5 — freeing xmm6/7 for the
+    // callee-save set.
+    if call_conv == CallConv::Tail && tail_winargs() {
+        return match arg_idx {
+            0 => Some(regs::xmm0()),
+            1 => Some(regs::xmm1()),
+            2 => Some(regs::xmm2()),
+            3 => Some(regs::xmm3()),
+            4 => Some(regs::xmm4()),
+            5 => Some(regs::xmm5()),
+            _ => None,
+        };
+    }
+
     let is_fastcall = call_conv == CallConv::WindowsFastcall;
 
     // Fastcall counts by absolute argument number; SysV counts by argument of
@@ -1120,14 +1258,16 @@ fn get_intreg_for_retval(
 fn get_fltreg_for_retval(call_conv: CallConv, fltreg_idx: usize, is_last: bool) -> Option<Reg> {
     match call_conv {
         CallConv::Tail => match fltreg_idx {
+            // PLIRON: on Windows xmm6/7 are callee-saved under
+            // `tail_winargs`, so they cannot return values either.
             0 => Some(regs::xmm0()),
             1 => Some(regs::xmm1()),
             2 => Some(regs::xmm2()),
             3 => Some(regs::xmm3()),
             4 => Some(regs::xmm4()),
             5 => Some(regs::xmm5()),
-            6 => Some(regs::xmm6()),
-            7 => Some(regs::xmm7()),
+            6 if !tail_winargs() => Some(regs::xmm6()),
+            7 if !tail_winargs() => Some(regs::xmm7()),
             _ => None,
         },
         CallConv::Fast | CallConv::SystemV | CallConv::PreserveAll => match fltreg_idx {
@@ -1137,12 +1277,68 @@ fn get_fltreg_for_retval(call_conv: CallConv, fltreg_idx: usize, is_last: bool) 
         },
         CallConv::WindowsFastcall => match fltreg_idx {
             0 => Some(regs::xmm0()),
+            1 => Some(regs::xmm1()), // The Rust ABI returns {f64,f64} pairs in xmm0/xmm1.
             _ => None,
         },
         CallConv::Winch => is_last.then(|| regs::xmm0()),
         CallConv::Probestack => todo!(),
         CallConv::AppleAarch64 => unreachable!(),
     }
+}
+
+// PLIRON: set per-compile by `X64Backend::compile_vcode` from the ISA
+// triple. On Windows x64 our internal `CallConv::Tail` treats xmm8-15 as
+// callee-saved (xmm6/7 stay volatile: they are Tail float arg/retval
+// regs, `get_fltreg_for_{arg,retval}`). Stock Tail inherits the SysV
+// clobber set, so every WindowsFastcall caller of an internal function
+// reported all ten callee-saved xmm regs as clobbered and paid a
+// ~160-byte save/restore storm even when it never touched them.
+// `PLIRON_X64_TAILXMM=0` restores the old behavior.
+thread_local! {
+    static PLIRON_X64_WINDOWS: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+pub(crate) fn pliron_set_x64_windows(is_windows: bool) {
+    PLIRON_X64_WINDOWS.with(|c| c.set(is_windows));
+}
+
+fn tail_winxmm() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("PLIRON_X64_TAILXMM").map_or(true, |v| v != "0")
+    });
+    *ON && PLIRON_X64_WINDOWS.with(|c| c.get())
+}
+
+// PLIRON: `PLIRON_X64_TAILARGS=0` disables the fastcall-lane argument
+// registers for `CallConv::Tail` on Windows (rcx,rdx,r8,r9 + xmm0-3 by
+// absolute position, then rsi,rdi + xmm4,5). Args then arrive in the
+// same registers a WindowsFastcall caller placed them — no shuffle.
+// Only with this do xmm6/7 stop being Tail arg/retval regs, so they may
+// join the callee-save set too.
+fn tail_winargs() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("PLIRON_X64_TAILARGS").map_or(true, |v| v != "0")
+    });
+    // Requires `tail_winxmm`: the callee-save filter and the call-site
+    // clobber set must agree on xmm6-15.
+    *ON && tail_winxmm()
+}
+
+/// PLIRON: xmm8-15 are callee-saved under `CallConv::Tail` on Windows;
+/// xmm6/7 join them when `tail_winargs` removes them from the arg set
+/// (stock Tail passes and returns floats in xmm0-7).
+fn is_tail_windows_xmm_save(r: RealReg) -> bool {
+    use asm::xmm::enc::*;
+
+    r.class() == RegClass::Float
+        && match r.hw_enc() {
+            XMM6 | XMM7 => tail_winargs(),
+            _ => true,
+        }
+        && matches!(
+            r.hw_enc(),
+            XMM6 | XMM7 | XMM8 | XMM9 | XMM10 | XMM11 | XMM12 | XMM13 | XMM14 | XMM15
+        )
 }
 
 fn is_callee_save_systemv(r: RealReg, enable_pinned_reg: bool) -> bool {
@@ -1200,14 +1396,30 @@ fn compute_clobber_size(clobbers: &[Writable<RealReg>]) -> u32 {
 
 const WINDOWS_CLOBBERS: PRegSet = windows_clobbers();
 const SYSV_CLOBBERS: PRegSet = sysv_clobbers();
+// PLIRON: `CallConv::Tail` call-site clobbers on Windows: the SysV set
+// minus xmm8-15, which Tail callees preserve there (see `tail_winxmm`).
+// xmm6/7 stay clobbered -- they are Tail float arg/retval regs under the
+// stock arg order; `tail_winargs` removes them too.
+const TAIL_WINDOWS_CLOBBERS: PRegSet = tail_windows_clobbers();
+const TAIL_WINDOWS_ARGS_CLOBBERS: PRegSet = tail_windows_args_clobbers();
 pub(crate) const ALL_CLOBBERS: PRegSet = all_clobbers();
 const NO_CLOBBERS: PRegSet = PRegSet::empty();
+
+/// xmm16-31 are caller-saved under every x64 ABI.
+const fn with_high_xmm(mut set: PRegSet) -> PRegSet {
+    let mut i = 16;
+    while i < 32 {
+        set = set.with(regs::fpr_preg(i));
+        i += 1;
+    }
+    set
+}
 
 const fn windows_clobbers() -> PRegSet {
     use asm::gpr::enc::*;
     use asm::xmm::enc::*;
 
-    PRegSet::empty()
+    let set = PRegSet::empty()
         .with(regs::gpr_preg(RAX))
         .with(regs::gpr_preg(RCX))
         .with(regs::gpr_preg(RDX))
@@ -1220,14 +1432,15 @@ const fn windows_clobbers() -> PRegSet {
         .with(regs::fpr_preg(XMM2))
         .with(regs::fpr_preg(XMM3))
         .with(regs::fpr_preg(XMM4))
-        .with(regs::fpr_preg(XMM5))
+        .with(regs::fpr_preg(XMM5));
+    with_high_xmm(set)
 }
 
 const fn sysv_clobbers() -> PRegSet {
     use asm::gpr::enc::*;
     use asm::xmm::enc::*;
 
-    PRegSet::empty()
+    let set = PRegSet::empty()
         .with(regs::gpr_preg(RAX))
         .with(regs::gpr_preg(RCX))
         .with(regs::gpr_preg(RDX))
@@ -1252,7 +1465,58 @@ const fn sysv_clobbers() -> PRegSet {
         .with(regs::fpr_preg(XMM12))
         .with(regs::fpr_preg(XMM13))
         .with(regs::fpr_preg(XMM14))
-        .with(regs::fpr_preg(XMM15))
+        .with(regs::fpr_preg(XMM15));
+    with_high_xmm(set)
+}
+
+// PLIRON: `sysv_clobbers` minus xmm8-15.
+const fn tail_windows_clobbers() -> PRegSet {
+    use asm::gpr::enc::*;
+    use asm::xmm::enc::*;
+
+    let set = PRegSet::empty()
+        .with(regs::gpr_preg(RAX))
+        .with(regs::gpr_preg(RCX))
+        .with(regs::gpr_preg(RDX))
+        .with(regs::gpr_preg(RSI))
+        .with(regs::gpr_preg(RDI))
+        .with(regs::gpr_preg(R8))
+        .with(regs::gpr_preg(R9))
+        .with(regs::gpr_preg(R10))
+        .with(regs::gpr_preg(R11))
+        .with(regs::fpr_preg(XMM0))
+        .with(regs::fpr_preg(XMM1))
+        .with(regs::fpr_preg(XMM2))
+        .with(regs::fpr_preg(XMM3))
+        .with(regs::fpr_preg(XMM4))
+        .with(regs::fpr_preg(XMM5))
+        .with(regs::fpr_preg(XMM6))
+        .with(regs::fpr_preg(XMM7));
+    with_high_xmm(set)
+}
+
+// PLIRON: `sysv_clobbers` minus xmm6-15 (all Windows callee-saved xmm).
+const fn tail_windows_args_clobbers() -> PRegSet {
+    use asm::gpr::enc::*;
+    use asm::xmm::enc::*;
+
+    let set = PRegSet::empty()
+        .with(regs::gpr_preg(RAX))
+        .with(regs::gpr_preg(RCX))
+        .with(regs::gpr_preg(RDX))
+        .with(regs::gpr_preg(RSI))
+        .with(regs::gpr_preg(RDI))
+        .with(regs::gpr_preg(R8))
+        .with(regs::gpr_preg(R9))
+        .with(regs::gpr_preg(R10))
+        .with(regs::gpr_preg(R11))
+        .with(regs::fpr_preg(XMM0))
+        .with(regs::fpr_preg(XMM1))
+        .with(regs::fpr_preg(XMM2))
+        .with(regs::fpr_preg(XMM3))
+        .with(regs::fpr_preg(XMM4))
+        .with(regs::fpr_preg(XMM5));
+    with_high_xmm(set)
 }
 
 /// For calling conventions that clobber all registers.
@@ -1260,7 +1524,7 @@ const fn all_clobbers() -> PRegSet {
     use asm::gpr::enc::*;
     use asm::xmm::enc::*;
 
-    PRegSet::empty()
+    let set = PRegSet::empty()
         .with(regs::gpr_preg(RAX))
         .with(regs::gpr_preg(RCX))
         .with(regs::gpr_preg(RDX))
@@ -1290,10 +1554,11 @@ const fn all_clobbers() -> PRegSet {
         .with(regs::fpr_preg(XMM12))
         .with(regs::fpr_preg(XMM13))
         .with(regs::fpr_preg(XMM14))
-        .with(regs::fpr_preg(XMM15))
+        .with(regs::fpr_preg(XMM15));
+    with_high_xmm(set)
 }
 
-const fn create_reg_env_systemv(enable_pinned_reg: bool) -> MachineEnv {
+const fn create_reg_env_systemv(enable_pinned_reg: bool, free_rbp: bool, high_xmm: bool) -> MachineEnv {
     const fn preg(r: Reg) -> PReg {
         r.to_real_reg().unwrap().preg()
     }
@@ -1354,6 +1619,21 @@ const fn create_reg_env_systemv(enable_pinned_reg: bool) -> MachineEnv {
     if !enable_pinned_reg {
         env.non_preferred_regs_by_class[0] =
             env.non_preferred_regs_by_class[0].with(preg(regs::r15()));
+    }
+    if free_rbp {
+        // RBP is callee-saved under both ABIs; with the frame pointer omitted
+        // it is free for the allocator like R12-R14.
+        env.non_preferred_regs_by_class[0] =
+            env.non_preferred_regs_by_class[0].with(preg(regs::rbp()));
+    }
+    if high_xmm {
+        // zmm16-31 (EVEX only; non-EVEX operands are limited to 0-15).
+        let mut i = 16;
+        while i < 32 {
+            env.non_preferred_regs_by_class[1] =
+                env.non_preferred_regs_by_class[1].with(regs::fpr_preg(i));
+            i += 1;
+        }
     }
 
     env

@@ -148,6 +148,28 @@ pub trait LowerBackend {
     fn maybe_pinned_reg(&self) -> Option<Reg> {
         None
     }
+
+    /// PLIRON: does the register of narrow (i8/i16) return operand `val`
+    /// already hold its zero-extended form, so a `uext` return slot needs
+    /// no extension instruction? Default: never.
+    fn narrow_ret_uext_clean(&self, _ctx: &mut Lower<Self::MInst>, _val: Value) -> bool {
+        false
+    }
+
+    /// PLIRON: does the register of narrow (i8/i16) call operand `val`
+    /// already hold its zero-extended form, so a `uext` arg slot needs
+    /// no extension instruction? Default: never.
+    fn narrow_arg_uext_clean(&self, _ctx: &mut Lower<Self::MInst>, _val: Value) -> bool {
+        false
+    }
+
+    /// PLIRON: widest integer call-arg width (in bits) that
+    /// `narrow_arg_uext_clean` may be consulted for. Default 16 (the
+    /// original narrow scope); x64 raises it to 32 because every
+    /// 32-bit-writing producer zero-extends the register for free.
+    fn arg_uext_skip_bits(&self) -> u32 {
+        16
+    }
 }
 
 /// Machine-independent lowering driver / machine-instruction container. Maintains a correspondence
@@ -199,6 +221,28 @@ pub struct Lower<'func, I: VCodeInst> {
     /// See doc comment on `ValueUseState` for more details.
     value_ir_uses: SecondaryMap<Value, ValueUseState>,
 
+    /// PLIRON: direct use-counts per SSA value (0, 1, or 2+ saturated), as
+    /// counted in the input IR. Unlike `value_ir_uses`, this is *not*
+    /// coarsened by the transitive `Multiple` propagation: a value with
+    /// exactly one direct use stays `1` here even if a transitive consumer
+    /// is multi-used. The side-effect sinking path uses this: an effectful
+    /// inst with a single direct use can always be fused into that consumer,
+    /// since it is emitted exactly once either way.
+    value_direct_uses: SecondaryMap<Value, u8>,
+
+    /// PLIRON: per SSA value, `true` when at least one use cannot fold
+    /// into a memory addressing mode — anything but the address operand
+    /// of a plain load/store. A value needed as a value keeps its
+    /// register live regardless of amode choice.
+    value_non_amode_use: SecondaryMap<Value, bool>,
+
+    /// PLIRON: per SSA value, the highest live-in count of any block
+    /// the value is defined or used in — a register-pressure proxy.
+    /// Keeping a base whole in an amode spans its register across
+    /// those blocks; in high-pressure blocks the decomposed reg+reg
+    /// amode is the cheaper choice.
+    value_max_pressure: SecondaryMap<Value, u32>,
+
     /// Actual uses of each SSA value so far, incremented while lowering.
     value_lowered_uses: SecondaryMap<Value, u32>,
 
@@ -219,6 +263,26 @@ pub struct Lower<'func, I: VCodeInst> {
 
     /// The register to use for GetPinnedReg, if any, on this architecture.
     pinned_reg: Option<Reg>,
+
+    /// PLIRON: pending post-indexed load/store to emit at an earlier
+    /// inst's position; see `set_pending_postindex`.
+    pending_postindex: Option<(Inst, I, InstOutput)>,
+
+    /// PLIRON: detach movs queued by `out_detach` (PLIRON_OUTCOPY);
+    /// appended to `ir_insts` by `finish_ir_inst` so they land right
+    /// after the call they copy results out of.
+    pending_out_movs: SmallVec<[I; 4]>,
+
+    /// PLIRON: lazy CFG+domtree for post-index's dominator-bound-use
+    /// relaxation (`try_postindex` in the aarch64 lower).
+    postindex_cfg_dt: Option<(crate::flowgraph::ControlFlowGraph, crate::dominator_tree::DominatorTree)>,
+
+    /// PLIRON: lazily-built set of blockparams whose every incoming
+    /// blockcall arg is provably narrow-clean (aarch64
+    /// `narrow_uext_clean`; built by `clean_blockparams` there).
+    /// `Rc` so the ISLE context can hold the set while also borrowing
+    /// `self` immutably for the cleanliness walk.
+    narrow_clean_params: Option<alloc::rc::Rc<FxHashSet<Value>>>,
 
     /// Compilation flags.
     flags: Flags,
@@ -484,7 +548,8 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             block_end_colors[bb] = InstColor::new(cur_color);
         }
 
-        let value_ir_uses = compute_use_states(f, sret_param);
+        let (value_ir_uses, value_direct_uses, value_non_amode_use, value_max_pressure) =
+            compute_use_states(f, sret_param);
 
         Ok(Lower {
             f,
@@ -495,6 +560,9 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             block_end_colors,
             side_effect_inst_entry_colors,
             value_ir_uses,
+            value_direct_uses,
+            value_non_amode_use,
+            value_max_pressure,
             value_lowered_uses: SecondaryMap::default(),
             inst_sunk: FxHashSet::default(),
             cur_scan_entry_color: None,
@@ -503,6 +571,10 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             try_call_rets,
             try_call_payloads,
             pinned_reg: None,
+            pending_postindex: None,
+            pending_out_movs: smallvec![],
+            postindex_cfg_dt: None,
+            narrow_clean_params: None,
             flags,
         })
     }
@@ -560,10 +632,27 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     }
 
     /// Generate the return instruction.
-    pub fn gen_return(&mut self, rets: &[ValueRegs<Reg>]) {
+    ///
+    /// PLIRON: `uext_clean(self, v)` answers whether narrow return operand
+    /// `v`'s register is already zero-extended (`LowerBackend::
+    /// narrow_ret_uext_clean`); such operands skip the slot's `uext`
+    /// extension.
+    pub fn gen_return(
+        &mut self,
+        rets: &[ValueRegs<Reg>],
+        uext_clean: &mut dyn FnMut(&mut Self, Value) -> bool,
+    ) {
         let mut out_rets = vec![];
 
         let mut rets = rets.into_iter();
+        // PLIRON: the `return` inst's operands, paired with each non-sret
+        // signature return. Used to decide which return values get a
+        // detached copy (see `ret_detach`).
+        let ret_args: &[Value] = self
+            .cur_inst
+            .map(|i| self.f.dfg.inst_args(i))
+            .unwrap_or(&[]);
+        let mut arg_idx = 0usize;
         for (i, ret) in self
             .abi()
             .signature()
@@ -572,17 +661,37 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             .into_iter()
             .enumerate()
         {
-            let regs = if ret.purpose == ArgumentPurpose::StructReturn {
+            let val = (ret.purpose != ArgumentPurpose::StructReturn)
+                .then(|| ret_args.get(arg_idx).copied())
+                .flatten();
+            let mut regs = if ret.purpose == ArgumentPurpose::StructReturn {
                 self.sret_reg.unwrap()
             } else {
+                arg_idx += 1;
                 *rets.next().unwrap()
             };
+            // PLIRON: detach loop-carried/shared return values from the
+            // fixed-return-reg constraint (see `ret_detach`).
+            if self.ret_detach(val) {
+                regs = self.ret_copy_regs(regs, val.unwrap());
+            }
 
+            let skip_uext = match val {
+                Some(v)
+                    if ret.extension == crate::ir::ArgumentExtension::Uext
+                        && ret.value_type.is_int()
+                        && ret.value_type.bits() <= 16 =>
+                {
+                    uext_clean(self, v)
+                }
+                _ => false,
+            };
             let (regs, insns) = self.vcode.abi().gen_copy_regs_to_retval(
                 self.vcode.sigs(),
                 i,
                 regs,
                 &mut self.vregs,
+                skip_uext,
             );
             out_rets.extend(regs);
             for insn in insns {
@@ -606,6 +715,183 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         self.emit(inst);
     }
 
+    /// PLIRON: should `v` (a `return` operand) be copied through a fresh
+    /// vreg before the rets pseudo?
+    ///
+    /// The RetPair's `FixedReg` operand constraint lands directly on the
+    /// returned vreg. regalloc2 merges a `return` operand's bundle with
+    /// every blockparam in-edge and computes a *single* requirement for
+    /// the whole bundle, so one fixed-reg use pins every range of the
+    /// bundle to the return register — including ranges that must cross
+    /// calls (which then split out into callee-saved regs, paying edge
+    /// `mov`s at every region boundary; seen in count_alpha's inner
+    /// loop). Copying through a fresh minimal-range vreg confines the
+    /// constraint and costs exactly the one move the constraint would
+    /// have forced anyway.
+    ///
+    /// Applied only when the return value's bundle plausibly spans more
+    /// than the return itself — block params (merged with every in-edge)
+    /// and values with other uses — so single-use non-param values keep
+    /// the original (mov-free) path. `PLIRON_RETCOPY=0` disables.
+    fn ret_detach(&self, val: Option<Value>) -> bool {
+        static RETCOPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*RETCOPY
+            .get_or_init(|| std::env::var_os("PLIRON_RETCOPY").is_none_or(|v| v != "0"))
+        {
+            return false;
+        }
+        let Some(v) = val else { return false };
+        let v = self.f.dfg.resolve_aliases(v);
+        match self.f.dfg.value_def(v) {
+            ValueDef::Param(..) => true,
+            ValueDef::Result(..) => self.value_ir_uses[v] == ValueUseState::Multiple,
+            _ => false,
+        }
+    }
+
+    /// PLIRON: the call-side twin of `ret_detach`. A call argument whose
+    /// value has other uses is copied into a fresh vreg, so the ABI's
+    /// fixed-register use binds only the copy. Without it regalloc2 merges
+    /// the value into a bundle that *requires* that register everywhere
+    /// (`compute_requirement` -> `FixedReg`), the register is clobbered by
+    /// every call, and the bundle splits into minimal pieces with the gaps
+    /// on the stack: serde_json's escape scan stored and reloaded its
+    /// string base every byte because the base was also `memcpy`'s `x1`.
+    /// LLVM gets the same effect from a `COPY` into the physical register
+    /// at the call. `PLIRON_ARGCOPY=0` disables.
+    fn arg_detach(&mut self, args: &[ValueRegs<Reg>]) -> Option<Vec<ValueRegs<Reg>>> {
+        static ARGCOPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ARGCOPY.get_or_init(|| std::env::var_os("PLIRON_ARGCOPY").is_none_or(|v| v != "0")) {
+            return None;
+        }
+        let inst = self.cur_inst?;
+        let mut multi: SmallVec<[Reg; 8]> = smallvec![];
+        let mut tys: SmallVec<[(Reg, Value); 8]> = smallvec![];
+        // PLIRON (`PLIRON_ARGDIRECT=0` restores the old test): a value
+        // used only by this call dies at the call — its fixed-arg pin
+        // is free — so detach only on *direct* multi-use
+        // (`value_direct_uses`), not the transitive `Multiple` mark a
+        // multiply-used consumer's producer cone picks up: fib's
+        // `isub` arg is single-use but inherits `Multiple` via the
+        // accumulator the call result feeds, and the detach copy costs
+        // a `movl` per call. Read per call inst so tests can toggle it
+        // within one process.
+        let argdirect = std::env::var("PLIRON_ARGDIRECT").as_deref() != Ok("0");
+        for &v in self.f.dfg.inst_args(inst) {
+            let v = self.f.dfg.resolve_aliases(v);
+            let multi_use = match self.f.dfg.value_def(v) {
+                ValueDef::Result(..) => {
+                    if argdirect {
+                        self.value_direct_uses[v] > 1
+                    } else {
+                        self.value_ir_uses[v] == ValueUseState::Multiple
+                    }
+                }
+                // Block params are live from the block start: detach them
+                // too (as `ret_detach` does).
+                ValueDef::Param(..) => true,
+                _ => false,
+            };
+            if multi_use {
+                for &r in self.value_regs[v].regs() {
+                    multi.push(r);
+                    tys.push((r, v));
+                }
+            }
+        }
+        if multi.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(args.len());
+        for regs in args {
+            if !regs.regs().iter().any(|r| multi.contains(r)) {
+                out.push(*regs);
+                continue;
+            }
+            let v = tys.iter().find(|(r, _)| regs.regs().contains(r)).unwrap().1;
+            out.push(self.ret_copy_regs(*regs, v));
+        }
+        Some(out)
+    }
+
+    /// PLIRON: the result-side twin of `arg_detach`. A call result's
+    /// `FixedReg` *def* pins its whole bundle to the return register:
+    /// `compute_requirement` merges all uses of all ranges, and the
+    /// blockparam-merged chain of a long-lived result then requires
+    /// the clobbered preg everywhere it is live — splitting at every
+    /// later call into spill+fill pieces (`BrotliCreateHqZopfli...`'s
+    /// `v448`-family bundle: one call result pinned to x0 across the
+    /// whole walk loop). Substituting fresh vregs into `defs` confines
+    /// the pin to the tmp's minimal range and emits one `mov` after
+    /// the call — the same shape LLVM's `COPY`s produce.
+    ///
+    /// Applied only to multi-use results: a single-use result's pin is
+    /// free (its range ends at its only use) while the detach would add
+    /// a `mov` the constraint never forced. `PLIRON_OUTCOPY=1` enables
+    /// (opt-in); try_call results are delivered on edges and are
+    /// already short-range, so `gen_try_call_rets` is untouched.
+    fn out_detach(&mut self, outputs: &[ValueRegs<Reg>]) -> Option<Vec<ValueRegs<Reg>>> {
+        static OUTCOPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*OUTCOPY.get_or_init(|| std::env::var_os("PLIRON_OUTCOPY").is_some_and(|v| v == "1")) {
+            return None;
+        }
+        let inst = self.cur_inst?;
+        let results = self.f.dfg.inst_results(inst);
+        let mut out = Vec::with_capacity(outputs.len());
+        let mut any = false;
+        for (i, regs) in outputs.iter().enumerate() {
+            let multi = results
+                .get(i)
+                .is_some_and(|&v| self.value_ir_uses[v] == ValueUseState::Multiple);
+            if !multi {
+                out.push(*regs);
+                continue;
+            }
+            any = true;
+            let val = results[i];
+            let ty = self.f.dfg.value_type(val);
+            let (_, tys) = I::rc_for_type(ty).unwrap_or_default();
+            let mut detached: SmallVec<[Reg; 2]> = smallvec![];
+            for (j, &r) in regs.regs().iter().enumerate() {
+                let reg_ty = tys.get(j).copied().unwrap_or(ty);
+                let tmp = self.vregs.alloc_with_deferred_error(reg_ty).only_reg().unwrap();
+                self.pending_out_movs
+                    .push(I::gen_move(Writable::from_reg(r), tmp, reg_ty));
+                detached.push(tmp);
+            }
+            out.push(match detached.len() {
+                1 => ValueRegs::one(detached[0]),
+                2 => ValueRegs::two(detached[0], detached[1]),
+                _ => panic!("Value must reside in 1 or 2 registers"),
+            });
+        }
+        any.then_some(out)
+    }
+
+    /// PLIRON: copy `regs` into fresh vregs, emitting the moves. Gives
+    /// `ret_detach`d return operands a minimal-range vreg so the
+    /// fixed-return-reg constraint stays local to the copy.
+    fn ret_copy_regs(&mut self, regs: ValueRegs<Reg>, val: Value) -> ValueRegs<Reg> {
+        let val = self.f.dfg.resolve_aliases(val);
+        let ty = self.f.dfg.value_type(val);
+        let (_, tys) = I::rc_for_type(ty).unwrap_or_default();
+        let mut out: SmallVec<[Reg; 2]> = smallvec![];
+        for (i, &r) in regs.regs().iter().enumerate() {
+            let reg_ty = tys.get(i).copied().unwrap_or(ty);
+            let dst =
+                writable_value_regs(self.vregs.alloc_with_deferred_error(reg_ty))
+                    .only_reg()
+                    .unwrap();
+            self.emit(I::gen_move(dst, r, reg_ty));
+            out.push(dst.to_reg());
+        }
+        match out.len() {
+            1 => ValueRegs::one(out[0]),
+            2 => ValueRegs::two(out[0], out[1]),
+            _ => panic!("Value must reside in 1 or 2 registers"),
+        }
+    }
+
     /// Generate list of registers to hold the output of a call with
     /// signature `sig`.
     pub fn gen_call_output(&mut self, sig: &Signature) -> InstOutput {
@@ -621,8 +907,61 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         self.gen_call_output(&self.f.dfg.signatures[sig_ref])
     }
 
+    /// PLIRON: for each `args[i]`, whether its source register already
+    /// holds the operand zero-extended to its narrow (i8/i16) width, so a
+    /// `uext` arg slot needs no extension instruction — the call-side
+    /// twin of the `skip_uext` flag in `gen_return`. The flag is computed
+    /// from the current instruction's operands (`put_in_regs*` keeps the
+    /// `value_regs` mapping for them), so it must run before `arg_detach`
+    /// substitutes fresh vregs; flags stay positional either way.
+    pub(crate) fn call_arg_uext_skips(
+        &mut self,
+        args: &[ValueRegs<Reg>],
+        max_bits: u32,
+        uext_clean: &mut dyn FnMut(&mut Self, Value) -> bool,
+    ) -> Option<Vec<bool>> {
+        let inst = self.cur_inst?;
+        let mut by_reg: FxHashMap<Reg, Value> = FxHashMap::default();
+        for &v in self.f.dfg.inst_args(inst) {
+            let v = self.f.dfg.resolve_aliases(v);
+            let ty = self.f.dfg.value_type(v);
+            if ty.is_int() && ty.bits() <= max_bits {
+                for &r in self.value_regs[v].regs() {
+                    by_reg.insert(r, v);
+                }
+            }
+        }
+        if by_reg.is_empty() {
+            return None;
+        }
+        let mut out = None;
+        for (i, regs) in args.iter().enumerate() {
+            let v = regs
+                .regs()
+                .first()
+                .and_then(|r| by_reg.get(r))
+                .copied();
+            if let Some(v) = v {
+                if uext_clean(self, v) {
+                    out.get_or_insert_with(|| vec![false; args.len()])[i] = true;
+                }
+            }
+        }
+        out
+    }
+
     /// Set up arguments values `args` for a call with signature `sig`.
-    pub fn gen_call_args(&mut self, sig: Sig, args: &[ValueRegs<Reg>]) -> CallArgList {
+    ///
+    /// PLIRON: `skip_uext[i]` marks `args[i]` as already zero-extended
+    /// (see `call_arg_uext_skips`); pass `&[]` when unknown.
+    pub fn gen_call_args(
+        &mut self,
+        sig: Sig,
+        args: &[ValueRegs<Reg>],
+        skip_uext: &[bool],
+    ) -> CallArgList {
+        let copied = self.arg_detach(args);
+        let args: &[ValueRegs<Reg>] = copied.as_deref().unwrap_or(args);
         let (uses, insts) = self.vcode.abi().gen_call_args(
             self.vcode.sigs(),
             sig,
@@ -630,6 +969,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             /* is_tail_call */ false,
             &self.flags,
             &mut self.vregs,
+            skip_uext,
         );
         for insn in insts {
             self.emit(insn);
@@ -638,7 +978,12 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     }
 
     /// Likewise, but for a `return_call`.
-    pub fn gen_return_call_args(&mut self, sig: Sig, args: &[ValueRegs<Reg>]) -> CallArgList {
+    pub fn gen_return_call_args(
+        &mut self,
+        sig: Sig,
+        args: &[ValueRegs<Reg>],
+        skip_uext: &[bool],
+    ) -> CallArgList {
         let (uses, insts) = self.vcode.abi().gen_call_args(
             self.vcode.sigs(),
             sig,
@@ -646,6 +991,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             /* is_tail_call */ true,
             &self.flags,
             &mut self.vregs,
+            skip_uext,
         );
         for insn in insts {
             self.emit(insn);
@@ -655,6 +1001,11 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
     /// Set up return values `outputs` for a call with signature `sig`.
     pub fn gen_call_rets(&mut self, sig: Sig, outputs: &[ValueRegs<Reg>]) -> CallRetList {
+        // PLIRON: detach multi-use results so the fixed-return-reg def
+        // binds only the tmp (`out_detach`); the copy back is queued in
+        // `pending_out_movs` and lands after the call.
+        let detached = self.out_detach(outputs);
+        let outputs: &[ValueRegs<Reg>] = detached.as_deref().unwrap_or(outputs);
         self.vcode
             .abi()
             .gen_call_rets(self.vcode.sigs(), sig, outputs, None, &mut self.vregs)
@@ -697,7 +1048,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
     /// Has this instruction been sunk to a use-site (i.e., away from its
     /// original location)?
-    fn is_inst_sunk(&self, inst: Inst) -> bool {
+    pub fn is_inst_sunk(&self, inst: Inst) -> bool {
         self.inst_sunk.contains(&inst)
     }
 
@@ -716,6 +1067,9 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         block: Block,
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<()> {
+        static LOWER_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let lower_debug =
+            *LOWER_DEBUG.get_or_init(|| std::env::var_os("PLIRON_LOWER_DEBUG").is_some());
         self.cur_scan_entry_color = Some(self.block_end_colors[block]);
         // Lowering loop:
         // - For each non-branch instruction, in reverse order:
@@ -745,6 +1099,16 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
             // If  inst has been sunk to another location, skip it.
             if self.is_inst_sunk(inst) {
+                // PLIRON: if a pending post-index fusion claimed this
+                // inst, the fused inst still has to emit so that its
+                // writeback result is defined. The sunk copy already
+                // produced the load/store's value for its user, so the
+                // fused inst's own result regs are dead here.
+                if let Some((mi, _out)) = self.take_pending_postindex(inst) {
+                    self.emit(mi);
+                    let loc = self.srcloc(inst);
+                    self.finish_ir_inst(loc);
+                }
                 continue;
             }
 
@@ -779,6 +1143,21 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             // (otherwise we want to keep using the earlier label instead).
             self.emit_value_label_live_range_start_for_inst(inst, has_side_effect || value_needed);
 
+            if lower_debug {
+                if matches!(
+                    self.f.dfg.insts[inst].opcode(),
+                    crate::ir::Opcode::Iadd | crate::ir::Opcode::Isub
+                ) {
+                    eprintln!(
+                        "lower {} {inst}@{block:?}: {} side_effect={} needed={} sunk={}",
+                        self.f.name,
+                        self.f.dfg.display_inst(inst),
+                        has_side_effect,
+                        value_needed,
+                        self.is_inst_sunk(inst)
+                    );
+                }
+            }
             // Normal instruction: codegen if the instruction is side-effecting
             // or any of its outputs is used.
             if has_side_effect || value_needed {
@@ -820,6 +1199,12 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                         self.vregs.set_vreg_alias(dst, temp);
                     }
                 }
+            } else if let Some((mi, _out)) = self.take_pending_postindex(inst) {
+                // PLIRON: this inst is the cand of a pending post-index
+                // fusion; its normal lowering is skipped as dead, but
+                // the fused inst still has to emit to define the
+                // writeback result.
+                self.emit(mi);
             }
 
             let start = self.vcode.vcode.num_insts();
@@ -977,6 +1362,10 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         // The VCodeBuilder builds in reverse order (and reverses at
         // the end), but `ir_insts` is in forward order, so reverse
         // it.
+        // PLIRON: detach movs queued by `out_detach` belong at the end
+        // of this IR-inst's emitted sequence — after the call whose
+        // `defs` write the tmp vregs they copy out of.
+        self.ir_insts.extend(self.pending_out_movs.drain(..));
         for inst in self.ir_insts.drain(..).rev() {
             self.vcode.push(inst, loc);
         }
@@ -1003,6 +1392,13 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         // When considering code-motion opportunities, consider the current
         // program point to be this branch.
         self.cur_inst = Some(branch);
+        // PLIRON: the branch is itself a side-effecting instruction, so its
+        // entry color describes the program point at which it executes.
+        // Without this, `cur_scan_entry_color` is stale/`None` here and
+        // `get_value_as_source_or_const` can never classify a load
+        // immediately feeding the branch (e.g. `brif (icmp (load ..) x)`) as
+        // sinkable, so `cmp reg, [mem]` folding never fires at branches.
+        self.cur_scan_entry_color = Some(self.side_effect_inst_entry_colors[branch]);
 
         // Lower the branch in ISLE.
         backend
@@ -1024,7 +1420,23 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         let mut branch_arg_vregs: SmallVec<[Reg; 16]> = smallvec![];
 
         // TODO: why not make `block_order` public?
-        for succ_idx in 0..self.vcode.block_order().succ_indices(block).1.len() {
+        let (branch, succs) = self.vcode.block_order().succ_indices(block);
+        let n_succs = succs.len();
+        let is_table = branch.is_some_and(|i| self.f.dfg.insts[i].opcode() == crate::ir::Opcode::BrTable);
+        // PLIRON: deduplicated `br_table` edges (`PLIRON_EDGEDEDUP`) repeat
+        // a split-edge successor; regalloc2 must see each CFG edge once (a
+        // repeated one reads as a critical edge). Such successors carry no
+        // args — those sit on the edge block's own jump.
+        let mut seen_succs: Option<FxHashSet<BlockIndex>> = (is_table
+            && crate::machinst::blockorder::edge_dedup_enabled())
+        .then(FxHashSet::default);
+        for succ_idx in 0..n_succs {
+            if let Some(seen) = seen_succs.as_mut() {
+                let succ = self.vcode.block_order().succ_indices(block).1[succ_idx];
+                if !seen.insert(succ) {
+                    continue;
+                }
+            }
             branch_arg_vregs.clear();
             let (succ, args) = self.collect_block_call(block, succ_idx, &mut branch_arg_vregs);
             self.vcode.add_succ(succ, args);
@@ -1196,6 +1608,30 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             }
         }
 
+        // PLIRON: `PLIRON_VREGMAP=<substr>` dumps the CLIF Value -> vcode
+        // vreg map (correlates `PLIRON_RA2_EDITS` decisions back to CLIF
+        // vregs); `all` matches every function.
+        if std::env::var("PLIRON_VREGMAP")
+            .ok()
+            .map(|pat| {
+                pat == "all" || (!pat.is_empty() && format!("{}", self.f.name).contains(&pat))
+            })
+            .unwrap_or(false)
+        {
+            let mut out = alloc::string::String::new();
+            for (v, regs) in self.value_regs.iter() {
+                if regs.is_invalid() {
+                    continue;
+                }
+                out.push_str(&format!("{}:", v));
+                for r in regs.regs() {
+                    out.push_str(&format!(" {:?}", r));
+                }
+                out.push('\n');
+            }
+            eprintln!("==== vregmap {} ====\n{}", self.f.name, out);
+        }
+
         // Now that we've emitted all instructions into the
         // VCodeBuilder, let's build the VCode.
         trace!(
@@ -1235,7 +1671,12 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 fn compute_use_states(
     f: &Function,
     sret_param: Option<Value>,
-) -> SecondaryMap<Value, ValueUseState> {
+) -> (
+    SecondaryMap<Value, ValueUseState>,
+    SecondaryMap<Value, u8>,
+    SecondaryMap<Value, bool>,
+    SecondaryMap<Value, u32>,
+) {
     // We perform the analysis without recursion, so we don't
     // overflow the stack on long chains of ops in the input.
     //
@@ -1254,11 +1695,19 @@ fn compute_use_states(
     // efficient than a full indirect-use-counting pass.
 
     let mut value_ir_uses = SecondaryMap::with_default(ValueUseState::Unused);
+    let mut value_direct_uses = SecondaryMap::with_default(0u8);
+    let mut value_non_amode_use = SecondaryMap::with_default(false);
+    // PLIRON: block live-in counts — uses of values defined in a
+    // different block — as a register-pressure proxy for
+    // `amode_shareable`.
+    let mut block_liveins = SecondaryMap::with_default(0u32);
 
     if let Some(sret_param) = sret_param {
         // There's an implicit use of the struct-return parameter in each
         // copy of the function epilogue, which we count here.
         value_ir_uses[sret_param] = ValueUseState::Multiple;
+        value_direct_uses[sret_param] = 2;
+        value_non_amode_use[sret_param] = true;
     }
 
     // Stack of iterators over Values as we do DFS to mark
@@ -1288,17 +1737,33 @@ fn compute_use_states(
 
     // Do a DFS through `value_ir_uses` to mark a subtree as
     // Multiple.
-    for inst in f
-        .layout
-        .blocks()
-        .flat_map(|block| f.layout.block_insts(block))
-    {
+    for block in f.layout.blocks() {
+    for inst in f.layout.block_insts(block) {
         // Iterate over all values used by all instructions, noting an
         // additional use on each operand.
-        for arg in f.dfg.inst_values(inst) {
+        let arg_count = f.dfg.inst_args(inst).len();
+        for (pos, arg) in f.dfg.inst_values(inst).enumerate() {
             debug_assert!(f.dfg.value_is_real(arg));
+            // PLIRON: mark uses that cannot fold into a memory
+            // addressing mode — everything but the address operand of
+            // a plain load/store (and any branch/table arg, which
+            // `inst_values` appends past `inst_args`).
+            if pos >= arg_count || !arg_is_mem_addr(&f.dfg.insts[inst], pos) {
+                value_non_amode_use[arg] = true;
+            }
+            // PLIRON: cross-block uses inflate the block's live-in
+            // pressure (params count as defs in their own block).
+            let def_block = match f.dfg.value_def(arg) {
+                ValueDef::Result(d, _) => f.layout.inst_block(d),
+                ValueDef::Param(b, _) => Some(b),
+                _ => None,
+            };
+            if def_block != Some(block) {
+                block_liveins[block] = block_liveins[block].saturating_add(1);
+            }
             let old = value_ir_uses[arg];
             value_ir_uses[arg].inc();
+            value_direct_uses[arg] = value_direct_uses[arg].saturating_add(1);
             let new = value_ir_uses[arg];
             trace!("arg {} used, old state {:?}, new {:?}", arg, old, new);
 
@@ -1337,7 +1802,51 @@ fn compute_use_states(
         }
     }
 
-    value_ir_uses
+    }
+
+    // PLIRON: roll the per-block pressure up to per-value — the kept
+    // base's register would live in its def block and every use block.
+    let mut value_max_pressure = SecondaryMap::with_default(0u32);
+    for block in f.layout.blocks() {
+        let p = block_liveins[block];
+        if p == 0 {
+            continue;
+        }
+        for inst in f.layout.block_insts(block) {
+            for arg in f.dfg.inst_values(inst) {
+                if p > value_max_pressure[arg] {
+                    value_max_pressure[arg] = p;
+                }
+            }
+            // The def side of every value produced here counts too —
+            // its register is live from this block onward.
+            for &res in f.dfg.inst_results(inst) {
+                if p > value_max_pressure[res] {
+                    value_max_pressure[res] = p;
+                }
+            }
+        }
+    }
+
+    (
+        value_ir_uses,
+        value_direct_uses,
+        value_non_amode_use,
+        value_max_pressure,
+    )
+}
+
+/// PLIRON: is the `pos`'th arg of `inst` a load/store address operand —
+/// the one slot that can fold an `iadd` into a reg+reg / reg+imm
+/// addressing mode? Only plain loads/stores qualify; atomic or
+/// non-memory uses are "real" uses by definition.
+fn arg_is_mem_addr(data: &InstructionData, pos: usize) -> bool {
+    use crate::ir::InstructionData::*;
+    match data {
+        Load { .. } | LoadNoOffset { .. } => pos == 0,
+        Store { .. } | StoreNoOffset { .. } => pos == 1,
+        _ => false,
+    }
 }
 
 /// Definition of a "root" instruction for the calculation of `ValueUseState`.
@@ -1587,14 +2096,37 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                 } else {
                     // Side-effect: test whether this is the only use of the
                     // only result of the instruction, and whether colors allow
-                    // the code-motion.
+                    // the code-motion. PLIRON: the upstream
+                    // `value_ir_uses == Once`
+                    // test requires the whole downstream def-DAG to be
+                    // uniquely used; we additionally allow the value to have
+                    // exactly one *direct* use, by `cur_inst` itself: the
+                    // consumer is emitted exactly once, so an inst fused into
+                    // it is too, regardless of how often the consumer's own
+                    // result is used downstream (the classic case: a load
+                    // feeding a single `add`/`fadd` whose result fans out to
+                    // both backedge and exit args). The `cur_inst` test
+                    // rejects probes that reach this value through a pure
+                    // sub-pattern of an inst that does not use it (e.g.
+                    // `(store (iadd (load l) k) addr)` matching `l` while the
+                    // `iadd` still needs it for another use). The
+                    // `value_lowered_uses` test covers the converse: an
+                    // earlier-lowered inst may have legitimately materialized
+                    // this value in a register after a sub-pattern probe
+                    // rejected sinking (the producer then *must* be emitted),
+                    // so fusing now would leave that register undefined.
                     trace!(
                         " -> side-effecting op {} for val {}: use state {:?}",
                         src_inst, val, self.value_ir_uses[val]
                     );
                     if self.cur_scan_entry_color.is_some()
-                        && self.value_ir_uses[val] == ValueUseState::Once
                         && self.num_outputs(src_inst) == 1
+                        && (self.value_ir_uses[val] == ValueUseState::Once
+                            || (self.value_direct_uses[val] == 1
+                                && self.value_lowered_uses[val] == 0
+                                && self.cur_inst.is_some_and(|ci| {
+                                    self.f.dfg.inst_values(ci).any(|a| a == val)
+                                })))
                         && src_entry_color.get() + 1 == self.cur_scan_entry_color.unwrap().get()
                     {
                         InputSourceInst::UniqueUse(src_inst, 0)
@@ -1679,6 +2211,148 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         assert!(sunk_inst_exit_color == self.cur_scan_entry_color.unwrap());
         self.cur_scan_entry_color = Some(sunk_inst_entry_color);
         self.inst_sunk.insert(ir_inst);
+    }
+
+    /// PLIRON: record that `cand` (an earlier inst in this block, not
+    /// yet lowered) should emit `inst` — producing `out` — in place of
+    /// its normal lowering. Used by post-index fusion: the fused
+    /// load/store is emitted at the load/store's own position while
+    /// the pointer increment it folds is handled at the current
+    /// (later) position.
+    pub fn set_pending_postindex(&mut self, cand: Inst, inst: I, out: InstOutput) {
+        assert!(self.pending_postindex.is_none());
+        self.pending_postindex = Some((cand, inst, out));
+    }
+
+    /// PLIRON: if `ir_inst` was claimed by `set_pending_postindex`,
+    /// return the machine inst and output to emit/return for it.
+    pub fn take_pending_postindex(&mut self, ir_inst: Inst) -> Option<(I, InstOutput)> {
+        match self.pending_postindex.take() {
+            Some((cand, inst, out)) if cand == ir_inst => Some((inst, out)),
+            pending => {
+                self.pending_postindex = pending;
+                None
+            }
+        }
+    }
+
+    /// PLIRON: lazy CFG+domtree for `try_postindex`'s dominator-bound
+    /// use relaxation.
+    pub fn postindex_dominates(&mut self, a: crate::ir::Block, b: crate::ir::Block) -> bool {
+        let f = self.f;
+        let (_, dt) = self.postindex_cfg_dt.get_or_insert_with(|| {
+            let cfg = crate::flowgraph::ControlFlowGraph::with_function(f);
+            let dt = crate::dominator_tree::DominatorTree::with_function(f, &cfg);
+            (cfg, dt)
+        });
+        dt.dominates(a, b, &f.layout)
+    }
+
+    /// PLIRON: the lazily-built set of narrow-clean blockparams for this
+    /// function (aarch64 `narrow_uext_clean`). `build` computes it once.
+    pub fn clean_blockparams(
+        &mut self,
+        build: impl FnOnce(&Lower<'func, I>) -> FxHashSet<Value>,
+    ) -> alloc::rc::Rc<FxHashSet<Value>> {
+        if self.narrow_clean_params.is_none() {
+            let set = alloc::rc::Rc::new(build(&*self));
+            self.narrow_clean_params = Some(set);
+        }
+        self.narrow_clean_params.as_ref().unwrap().clone()
+    }
+
+    /// PLIRON: is `ir_inst` the load/store claimed by a pending
+    /// post-index fusion?
+    pub fn is_pending_postindex_cand(&self, ir_inst: Inst) -> bool {
+        matches!(self.pending_postindex, Some((cand, _, _)) if cand == ir_inst)
+    }
+
+    /// PLIRON: is a pending post-index fusion still in flight?
+    pub fn has_pending_postindex(&self) -> bool {
+        self.pending_postindex.is_some()
+    }
+
+    /// PLIRON: does `val` have more than one use (per the
+    /// `ValueUseState` analysis)? A value with a single use may have its
+    /// producing inst sunk into that use, which must not be allowed to
+    /// consume a pending fusion candidate.
+    pub fn value_has_multiple_uses(&self, val: Value) -> bool {
+        self.value_ir_uses[val] == ValueUseState::Multiple
+    }
+
+    /// PLIRON: is `val` used by at most one instruction
+    /// (`value_direct_uses`, the non-transitive map)? Amode
+    /// displacement folds decompose a producer `iadd x, K` into
+    /// `[x, K]` pieces — profitable only when `x` has no other
+    /// consumers, since a multi-use result is materialized anyway and
+    /// the fold then keeps `x` live alongside it.
+    pub fn value_single_direct_use(&self, val: Value) -> bool {
+        self.value_direct_uses[self.f.dfg.resolve_aliases(val)] <= 1
+    }
+
+    /// PLIRON: may a multi-use `iadd` `val` stay whole in an amode?
+    /// Sharing is free when the sum is genuinely needed as a value
+    /// (at least one non-address use — e.g. a loop-carried pointer).
+    /// For all-address uses the fanout is capped and the block must
+    /// not be register-starved: a base shared across several offset
+    /// accesses holds its register over the span while decomposed
+    /// reg+reg amodes are free. `value_max_pressure` is the live-in
+    /// proxy measured in `compute_use_states`;
+    /// `PLIRON_AMODESHARE_PRESS` tunes the cutoff (default 5 —
+    /// measured: keeps the sieve/parse_only wins (~−5%/−3%), and the
+    /// sortw/hashmap hot functions stay byte-identical to OFF; looser
+    /// thresholds regress).
+    pub fn amode_shareable(&self, val: Value) -> bool {
+        // `value_ir_uses` is propagated: a single-use address whose loaded
+        // value has two uses reads `Multiple` too. Only a value used by more
+        // than one instruction is shared (pulldown's `parse_block` scan kept
+        // `add x5, x19, x27; ldurb w5, [x5]` instead of `ldrb w5, [x19, x27]`).
+        static DIRECT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let direct = *DIRECT.get_or_init(|| std::env::var("PLIRON_AMODESHARE_DIRECT").as_deref() != Ok("0"));
+        if self.value_ir_uses[val] != ValueUseState::Multiple || (direct && self.value_direct_uses[val] <= 1) {
+            return false;
+        }
+        if self.value_non_amode_use[val] {
+            return true;
+        }
+        // A decomposed `iadd(mul, base)` pays a fresh `mul` for every
+        // access; materializing the sum costs one `madd` either way, so
+        // keeping it whole is never worse even in a starved block — and
+        // shares the base+index across its uses (the HqZopfli node-walk
+        // paid a `mul` plus a base reload per store otherwise).
+        static IMUL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let imul_on = *IMUL.get_or_init(|| std::env::var("PLIRON_AMODESHARE_IMUL").as_deref() != Ok("0"));
+        if imul_on {
+            if let ValueDef::Result(inst, _) = self.f.dfg.value_def(val) {
+                if self.f.dfg.insts[inst].opcode() == crate::ir::Opcode::Iadd {
+                    let imul = self
+                        .f
+                        .dfg
+                        .inst_args(inst)
+                        .iter()
+                        .any(|&a| match self.f.dfg.value_def(a) {
+                            ValueDef::Result(a_inst, _) => {
+                                self.f.dfg.insts[a_inst].opcode() == crate::ir::Opcode::Imul
+                            }
+                            _ => false,
+                        });
+                    if imul {
+                        return true;
+                    }
+                }
+            }
+        }
+        if self.value_direct_uses[val] > 3 {
+            return false;
+        }
+        static PRESS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let max = *PRESS.get_or_init(|| {
+            std::env::var("PLIRON_AMODESHARE_PRESS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5)
+        });
+        self.value_max_pressure[val] <= max
     }
 
     /// Retrieve immediate data given a handle.

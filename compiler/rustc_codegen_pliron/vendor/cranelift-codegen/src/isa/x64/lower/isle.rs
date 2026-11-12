@@ -431,11 +431,16 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
         let inputs = self.lower_ctx.get_value_as_source_or_const(val);
 
         if let Some(c) = inputs.constant {
-            // A load from the constant pool is better than a
-            // rematerialization into a register, because it reduces
-            // register pressure.
-            let vcode_constant = self.emit_u64_le_const(c);
-            return RegMem::mem(SyntheticAmode::ConstantOffset(vcode_constant));
+            if c != 0 {
+                // A load from the constant pool is better than a
+                // rematerialization into a register, because it reduces
+                // register pressure.
+                let vcode_constant = self.emit_u64_le_const(c);
+                return RegMem::mem(SyntheticAmode::ConstantOffset(vcode_constant));
+            }
+            // Zero materializes as `xorl` — cheaper than a constant-pool
+            // load in hot loops (e.g. cmov of an Option niche sentinel).
+            return RegMem::reg(self.put_in_reg(val));
         }
 
         if let Some(load) = self.sinkable_load(val) {
@@ -465,6 +470,11 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     #[inline]
     fn use_avx2(&mut self) -> bool {
         self.backend.x64_flags.has_avx() && self.backend.x64_flags.has_avx2()
+    }
+
+    #[inline]
+    fn has_avx512bw(&mut self) -> bool {
+        self.backend.x64_flags.has_avx512bw()
     }
 
     #[inline]
@@ -505,6 +515,81 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     #[inline]
     fn has_bmi2(&mut self) -> bool {
         self.backend.x64_flags.has_bmi2()
+    }
+
+    /// pliron: true when `val` is not an `iconst` — the `emit_cmp` LHS-load
+    /// swap keeps constants in the RMI/imm slot, so it must not fire when the
+    /// other operand is a constant (`cmp reg, imm` / `test reg, reg` wins).
+    #[inline]
+    fn pliron_not_iconst(&mut self, val: Value) -> bool {
+        self.lower_ctx
+            .get_value_as_source_or_const(val)
+            .constant
+            .is_none()
+    }
+
+    /// pliron: `PLIRON_X64_AMODEIADD=0` disables folding `K<<s` of an
+    /// `iadd`-inside-`ishl` index into the amode displacement.
+    #[inline]
+    fn pliron_amode_iadd(&mut self) -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("PLIRON_X64_AMODEIADD").map_or(true, |v| v != "0")
+        });
+        *ON
+    }
+
+    /// pliron: `PLIRON_X64_BITTAB=0` disables the `(bitmap >> x) & 1`
+    /// -> `bt` fold in `is_nonzero_band`.
+    #[inline]
+    fn pliron_bittab(&mut self) -> bool {
+        static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("PLIRON_X64_BITTAB").map_or(true, |v| v != "0")
+        });
+        *ON
+    }
+
+    /// pliron: `PLIRON_X64_IMULEA=1` `imul` → `lea` for odd small
+    /// multipliers — see `mul_lea_shift` below.
+    fn pliron_mul_lea_d(&mut self, c: u64) -> Option<u8> {
+        mul_lea_shift(c)
+    }
+
+    /// pliron: `iadd x, K` as an amode operand. Under
+    /// `PLIRON_X64_SUAMODE=1` the `to_amode_add` displacement fold
+    /// fires only when the sum has ≤1 direct use — a multi-use result
+    /// is materialized anyway for its other consumers, and folding
+    /// then keeps `x` live alongside it (parse's digit adds: folded
+    /// `lea -0x30(char, acc*2)` kept `char` live across the range
+    /// check → spills; `lea (digit, acc*2)` frees it). Off =
+    /// unconditional fold (stock). Returns `(x, K)`.
+    fn pliron_iadd_su_iconst(&mut self, v: Value) -> Option<(Value, i64)> {
+        let v = self.lower_ctx.dfg().resolve_aliases(v);
+        let inst = self.lower_ctx.dfg().value_def(v).inst()?;
+        let InstructionData::Binary {
+            opcode: Opcode::Iadd,
+            args,
+        } = self.lower_ctx.dfg().insts[inst]
+        else {
+            return None;
+        };
+        if su_amode_enabled() && !self.lower_ctx.value_single_direct_use(v) {
+            return None;
+        }
+        for i in 0..2 {
+            let kv = self.lower_ctx.dfg().resolve_aliases(args[1 - i]);
+            let Some(d) = self.lower_ctx.dfg().value_def(kv).inst() else {
+                continue;
+            };
+            if let InstructionData::UnaryImm {
+                opcode: Opcode::Iconst,
+                imm,
+            } = self.lower_ctx.dfg().insts[d]
+            {
+                let x = self.lower_ctx.dfg().resolve_aliases(args[i]);
+                return Some((x, imm.bits()));
+            }
+        }
+        None
     }
 
     #[inline]
@@ -761,6 +846,129 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     #[inline]
     fn synthetic_amode_to_xmm_mem_128(&mut self, amode: &SyntheticAmode) -> XmmMem128 {
         XmmMem128::unwrap_new(RegMem::mem(amode.clone()))
+    }
+
+    // PLIRON: 256/512-bit xmm-or-mem operand helpers for the wide-vector
+    // lowering rules — keeps wide operand widths type-checked end to end.
+    #[inline]
+    fn xmm_to_xmm_mem_256(&mut self, xmm: Xmm) -> XmmMem256 {
+        XmmMem256::from(xmm)
+    }
+
+    #[inline]
+    fn xmm_to_xmm_mem_512(&mut self, xmm: Xmm) -> XmmMem512 {
+        XmmMem512::from(xmm)
+    }
+
+    #[inline]
+    fn synthetic_amode_to_xmm_mem_256(&mut self, amode: &SyntheticAmode) -> XmmMem256 {
+        XmmMem256::unwrap_new(RegMem::mem(amode.clone()))
+    }
+
+    #[inline]
+    fn synthetic_amode_to_xmm_mem_512(&mut self, amode: &SyntheticAmode) -> XmmMem512 {
+        XmmMem512::unwrap_new(RegMem::mem(amode.clone()))
+    }
+
+    #[inline]
+    fn put_in_xmm_mem_256(&mut self, val: Value) -> XmmMem256 {
+        let ty = self.lower_ctx.dfg().value_type(val);
+        assert_eq!(
+            ty.bits(),
+            256,
+            "put_in_xmm_mem_256: expected a 256-bit value, got value of type {ty}"
+        );
+        // Skip `put_in_xmm_mem`'s u128 const-pool path: the constant-pool
+        // materializes only 16 bytes, which would truncate a folded 256-bit
+        // operand. `put_in_reg_mem`'s own const paths only fire for scalar
+        // `iconst` types, so a vector-typed `Value` always lands in a reg or
+        // a sinkable load here.
+        debug_assert!(
+            self.lower_ctx
+                .get_value_as_source_or_const(val)
+                .constant
+                .is_none(),
+            "put_in_xmm_mem_256: cannot materialize a >128-bit constant"
+        );
+        XmmMem256::unwrap_new(self.put_in_reg_mem(val))
+    }
+
+    #[inline]
+    fn put_in_xmm_mem_512(&mut self, val: Value) -> XmmMem512 {
+        let ty = self.lower_ctx.dfg().value_type(val);
+        assert_eq!(
+            ty.bits(),
+            512,
+            "put_in_xmm_mem_512: expected a 512-bit value, got value of type {ty}"
+        );
+        debug_assert!(
+            self.lower_ctx
+                .get_value_as_source_or_const(val)
+                .constant
+                .is_none(),
+            "put_in_xmm_mem_512: cannot materialize a >128-bit constant"
+        );
+        XmmMem512::unwrap_new(self.put_in_reg_mem(val))
+    }
+
+    /// PLIRON: constant-pool amode holding `fill` replicated across each
+    /// lane of `ty` (wide types only — the u128 pool emit can't express
+    /// >128-bit constants). `hi`/`lo` give the lane's top byte vs the rest.
+    fn wide_lane_mask_amode(&mut self, ty: Type, hi: u8, lo: u8) -> SyntheticAmode {
+        let lane_bytes = (ty.lane_bits() / 8) as usize;
+        let mut bytes = vec![lo; (ty.bits() / 8) as usize];
+        for lane in bytes.chunks_mut(lane_bytes) {
+            lane[lane_bytes - 1] = hi;
+        }
+        let c = self
+            .lower_ctx
+            .use_constant(VCodeConstantData::Generated(ConstantData::from(&bytes[..])));
+        SyntheticAmode::ConstantOffset(c)
+    }
+
+    #[inline]
+    fn wide_sign_mask_amode(&mut self, ty: Type) -> SyntheticAmode {
+        self.wide_lane_mask_amode(ty, 0x80, 0x00)
+    }
+
+    #[inline]
+    fn wide_abs_mask_amode(&mut self, ty: Type) -> SyntheticAmode {
+        self.wide_lane_mask_amode(ty, 0x7f, 0xff)
+    }
+
+    #[inline]
+    fn wide_ones_amode(&mut self, ty: Type) -> SyntheticAmode {
+        self.wide_lane_mask_amode(ty, 0xff, 0xff)
+    }
+
+    /// PLIRON: the low 128 bits of a wide `Value` as an `XmmMem128` operand.
+    /// For a register the xmm is the low half of the ymm/zmm; for a sinkable
+    /// load it is the same address (little-endian low half).
+    fn put_low128_in_xmm_mem(&mut self, val: Value) -> XmmMem128 {
+        assert!(self.lower_ctx.dfg().value_type(val).bits() >= 256);
+        if let Some(load) = self.sinkable_load(val) {
+            return XmmMem128::unwrap_new(RegMem::mem(self.sink_load(&load)));
+        }
+        XmmMem128::unwrap_new(RegMem::reg(self.put_in_reg(val)))
+    }
+
+    fn xmm_mem_256_to_xmm_mem(&mut self, x: &XmmMem256) -> XmmMem {
+        XmmMem::unwrap_new(x.clone().into())
+    }
+
+    #[inline]
+    fn xmm_mem_512_to_xmm_mem(&mut self, x: &XmmMem512) -> XmmMem {
+        XmmMem::unwrap_new(x.clone().into())
+    }
+
+    #[inline]
+    fn writable_xmm_to_xmm_mem_256(&mut self, r: WritableXmm) -> XmmMem256 {
+        XmmMem256::from(r.to_reg())
+    }
+
+    #[inline]
+    fn writable_xmm_to_xmm_mem_512(&mut self, r: WritableXmm) -> XmmMem512 {
+        XmmMem512::from(r.to_reg())
     }
 
     /// Wrap a `SyntheticAmode` as a 64-bit XMM memory operand.
@@ -1331,12 +1539,32 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     );
 
     #[inline]
+    fn wide_lane_chunk(&mut self, lane: u8) -> u8 {
+        lane / 4
+    }
+
+    fn wide_lane_sub(&mut self, lane: u8) -> u8 {
+        lane % 4
+    }
+
+    /// PLIRON: like `wide_lane_chunk`/`wide_lane_sub` but parameterized by
+    /// lane width: the 128-bit chunk index containing `lane`, and the
+    /// sub-index within it.
+    #[inline]
+    fn wide_lane_chunk128(&mut self, ty: Type, lane: u8) -> u8 {
+        lane / (16 / (ty.lane_bits() / 8) as u8)
+    }
+
+    fn wide_lane_sub128(&mut self, ty: Type, lane: u8) -> u8 {
+        lane % (16 / (ty.lane_bits() / 8) as u8)
+    }
+
     fn type_register_class(&mut self, ty: Type) -> Option<RegisterClass> {
         if is_int_or_ref_ty(ty) || ty == I128 {
             Some(RegisterClass::Gpr {
                 single_register: ty != I128,
             })
-        } else if ty.is_float() || (ty.is_vector() && ty.bits() <= 128) {
+        } else if ty.is_float() || (ty.is_vector() && ty.bits() <= 512) {
             Some(RegisterClass::Xmm)
         } else {
             None
@@ -1477,6 +1705,15 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
             .iter()
             .map(|&b| if b > 15 { b.wrapping_sub(16) } else { b })
             .map(|b| if b > 15 { 0b10000000 } else { b })
+            .collect();
+        self.lower_ctx
+            .use_constant(VCodeConstantData::Generated(mask))
+    }
+
+    #[inline]
+    fn mask_00ff(&mut self) -> VCodeConstant {
+        let mask = (0..16)
+            .map(|i| if i % 2 == 0 { 0xFFu8 } else { 0 })
             .collect();
         self.lower_ctx
             .use_constant(VCodeConstantData::Generated(mask))
@@ -2090,3 +2327,168 @@ const I8X16_USHR_MASKS: [u8; 128] = [
     0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03,
     0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
 ];
+
+/// PLIRON (`PLIRON_ARGUEXT=1`, opt-in): enable the i32 call-arg
+/// `uext` skip (`narrow_arg_uext_clean` / `arg_uext_skip_bits`).
+pub(crate) fn arguext_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_ARGUEXT").as_deref() == Ok("1"))
+}
+
+/// PLIRON (`PLIRON_ARGUEXT=1`): is the register of `v` (an i32 call
+/// operand) already zero-extended through all 64 bits? Almost every
+/// i32-typed CLIF result lowers to an x64 instruction that writes a
+/// 32-bit GPR, and every 32-bit GPR write zero-extends the upper half
+/// for free — so the dirty producers are the passthroughs (`ireduce`
+/// of a wider value, `copy`/`black_box` aliases), blockparams, and
+/// call results whose return slot doesn't declare `uext`.
+pub(crate) fn arg_uext_clean32(lctx: &Lower<'_, MInst>, v: Value) -> bool {
+    let dfg = lctx.dfg();
+    let ty = dfg.value_type(v);
+    ty.bits() == 32 && clean32(dfg, v, &mut 8)
+}
+
+fn clean32(dfg: &crate::ir::DataFlowGraph, v: Value, budget: &mut u32) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    let v = dfg.resolve_aliases(v);
+    let crate::ir::ValueDef::Result(inst, num) = dfg.value_def(v) else {
+        // Blockparams and unions can carry dirty upper bits.
+        return false;
+    };
+    match &dfg.insts[inst] {
+        // `black_box` is a passthrough: keeps the source's cleanliness.
+        InstructionData::Unary {
+            opcode: Opcode::BlackBox,
+            arg,
+        } => clean32(dfg, *arg, budget),
+        // `ireduce` keeps the wide register: clean only when the wide
+        // source's upper half is already zero.
+        InstructionData::Unary {
+            opcode: Opcode::Ireduce,
+            arg,
+        } => clean_upper32(dfg, *arg, budget),
+        // A call result is clean only when this return slot's ABI
+        // declares unsigned extension (`call_signature` covers
+        // `call`, `call_indirect`, and the `try_call` pair).
+        InstructionData::Call { .. }
+        | InstructionData::CallIndirect { .. }
+        | InstructionData::TryCall { .. }
+        | InstructionData::TryCallIndirect { .. } => dfg
+            .call_signature(inst)
+            .and_then(|sig| dfg.signatures[sig].returns.get(num))
+            .map(|p| p.extension == crate::ir::ArgumentExtension::Uext)
+            .unwrap_or(false),
+        // Every other i32 result lowers to a 32-bit-writing inst, and
+        // a 32-bit dest write zero-extends to 64 bits on x64.
+        _ => true,
+    }
+}
+
+/// PLIRON: is `v` (an i64 value) zero through bit 32 — i.e. does its
+/// register already hold a `uext` 32->64 value? Used for `ireduce`
+/// sources; bounded by the same budget as `clean32`.
+fn clean_upper32(dfg: &crate::ir::DataFlowGraph, v: Value, budget: &mut u32) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    let v = dfg.resolve_aliases(v);
+    let bits = dfg.value_type(v).bits();
+    if bits == 32 {
+        return clean32(dfg, v, budget);
+    }
+    if bits != 64 {
+        return false;
+    }
+    let crate::ir::ValueDef::Result(inst, _) = dfg.value_def(v) else {
+        return false;
+    };
+    match &dfg.insts[inst] {
+        InstructionData::UnaryImm {
+            opcode: Opcode::Iconst,
+            imm,
+        } => (imm.bits() as u64) <= u32::MAX as u64,
+        InstructionData::Unary {
+            opcode: Opcode::Uextend,
+            arg,
+        } => dfg.value_type(*arg).bits() <= 32,
+        InstructionData::Unary {
+            opcode: Opcode::BlackBox | Opcode::Ireduce,
+            arg,
+        } => clean_upper32(dfg, *arg, budget),
+        InstructionData::Load {
+            opcode: Opcode::Uload8 | Opcode::Uload16 | Opcode::Uload32,
+            ..
+        } => true,
+        // `x & m` is clean when either operand is: a canonical
+        // `band x, 0xffffffff` or a nested clean value both work.
+        InstructionData::Binary {
+            opcode: Opcode::Band,
+            args,
+        } => {
+            let [a, b] = *args;
+            clean_upper32(dfg, a, budget) || clean_upper32(dfg, b, budget)
+        }
+        // `x | y` / `x ^ y` need both halves clean.
+        InstructionData::Binary {
+            opcode: Opcode::Bor | Opcode::Bxor,
+            args,
+        } => {
+            let [a, b] = *args;
+            clean_upper32(dfg, a, budget) && clean_upper32(dfg, b, budget)
+        }
+        // `x >> k` with k >= 32 leaves at most 32 live bits.
+        InstructionData::Binary {
+            opcode: Opcode::Ushr,
+            args,
+        } => {
+            let [_, k] = *args;
+            match dfg.value_def(k) {
+                crate::ir::ValueDef::Result(inst, _) => match &dfg.insts[inst] {
+                    InstructionData::UnaryImm {
+                        opcode: Opcode::Iconst,
+                        imm,
+                    } => (imm.bits() as u64) >= 32,
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// PLIRON (`PLIRON_X64_IMULEA`): `x·d` for `d ∈ {3,5,9}` lowers to one
+/// `lea (x, x·(d-1))` — 1c vs `imul`'s 3c; LLVM's canonical
+/// small-multiply form. The `·2^k` tail of `d·2^k` multipliers is
+/// split off upstream (clifpeep `mulea_sweep`) into an `ishl` that
+/// folds into a consuming `iadd`'s amode. Returns `log2(d-1)` — the
+/// amode shift — when `c` is such a `d`. Default-on;
+/// `PLIRON_X64_IMULEA=0` keeps `imul`.
+pub(crate) fn imulea_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("PLIRON_X64_IMULEA").as_deref(), Ok("0")))
+}
+
+fn mul_lea_shift(c: u64) -> Option<u8> {
+    imulea_enabled()
+        .then(|| match c {
+            3 => Some(1u8),
+            5 => Some(2u8),
+            9 => Some(3u8),
+            _ => None,
+        })?
+}
+
+/// PLIRON (`PLIRON_X64_SUAMODE`, default-on): `pliron_iadd_su_iconst`
+/// requires the folded `iadd x, K` to have ≤1 direct use. `=0` = the
+/// stock unconditional displacement fold.
+fn su_amode_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("PLIRON_X64_SUAMODE").as_deref(), Ok("0")))
+}
+
+

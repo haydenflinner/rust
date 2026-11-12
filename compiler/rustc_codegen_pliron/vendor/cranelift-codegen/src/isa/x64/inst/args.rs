@@ -376,6 +376,8 @@ newtype_of_reg!(
               XmmMem32         size:32,
               XmmMem64         size:64,
               XmmMem128        size:128,
+              XmmMem256        size:256,
+              XmmMem512        size:512,
               XmmMemAligned                    aligned:true,
               XmmMemAligned8   size:8          aligned:true,
               XmmMemAligned16  size:16         aligned:true,
@@ -614,10 +616,21 @@ impl SyntheticAmode {
                 // NOTE: this could be made relative to RSP by adding additional
                 // offsets from the frame_layout.
                 let args_max_fp_offset = frame.tail_args_size + frame.setup_area_size;
-                Amode::imm_reg(
-                    i32::try_from(args_max_fp_offset - offset).unwrap(),
-                    regs::rbp(),
-                )
+                if frame.setup_area_size == 0 {
+                    // PLIRON: frameless functions have no RBP anchor; FP is
+                    // `active_size` above the final RSP and the caller's SP is
+                    // one word above that (return address).
+                    let off = i64::from(frame.active_size())
+                        + 8
+                        + i64::from(frame.tail_args_size)
+                        - i64::from(*offset);
+                    Amode::imm_reg(i32::try_from(off).unwrap(), regs::rsp())
+                } else {
+                    Amode::imm_reg(
+                        i32::try_from(args_max_fp_offset - offset).unwrap(),
+                        regs::rbp(),
+                    )
+                }
             }
             SyntheticAmode::SlotOffset { simm32 } => {
                 let off = *simm32 as i64 + i64::from(frame.outgoing_args_size);

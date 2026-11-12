@@ -1,0 +1,598 @@
+//! `.eh_frame` + `.gcc_except_table` (LSDA) emission for Cranelift-compiled
+//! functions. Adapted from rustc_codegen_cranelift's `debuginfo/unwind.rs`
+//! (MIT/Apache-2.0).
+
+mod gcc_except_table;
+
+use cranelift_codegen::ir::{AbiParam, Endianness, Signature, types};
+use cranelift_codegen::isa::unwind::UnwindInfo;
+use cranelift_codegen::{CompiledCode, FinalizedMachExceptionHandler};
+use cranelift_module::{DataDescription, DataId, FuncId, FuncOrDataId, Linkage, Module};
+use cranelift_object::ObjectProduct;
+use gcc_except_table::*;
+use gimli::write::{Address, CieId, EhFrame, EndianVec, FrameTable, Result, Writer};
+use gimli::{Encoding, Format, RunTimeEndian, SectionId};
+use object::write::{Relocation, StandardSection};
+use object::{RelocationEncoding, RelocationFlags};
+
+pub const EXCEPTION_HANDLER_CLEANUP: u32 = 0;
+pub const EXCEPTION_HANDLER_CATCH: u32 = 1;
+
+fn address_for_func(id: FuncId) -> Address {
+    Address::Symbol {
+        symbol: id.as_u32() as usize,
+        addend: 0,
+    }
+}
+
+fn address_for_data(id: DataId) -> Address {
+    Address::Symbol {
+        symbol: (id.as_u32() | 1 << 31) as usize,
+        addend: 0,
+    }
+}
+
+pub struct UnwindContext {
+    endian: RunTimeEndian,
+    frame_table: FrameTable,
+    cie_id: Option<CieId>,
+    lsda: bool,
+    /// FuncId of `rust_eh_personality` when the CIE references it directly
+    /// (Mach-O); the ld64 personality reloc points at the function and gets a
+    /// POINTER_TO_GOT reloc instead of a DW.ref slot.
+    personality_fn: Option<u32>,
+    macho: bool,
+    x86_macho: bool,
+    /// COFF: per-function (FuncId, .xdata UNWIND_INFO bytes, function size).
+    /// Emitted as `.pdata` RUNTIME_FUNCTION + `.xdata` records.
+    coff: bool,
+    pdata: Vec<(FuncId, Vec<u8>, u64)>,
+}
+
+impl UnwindContext {
+    /// `unwind`: reference `rust_eh_personality` and emit LSDAs (panic=unwind).
+    /// `personality`: the personality function's symbol.
+    // r[impl native.eh.personality]
+    pub fn new(module: &mut dyn Module, pic: bool, unwind: bool, personality: &str) -> Self {
+        let endian = match module.isa().endianness() {
+            Endianness::Little => RunTimeEndian::Little,
+            Endianness::Big => RunTimeEndian::Big,
+        };
+        let mut frame_table = FrameTable::default();
+        let binary_format = module.isa().triple().binary_format;
+        let macho = binary_format == target_lexicon::BinaryFormat::Macho;
+        let coff = binary_format == target_lexicon::BinaryFormat::Coff;
+        let x86_macho =
+            macho && module.isa().triple().architecture == target_lexicon::Architecture::X86_64;
+        let mut personality_fn = None;
+        // No DWARF CIE on COFF: unwind info is .pdata/.xdata per function.
+        let cie_id = if coff {
+            None
+        } else {
+            module.isa().create_systemv_cie().map(|mut cie| {
+                let ptr_enc = if pic {
+                    gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0)
+                } else {
+                    gimli::DW_EH_PE_absptr
+                };
+                cie.fde_address_encoding = ptr_enc;
+                if unwind {
+                    let code_enc = if pic {
+                        let fmt = if module.isa().triple().binary_format
+                            == target_lexicon::BinaryFormat::Macho
+                            || module.isa().triple().architecture
+                                == target_lexicon::Architecture::X86_64
+                        {
+                            // ld64/ld64.lld require sdata4 for the CIE personality.
+                            gimli::DW_EH_PE_sdata4
+                        } else {
+                            gimli::DW_EH_PE_sdata8
+                        };
+                        gimli::DwEhPe(gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_pcrel.0 | fmt.0)
+                    } else {
+                        gimli::DwEhPe(gimli::DW_EH_PE_indirect.0 | gimli::DW_EH_PE_absptr.0)
+                    };
+                    cie.lsda_encoding = Some(ptr_enc);
+                    let pt = module.target_config().pointer_type();
+                    let personality_name = personality;
+                    let personality = match module.get_name(personality_name) {
+                        Some(FuncOrDataId::Func(id)) => id,
+                        _ => {
+                            let sig = Signature {
+                                params: vec![
+                                    AbiParam::new(types::I32),
+                                    AbiParam::new(types::I32),
+                                    AbiParam::new(types::I64),
+                                    AbiParam::new(pt),
+                                    AbiParam::new(pt),
+                                ],
+                                returns: vec![AbiParam::new(types::I32)],
+                                call_conv: module.target_config().default_call_conv,
+                            };
+                            module
+                                .declare_function(personality_name, Linkage::Import, &sig)
+                                .unwrap()
+                        }
+                    };
+                    if macho {
+                        // Mach-O: the CIE personality reloc points at the function
+                        // itself and is emitted as POINTER_TO_GOT; the linker GOT
+                        // supplies the `indirect` hop, so no DW.ref slot is needed.
+                        personality_fn = Some(personality.as_u32());
+                        cie.personality = Some((code_enc, address_for_func(personality)));
+                    } else {
+                        // Indirect so the personality may live in another DSO.
+                        let pref = module
+                            .declare_data(
+                                &format!("DW.ref.{personality_name}"),
+                                Linkage::Local,
+                                false,
+                                false,
+                            )
+                            .unwrap();
+                        let mut d = DataDescription::new();
+                        // Must not be zero-init: the unwinder can't handle it in .bss.
+                        d.define(vec![0; pt.bytes() as usize].into_boxed_slice());
+                        let fr = module.declare_func_in_data(personality, &mut d);
+                        d.write_function_addr(0, fr);
+                        module.define_data(pref, &d).unwrap();
+                        cie.personality = Some((code_enc, address_for_data(pref)));
+                    }
+                }
+                frame_table.add_cie(cie)
+            })
+        };
+        UnwindContext {
+            endian,
+            frame_table,
+            cie_id,
+            lsda: unwind,
+            personality_fn,
+            macho,
+            x86_macho,
+            coff,
+            pdata: Vec::new(),
+        }
+    }
+
+    // r[impl native.eh.frames]
+    // r[impl native.eh.lsda]
+    pub fn add_function(&mut self, module: &mut dyn Module, func_id: FuncId, code: &CompiledCode) {
+        if self.coff {
+            let info = code.create_unwind_info(module.isa()).unwrap();
+            if let Some(UnwindInfo::WindowsX64(info)) = info {
+                let mut buf = vec![0; info.emit_size()];
+                info.emit(&mut buf);
+                self.pdata
+                    .push((func_id, buf, u64::from(code.buffer.total_size())));
+            }
+            return;
+        }
+        let Some(UnwindInfo::SystemV(info)) = code.create_unwind_info(module.isa()).unwrap() else {
+            return;
+        };
+        let mut fde = info.to_fde(address_for_func(func_id));
+        if self.lsda {
+            let lsda = module.declare_anonymous_data(false, false).unwrap();
+            let encoding = Encoding {
+                format: Format::Dwarf32,
+                version: 1,
+                address_size: module.isa().frontend_config().pointer_bytes(),
+            };
+            let mut t = GccExceptTable {
+                call_sites: CallSiteTable(vec![]),
+                actions: ActionTable::new(),
+                type_info: TypeInfoTable::new(gimli::DW_EH_PE_udata4),
+            };
+            let catch_type = t.type_info.add(Address::Constant(0));
+            let catch_action = t.actions.add(Action {
+                kind: ActionKind::Catch(catch_type),
+                next_action: None,
+            });
+            for cs in code.buffer.call_sites() {
+                let start = u64::from(cs.ret_addr - 1);
+                if cs.exception_handlers.is_empty() {
+                    t.call_sites.0.push(CallSite {
+                        start,
+                        length: 1,
+                        landing_pad: 0,
+                        action_entry: None,
+                    });
+                }
+                for &h in cs.exception_handlers {
+                    let FinalizedMachExceptionHandler::Tag(tag, lp) = h else {
+                        unreachable!()
+                    };
+                    let action_entry = match tag.as_u32() {
+                        EXCEPTION_HANDLER_CLEANUP => None,
+                        EXCEPTION_HANDLER_CATCH => Some(catch_action),
+                        _ => unreachable!(),
+                    };
+                    t.call_sites.0.push(CallSite {
+                        start,
+                        length: 1,
+                        landing_pad: u64::from(lp),
+                        action_entry,
+                    });
+                }
+            }
+            let mut w = WriterRelocate::new(self.endian);
+            t.write(&mut w, encoding).unwrap();
+            let mut data = DataDescription::new();
+            data.define(w.writer.into_vec().into_boxed_slice());
+            // Mach-O custom sections never dedup, and n_sect is a u8: emit
+            // LSDAs into the shared read-only-data section instead of one
+            // `__gcc_except_tab` per FDE.
+            if !self.macho {
+                data.set_custom_section(".gcc_except_table");
+            }
+            for r in &w.relocs {
+                let DebugRelocName::Symbol(id) = r.name else {
+                    unreachable!()
+                };
+                let id = id as u32;
+                if id & 1 << 31 == 0 {
+                    let fr = module.declare_func_in_data(FuncId::from_u32(id), &mut data);
+                    data.write_function_addr(r.offset, fr);
+                } else {
+                    let gv =
+                        module.declare_data_in_data(DataId::from_u32(id & !(1 << 31)), &mut data);
+                    data.write_data_addr(r.offset, gv, 0);
+                }
+            }
+            module.define_data(lsda, &data).unwrap();
+            fde.lsda = Some(address_for_data(lsda));
+        }
+        self.frame_table.add_fde(self.cie_id.unwrap(), fde);
+    }
+
+    /// COFF: `.pdata` RUNTIME_FUNCTION entries + `.xdata` UNWIND_INFO records.
+    /// No exception handler is registered (UNW_FLAG_NHANDLER): real SEH can
+    /// unwind through our frames but cannot catch in them — catching is done
+    /// by the emulated-EH path in lower.rs under panic=unwind.
+    // r[impl native.win.pdata]
+    pub fn emit_coff(self, product: &mut ObjectProduct) {
+        if self.pdata.is_empty() {
+            return;
+        }
+        let fsyms: Vec<object::write::SymbolId> = self
+            .pdata
+            .iter()
+            .map(|(id, _, _)| product.function_symbol(*id))
+            .collect();
+        let obj = &mut product.object;
+        let xdata = obj.add_section(
+            Vec::new(),
+            b".xdata".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        let pdata = obj.add_section(
+            Vec::new(),
+            b".pdata".to_vec(),
+            object::SectionKind::ReadOnlyData,
+        );
+        for ((func_id, bytes, size), fsym) in self.pdata.into_iter().zip(fsyms) {
+            let xoff = obj.append_section_data(xdata, &bytes, 4);
+            let xsym = obj.add_symbol(object::write::Symbol {
+                name: format!("$unwind${}", func_id.as_u32()).into_bytes(),
+                value: xoff,
+                size: bytes.len() as u64,
+                kind: object::SymbolKind::Data,
+                scope: object::SymbolScope::Compilation,
+                weak: false,
+                section: object::write::SymbolSection::Section(xdata),
+                flags: object::SymbolFlags::None,
+            });
+            let poff = obj.append_section_data(pdata, &[0; 12], 4);
+            for (off, sym, addend) in [(0u64, fsym, 0i64), (4, fsym, size as i64), (8, xsym, 0)] {
+                obj.add_relocation(
+                    pdata,
+                    Relocation {
+                        offset: poff + off,
+                        symbol: sym,
+                        flags: RelocationFlags::Generic {
+                            kind: object::RelocationKind::ImageOffset,
+                            encoding: RelocationEncoding::Generic,
+                            size: 32,
+                        },
+                        addend,
+                    },
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    // r[impl native.eh.macho-x64]
+    pub fn emit(self, product: &mut ObjectProduct) {
+        if self.coff {
+            return self.emit_coff(product);
+        }
+        let mut eh = EhFrame::from(WriterRelocate::new(self.endian));
+        self.frame_table.write_eh_frame(&mut eh).unwrap();
+        let w = eh.0;
+        if w.writer.slice().is_empty() {
+            return;
+        }
+        // The CIE record is written first; its personality field is the only
+        // relocated field inside it. Restrict the Mach-O personality reloc to
+        // offsets within the CIE so that an FDE for the personality function
+        // itself (e.g. when building std, which defines rust_eh_personality)
+        // still gets a normal pc_begin reloc.
+        let cie_end = 4 + u64::from(u32::from_le_bytes(
+            w.writer.slice()[0..4].try_into().unwrap(),
+        ));
+        let sec = product.object.section_id(StandardSection::EhFrame);
+        product
+            .object
+            .section_mut(sec)
+            .set_data(w.writer.into_vec(), 8);
+        // x86_64-macho: ld64's eh_frame parser accepts only UNSIGNED,
+        // SUBTRACTOR and GOT relocs — a pcrel field needs a SUBTRACTOR
+        // (field label) + UNSIGNED (target) pair, like the assembler's
+        // `.long target - Lfield`. object::write reverses a reloc list that
+        // is ascending by offset (ld64 wants descending), so emit ours
+        // descending to keep each SUBTRACTOR immediately before its UNSIGNED.
+        let mut relocs: Vec<&DebugReloc> = w.relocs.iter().collect();
+        if self.x86_macho {
+            relocs.sort_by_key(|r| std::cmp::Reverse(r.offset));
+        }
+        for r in relocs {
+            let (symbol, off) = match r.name {
+                DebugRelocName::Section(_) => (product.object.section_symbol(sec), 0),
+                DebugRelocName::Symbol(id) => {
+                    let id = id as u32;
+                    let s = if id & 1 << 31 == 0 {
+                        product.function_symbol(FuncId::from_u32(id))
+                    } else {
+                        product.data_symbol(DataId::from_u32(id & !(1 << 31)))
+                    };
+                    if self.macho {
+                        // ld64's eh_frame parser reads every reloc as a symbol
+                        // index, so reference the symbol itself, never the
+                        // section+offset form.
+                        (s, 0)
+                    } else {
+                        product
+                            .object
+                            .symbol_section_and_offset(s)
+                            .unwrap_or((s, 0))
+                    }
+                }
+            };
+            if self.macho
+                && matches!(r.name, DebugRelocName::Symbol(id) if self.personality_fn == Some(id as u32))
+                && u64::from(r.offset) < cie_end
+            {
+                // CIE personality: ld64 stores the symbol index in the field
+                // and turns it into a GOT pcrel fixup in the linked image.
+                let r_type = if self.x86_macho {
+                    object::macho::X86_64_RELOC_GOT
+                } else {
+                    object::macho::ARM64_RELOC_POINTER_TO_GOT
+                };
+                // r_pcrel must stay clear on x86_64: the writer would fold a
+                // +4 pcrel correction into the field, and ld64 adds the field
+                // to the symbol index it stores there.
+                product
+                    .object
+                    .add_relocation(
+                        sec,
+                        Relocation {
+                            offset: u64::from(r.offset),
+                            symbol,
+                            flags: RelocationFlags::MachO {
+                                r_type,
+                                r_pcrel: !self.x86_macho,
+                                r_length: 2,
+                            },
+                            addend: 0,
+                        },
+                    )
+                    .unwrap();
+                continue;
+            }
+            if self.x86_macho {
+                // A local symbol at the relocated field itself, so the
+                // SUBTRACTOR computes target - field.
+                let lbl = product.object.add_symbol(object::write::Symbol {
+                    name: format!("Leh_field_{:x}", r.offset).into_bytes(),
+                    value: u64::from(r.offset),
+                    size: 0,
+                    kind: object::SymbolKind::Unknown,
+                    scope: object::SymbolScope::Compilation,
+                    weak: false,
+                    section: object::write::SymbolSection::Section(sec),
+                    flags: object::SymbolFlags::None,
+                });
+                let r_length = match r.size {
+                    4 => 2,
+                    8 => 3,
+                    _ => unreachable!("eh_frame reloc size {}", r.size),
+                };
+                for (r_type, sym) in [
+                    (object::macho::X86_64_RELOC_SUBTRACTOR, lbl),
+                    (object::macho::X86_64_RELOC_UNSIGNED, symbol),
+                ] {
+                    product
+                        .object
+                        .add_relocation(
+                            sec,
+                            Relocation {
+                                offset: u64::from(r.offset),
+                                symbol: sym,
+                                flags: RelocationFlags::MachO {
+                                    r_type,
+                                    r_pcrel: false,
+                                    r_length,
+                                },
+                                addend: off as i64 + r.addend,
+                            },
+                        )
+                        .unwrap();
+                }
+                continue;
+            }
+            product
+                .object
+                .add_relocation(
+                    sec,
+                    Relocation {
+                        offset: u64::from(r.offset),
+                        symbol,
+                        flags: RelocationFlags::Generic {
+                            kind: r.kind,
+                            encoding: RelocationEncoding::Generic,
+                            size: r.size * 8,
+                        },
+                        addend: off as i64 + r.addend,
+                    },
+                )
+                .unwrap();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DebugReloc {
+    offset: u32,
+    size: u8,
+    name: DebugRelocName,
+    addend: i64,
+    kind: object::RelocationKind,
+}
+
+#[derive(Clone)]
+enum DebugRelocName {
+    Section(#[allow(dead_code)] SectionId),
+    Symbol(usize),
+}
+
+/// A gimli [`Writer`] that records relocations.
+#[derive(Clone)]
+struct WriterRelocate {
+    relocs: Vec<DebugReloc>,
+    writer: EndianVec<RunTimeEndian>,
+}
+
+impl WriterRelocate {
+    fn new(endian: RunTimeEndian) -> Self {
+        WriterRelocate {
+            relocs: Vec::new(),
+            writer: EndianVec::new(endian),
+        }
+    }
+    fn reloc(
+        &mut self,
+        offset: usize,
+        size: u8,
+        name: DebugRelocName,
+        addend: i64,
+        kind: object::RelocationKind,
+    ) {
+        self.relocs.push(DebugReloc {
+            offset: offset as u32,
+            size,
+            name,
+            addend,
+            kind,
+        });
+    }
+}
+
+impl Writer for WriterRelocate {
+    type Endian = RunTimeEndian;
+    fn endian(&self) -> Self::Endian {
+        self.writer.endian()
+    }
+    fn len(&self) -> usize {
+        self.writer.len()
+    }
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer.write(bytes)
+    }
+    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.writer.write_at(offset, bytes)
+    }
+    fn write_address(&mut self, address: Address, size: u8) -> Result<()> {
+        match address {
+            Address::Constant(val) => self.write_udata(val, size),
+            Address::Symbol { symbol, addend } => {
+                self.reloc(
+                    self.len(),
+                    size,
+                    DebugRelocName::Symbol(symbol),
+                    addend,
+                    object::RelocationKind::Absolute,
+                );
+                self.write_udata(0, size)
+            }
+        }
+    }
+    fn write_offset(&mut self, val: usize, section: SectionId, size: u8) -> Result<()> {
+        self.reloc(
+            self.len(),
+            size,
+            DebugRelocName::Section(section),
+            val as i64,
+            object::RelocationKind::Absolute,
+        );
+        self.write_udata(0, size)
+    }
+    fn write_offset_at(
+        &mut self,
+        offset: usize,
+        val: usize,
+        section: SectionId,
+        size: u8,
+    ) -> Result<()> {
+        self.reloc(
+            offset,
+            size,
+            DebugRelocName::Section(section),
+            val as i64,
+            object::RelocationKind::Absolute,
+        );
+        self.write_udata_at(offset, 0, size)
+    }
+    fn write_eh_pointer(&mut self, address: Address, eh_pe: gimli::DwEhPe, size: u8) -> Result<()> {
+        match address {
+            Address::Constant(val) => {
+                let val = match eh_pe.application() {
+                    gimli::DW_EH_PE_absptr => val,
+                    gimli::DW_EH_PE_pcrel => (self.len() as u64).wrapping_sub(val),
+                    _ => return Err(gimli::write::Error::UnsupportedPointerEncoding(eh_pe)),
+                };
+                self.write_eh_pointer_data(val, eh_pe.format(), size)
+            }
+            Address::Symbol { symbol, addend } => match eh_pe.application() {
+                gimli::DW_EH_PE_pcrel => {
+                    let size = match eh_pe.format() {
+                        gimli::DW_EH_PE_sdata4 => 4,
+                        gimli::DW_EH_PE_sdata8 => 8,
+                        _ => return Err(gimli::write::Error::UnsupportedPointerEncoding(eh_pe)),
+                    };
+                    self.reloc(
+                        self.len(),
+                        size,
+                        DebugRelocName::Symbol(symbol),
+                        addend,
+                        object::RelocationKind::Relative,
+                    );
+                    self.write_udata(0, size)
+                }
+                gimli::DW_EH_PE_absptr => {
+                    self.reloc(
+                        self.len(),
+                        size,
+                        DebugRelocName::Symbol(symbol),
+                        addend,
+                        object::RelocationKind::Absolute,
+                    );
+                    self.write_udata(0, size)
+                }
+                _ => Err(gimli::write::Error::UnsupportedPointerEncoding(eh_pe)),
+            },
+        }
+    }
+}

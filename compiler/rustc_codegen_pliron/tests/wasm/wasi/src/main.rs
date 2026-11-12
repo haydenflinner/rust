@@ -1,4 +1,5 @@
 //! std on wasm32-wasip1 with tools/pliron-wasi-libc instead of wasi-libc.
+
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -59,10 +60,135 @@ fn main() {
     check("systemtime", now.as_secs() > 1_700_000_000);
     let x = std::hint::black_box(1.0f64);
     check(
+        "variadic",
+        unsafe { vsum(3, 10i32, 20i64, 30.5f64) == 60.5 },
+    );
+    // Consecutive i32/u32 args: the wasm C ABI packs varargs in 4-byte
+    // slots at natural alignment, not SysV 8-byte slots — a stride-8 bug
+    // shows up as misaligned reads here. The i64 after three i32s
+    // exercises >4-alignment padding (offset 16, not 12/24).
+    check(
+        "variadic slots",
+        unsafe { vpack(6, 1i32, 2u32, 3i32, 4i64, 5i32, 6.5f64) == 21.5 },
+    );
+    check(
         "libm",
         (x.exp() - std::f64::consts::E).abs() < 1e-12 && (x.atan2(x) - std::f64::consts::FRAC_PI_4).abs() < 1e-12,
     );
+    // wpeep regression: str::lt compares a prefix then falls back to the
+    // length difference; a deleted `get l; set l` self-copy hid the write
+    // carrying that difference out of the branch, and the copy-forward
+    // pass overwrote it with the memcmp result (lt returned false).
+    {
+        let c = std::hint::black_box("cccc");
+        let cc = std::hint::black_box("ccccc");
+        check("str lt", c < cc && !(cc < c) && c != cc && cc > c);
+        let b = std::hint::black_box(b"abcd".as_slice());
+        let bb = std::hint::black_box(b"abcde".as_slice());
+        check("slice lt", b < bb && bb > b);
+    }
+    // localify steal regression (pulldown-cmark miscompile): the
+    // br_table below sends two edges to the loop-header block with
+    // different arg tuples and a third to the `)` handler, which still
+    // reads the pre-increment `i` on its exit edge. Letting the shared
+    // `i+1` arg steal `i`'s local clobbers the value the `)` exit reads
+    // (scan returned i+1 on break).
+    check(
+        "br_table edge args",
+        scan(std::hint::black_box(b"(x))y".as_slice())) == (3, 0),
+    );
+    check(
+        "br_table edge args 2",
+        scan(std::hint::black_box(b"(x)".as_slice())) == (3, 0)
+            && scan(std::hint::black_box(b"u) b".as_slice())) == (1, 0),
+    );
+    // Per-function `#[target_feature(enable = "simd128")]` with no global
+    // `+simd128`: vector signatures scalarize to per-lane params/results,
+    // so the `llvm.wasm.*` intrinsic emit packs lanes into v128 and
+    // extracts them back (hex-simd panicked binding 1 value to 16
+    // results and emitted `unreachable` stubs).
+    {
+        let a = [0xabu8; 16];
+        let b = [0xcdu8; 16];
+        let mut m = [0u8; 16];
+        for i in 0..16 {
+            m[i] = if i % 3 == 0 { 0xff } else { 0 };
+        }
+        let (r, t) = unsafe { bitselect_check(&a, &b, &m) };
+        check(
+            "v128 bitselect",
+            r.iter().enumerate().all(|(i, &x)| {
+                x == if i % 3 == 0 { 0xab } else { 0xcd }
+            }) && t,
+        );
+    }
     eprintln!("wasi std OK");
+}
+
+#[target_feature(enable = "simd128")]
+unsafe fn bitselect_check(a: &[u8; 16], b: &[u8; 16], m: &[u8; 16]) -> ([u8; 16], bool) {
+    use std::arch::wasm32::{v128_any_true, v128_bitselect, v128_load, v128_store};
+    let (a, b, m) = (
+        v128_load(a.as_ptr().cast()),
+        v128_load(b.as_ptr().cast()),
+        v128_load(m.as_ptr().cast()),
+    );
+    let r = v128_bitselect(a, b, m);
+    let mut out = [0u8; 16];
+    v128_store(out.as_mut_ptr().cast(), r);
+    (out, v128_any_true(r))
+}
+
+#[inline(never)]
+fn scan(bytes: &[u8]) -> (usize, u32) {
+    let mut i = 0usize;
+    let mut nest = 0u32;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x0..=0x20 => break,
+            b'(' => nest += 1,
+            b')' => {
+                if nest == 0 {
+                    break;
+                }
+                nest -= 1;
+            }
+            b'\\' if i + 1 < bytes.len() && bytes[i + 1].is_ascii_punctuation() => i += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    (i, nest)
+}
+
+unsafe extern "C" fn vsum(n: i32, mut ap: ...) -> f64 {
+    let mut s = 0.0;
+    for i in 0..n {
+        s += unsafe {
+            match i {
+                0 => ap.next_arg::<i32>() as f64,
+                1 => ap.next_arg::<i64>() as f64,
+                _ => ap.next_arg::<f64>(),
+            }
+        };
+    }
+    s
+}
+
+unsafe extern "C" fn vpack(n: i32, mut ap: ...) -> f64 {
+    let mut s = 0.0;
+    for i in 0..n {
+        s += unsafe {
+            match i {
+                0 => ap.next_arg::<i32>() as f64,
+                1 => ap.next_arg::<u32>() as f64,
+                2 | 4 => ap.next_arg::<i32>() as f64,
+                3 => ap.next_arg::<i64>() as f64,
+                _ => ap.next_arg::<f64>(),
+            }
+        };
+    }
+    s
 }
 
 // std dereferences the returned `dirent` directly, so it must be suitably aligned.

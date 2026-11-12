@@ -2363,6 +2363,22 @@ pub(crate) fn define(
 
     ig.push(
         Inst::new(
+            "ctz_nonzero",
+            r#"
+        Count trailing zeros of a nonzero value.
+
+        Like ``ctz``, but ``x`` must be nonzero; the result is undefined
+        when ``x`` is zero. Targets may use this to omit the zero-input
+        fallback that ``ctz`` requires.
+        "#,
+            &formats.unary,
+        )
+        .operands_in(vec![Operand::new("x", iB)])
+        .operands_out(vec![Operand::new("a", iB)]),
+    );
+
+    ig.push(
+        Inst::new(
             "bswap",
             r#"
         Reverse the byte order of an integer.
@@ -3003,6 +3019,268 @@ pub(crate) fn define(
         .operands_out(vec![Operand::new("a", I16x8)]),
     );
 
+    // PLIRON: SSE2 `psadbw` — with a zero `y` this is the u8x16 byte-sum
+    // reduction (sum_u8 / `a[i] as u64` loops) that otherwise costs a
+    // 3-level `uwiden` tree.
+    ig.push(
+        Inst::new(
+            "x86_psadbw",
+            r#"
+        An instruction with equivalent semantics to `psadbw` on x86.
+
+        Computes the sum of absolute differences of unsigned bytes in each
+        8-byte group: `a[i] = sum(|x[j] - y[j]| for j in group i)`, producing
+        two `i64` lanes from an `i8x16` pair. With `y` all-zero this sums the
+        bytes of `x` per group.
+            "#,
+            &formats.binary,
+        )
+        .operands_in(vec![Operand::new("x", I8x16), Operand::new("y", I8x16)])
+        .operands_out(vec![Operand::new("a", I64x2)]),
+    );
+
+    // PLIRON: pairwise integer dot products — the quantized-inference
+    // primitives. `sdot` multiplies adjacent i16 lane pairs of `x` and `y`
+    // and adds them into i32 (x86 `pmaddwd`); `udot` does the same for
+    // unsigned `x` bytes times signed `y` bytes producing i16
+    // (x86 `pmaddubsw`, saturating); `udot_acc` is the four-wide
+    // u8*x*i8 dot accumulate (x86 `vpdpbusd` / AVX-VNNI) — the real
+    // quantized kernel op.
+    let I16xN = &TypeVar::new(
+        "I16xN",
+        "A SIMD vector type of 16-bit integer lanes",
+        TypeSetBuilder::new()
+            .ints(16..16)
+            .simd_lanes(2..32)
+            .includes_scalars(false)
+            .build(),
+    );
+    let I8xN = &TypeVar::new(
+        "I8xN",
+        "A SIMD vector type of 8-bit integer lanes",
+        TypeSetBuilder::new()
+            .ints(8..8)
+            .simd_lanes(4..64)
+            .includes_scalars(false)
+            .build(),
+    );
+    let I32xN = &TypeVar::new(
+        "I32xN",
+        "A SIMD vector type of 32-bit integer lanes",
+        TypeSetBuilder::new()
+            .ints(32..32)
+            .simd_lanes(2..16)
+            .includes_scalars(false)
+            .build(),
+    );
+    let I8xN2 = &TypeVar::new(
+        "I8xN2",
+        "A SIMD vector type of 8-bit integer lanes",
+        TypeSetBuilder::new()
+            .ints(8..8)
+            .simd_lanes(4..64)
+            .includes_scalars(false)
+            .build(),
+    );
+
+    ig.push(
+        Inst::new(
+            "sdot",
+            r#"
+        Signed pairwise dot product.
+
+        `a[i] = x[2i]*y[2i] + x[2i+1]*y[2i+1]`: multiply adjacent signed
+        16-bit lane pairs of `x` and `y` and add them into a signed 32-bit
+        lane. Result has half the lanes of `x` at double the width.
+        "#,
+            &formats.binary,
+        )
+        .operands_in(vec![
+            Operand::new("x", I16xN),
+            Operand::new("y", I16xN),
+        ])
+        .operands_out(vec![Operand::new("a", &I16xN.merge_lanes())]),
+    );
+
+    ig.push(
+        Inst::new(
+            "udot",
+            r#"
+        Pairwise unsigned-times-signed dot product.
+
+        `a[i] = x[2i]*y[2i] + x[2i+1]*y[2i+1]` where `x` lanes are
+        unsigned bytes and `y` lanes are signed bytes; the pairwise sums
+        saturate to signed 16-bit lanes (x86 `pmaddubsw` semantics).
+        Result has half the lanes of `x` at double the width.
+        "#,
+            &formats.binary,
+        )
+        .operands_in(vec![
+            Operand::new("x", I8xN),
+            Operand::new("y", I8xN),
+        ])
+        .operands_out(vec![Operand::new("a", &I8xN.merge_lanes())]),
+    );
+
+    ig.push(
+        Inst::new(
+            "udot_acc",
+            r#"
+        Four-wide unsigned-times-signed dot product with accumulation.
+
+        `a[i] = acc[i] + x[4i]*y[4i] + x[4i+1]*y[4i+1] + x[4i+2]*y[4i+2]
+        + x[4i+3]*y[4i+3]` where `x` lanes are unsigned bytes and `y`
+        lanes are signed bytes (x86 `vpdpbusd` semantics). `x`/`y` have
+        four times as many lanes at a quarter of the width as `acc`.
+        "#,
+            &formats.ternary,
+        )
+        .operands_in(vec![
+            Operand::new("acc", I32xN),
+            // x/y are free typevars: the 4x lane-count relation to acc
+            // can't be expressed one derived level down, so lowering
+            // rules match the concrete byte-vector types instead.
+            Operand::new("x", I8xN),
+            Operand::new("y", I8xN2),
+        ])
+        .operands_out(vec![Operand::new("a", I32xN)]),
+    );
+
+    // PLIRON: runtime-index swizzles. `vswizzle` picks each result lane
+    // from one source vector by a per-lane index vector — a crossbar
+    // `shuffle` with the mask in a register (x86 `vperm*`), which
+    // sidesteps `shuffle`'s fixed `uimm128` mask entirely. `vswizzle2`
+    // selects across two concatenated sources (x86 `vpermt2*`).
+    let PermVec = &TypeVar::new(
+        "PermVec",
+        "A SIMD vector type with 32- or 64-bit lanes",
+        TypeSetBuilder::new()
+            .ints(32..64)
+            .floats(32..64)
+            .simd_lanes(2..16)
+            .includes_scalars(false)
+            .build(),
+    );
+    let IdxVec = &TypeVar::new(
+        "IdxVec",
+        "An integer index vector for a runtime swizzle",
+        TypeSetBuilder::new()
+            .ints(32..64)
+            .simd_lanes(2..16)
+            .includes_scalars(false)
+            .build(),
+    );
+
+    ig.push(
+        Inst::new(
+            "vswizzle",
+            r#"
+        Runtime-index vector swizzle.
+
+        `a[i] = x[idx[i]]`: each result lane takes the lane of `x` that
+        its `idx` lane selects (indices are interpreted modulo the lane
+        count). `idx` is an integer vector with the same lane count and
+        lane width as `x` — on x86 the permute index lives in lanes
+        matching the permuted element size.
+        "#,
+            &formats.binary,
+        )
+        .operands_in(vec![
+            Operand::new("x", PermVec),
+            Operand::new("idx", IdxVec),
+        ])
+        .operands_out(vec![Operand::new("a", PermVec)]),
+    );
+
+    // PLIRON: vector gather/scatter. `vgather` collects result lanes
+    // from `base + idx[i]*E + offset` where `E` is the element size of
+    // a result lane; `vscatter` is the matching store (x86 VSIB
+    // encodings; scatter is AVX512-only in HW).
+    let GatherVec = &TypeVar::new(
+        "GatherVec",
+        "A SIMD vector type with 32- or 64-bit lanes",
+        TypeSetBuilder::new()
+            .ints(32..64)
+            .floats(32..64)
+            .simd_lanes(2..16)
+            .includes_scalars(false)
+            .build(),
+    );
+    let GatherIdx = &TypeVar::new(
+        "GatherIdx",
+        "An integer index vector for a gather/scatter",
+        TypeSetBuilder::new()
+            .ints(32..64)
+            .simd_lanes(2..16)
+            .includes_scalars(false)
+            .build(),
+    );
+
+    ig.push(
+        Inst::new(
+            "vgather",
+            r#"
+        Gather vector lanes from memory.
+
+        `a[i] = load(base + idx[i]*E + offset)` where `E` is the element
+        size in bytes of a result lane. `idx` is an integer vector with
+        the same lane count as the result; its lanes may be 32- or
+        64-bit. Addresses are computed with wrapping 64-bit arithmetic.
+        "#,
+            &formats.store,
+        )
+        .operands_in(vec![
+            Operand::new("MemFlags", &imm.memflags),
+            Operand::new("p", iAddr),
+            Operand::new("idx", GatherIdx),
+            Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
+        ])
+        .operands_out(vec![Operand::new("a", GatherVec)])
+        .can_load(),
+    );
+
+    ig.push(
+        Inst::new(
+            "vscatter",
+            r#"
+        Scatter vector lanes to memory.
+
+        `store(x[i], base + idx[i]*E + offset)` where `E` is the element
+        size in bytes of a lane of `x`. `idx` is an integer vector with
+        the same lane count as `x`.
+        "#,
+            &formats.scatter,
+        )
+        .operands_in(vec![
+            Operand::new("MemFlags", &imm.memflags),
+            Operand::new("x", GatherVec),
+            Operand::new("p", iAddr),
+            Operand::new("idx", GatherIdx),
+            Operand::new("Offset", &imm.offset32).with_doc("Byte offset from base address"),
+        ])
+        .can_store(),
+    );
+
+    ig.push(
+        Inst::new(
+            "vswizzle2",
+            r#"
+        Runtime-index swizzle across two source vectors.
+
+        `a[i] = idx[i] < N ? x[idx[i]] : y[idx[i] - N]` where `N` is the
+        lane count: the index vector selects from `x` and `y`
+        concatenated (x86 `vpermt2*` semantics).
+        "#,
+            &formats.ternary,
+        )
+        .operands_in(vec![
+            Operand::new("x", PermVec),
+            Operand::new("y", PermVec),
+            Operand::new("idx", IdxVec),
+        ])
+        .operands_out(vec![Operand::new("a", PermVec)]),
+    );
+
     ig.push(
         Inst::new(
             "uextend",
@@ -3097,6 +3375,90 @@ pub(crate) fn define(
             "A scalar only floating point number, wider than the controlling type",
         )])
         .operands_out(vec![Operand::new("a", FloatScalar)]),
+    );
+
+    let F32Vec = &TypeVar::new(
+        "F32Vec",
+        "A SIMD vector of 32-bit floats",
+        TypeSetBuilder::new().floats(32..32).simd_lanes(4..16).build(),
+    );
+    let F16Vec = &TypeVar::new(
+        "F16Vec",
+        "A SIMD vector of 16-bit floats",
+        TypeSetBuilder::new().floats(16..16).simd_lanes(4..16).build(),
+    );
+
+    ig.push(
+        Inst::new(
+            "fvpromote_f16",
+            r#"
+        Convert each f16 lane of `x` to f32 (exact).
+        "#,
+            &formats.unary,
+        )
+        .operands_in(vec![Operand::new("x", &F32Vec.half_width())])
+        .operands_out(vec![Operand::new("a", F32Vec)]),
+    );
+
+    ig.push(
+        Inst::new(
+            "fvdemote_f16",
+            r#"
+        Convert each f32 lane of `x` to f16, rounding to nearest, ties to even.
+        "#,
+            &formats.unary,
+        )
+        .operands_in(vec![Operand::new("x", &F16Vec.double_width())])
+        .operands_out(vec![Operand::new("a", F16Vec)]),
+    );
+
+    ig.push(
+        Inst::new(
+            "fvpromote_bf16",
+            r#"
+        Convert each bf16 lane of `x` (carried as f16 bits) to f32 (exact).
+        "#,
+            &formats.unary,
+        )
+        .operands_in(vec![Operand::new("x", &F32Vec.half_width())])
+        .operands_out(vec![Operand::new("a", F32Vec)]),
+    );
+
+    ig.push(
+        Inst::new(
+            "fvdemote_bf16",
+            r#"
+        Convert each f32 lane of `x` to bf16 (as f16 bits), round to nearest even.
+        "#,
+            &formats.unary,
+        )
+        .operands_in(vec![Operand::new("x", &F16Vec.double_width())])
+        .operands_out(vec![Operand::new("a", F16Vec)]),
+    );
+
+    for (name, half) in [("fvpromote_f16_lo", "low"), ("fvpromote_f16_hi", "high")] {
+        ig.push(
+            Inst::new(
+                name,
+                &format!("Convert the {half} half of the f16 lanes of `x` to f32 (exact)."),
+                &formats.unary,
+            )
+            .operands_in(vec![Operand::new("x", &F32Vec.split_lanes())])
+            .operands_out(vec![Operand::new("a", F32Vec)]),
+        );
+    }
+
+    ig.push(
+        Inst::new(
+            "fvdemote_f16_pair",
+            r#"
+        Convert `x` (low half) and `y` (high half) to one f16 vector of twice the
+        lanes, rounding to nearest, ties to even.
+        "#,
+            &formats.binary,
+        )
+        .operands_in(vec![Operand::new("x", F32Vec), Operand::new("y", F32Vec)])
+        .operands_out(vec![Operand::new("a", &F32Vec.split_lanes())]),
     );
 
     let F64x2 = &TypeVar::new(
@@ -3518,6 +3880,35 @@ pub(crate) fn define(
          "#,
             &formats.nullary,
         )
+        .other_side_effects(),
+    );
+
+    // PLIRON: opaque value barrier for rustc's `black_box` — the CLIF
+    // equivalent of LLVM's `asm("" : "r,~{memory}" :: v)`. Optimization
+    // passes cannot look through it (not eliminable, not foldable, and
+    // `can_store` gives the `~{memory}` clobber), but ISAs lower it to
+    // zero machine instructions: the result vreg aliases the input.
+    ig.push(
+        Inst::new(
+            "black_box",
+            r#"
+        Optimization barrier: `a` is `x`, but the compiler must not assume that.
+
+        The result is opaque to every optimization — it cannot be folded back to
+        the input, and the instruction is a memory clobber, so loads and stores
+        cannot be forwarded or moved across it. Models LLVM's
+        `asm("" : "r,~{memory}" :: v)`. Emits no machine code; lowering aliases
+        the result to the input's register.
+        "#,
+            &formats.unary,
+        )
+        .operands_in(vec![
+            Operand::new("x", Any).with_doc("Value to make opaque"),
+        ])
+        .operands_out(vec![
+            Operand::new("a", Any).with_doc("The same value, opaque to the optimizer"),
+        ])
+        .can_store()
         .other_side_effects(),
     );
 }

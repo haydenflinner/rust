@@ -23,10 +23,11 @@
 //! carries is notified.
 
 use alloc::vec::Vec;
+use alloc::vec;
 
 use crate::{
     basic_block::BasicBlock,
-    context::{Context, Ptr},
+    context::{Context, Ptr, private::ArenaObj},
     irbuild::{
         inserter::{BlockInsertionPoint, Inserter, OpInsertionPoint},
         rewriter::{Rewriter, ScopedRewriter},
@@ -40,18 +41,113 @@ use crate::{
     value::Value,
 };
 
+/// PLIRON: key into a dense [`Tab`] — a per-Context arena/value ordinal.
+trait OrdKey: Copy + Eq + core::hash::Hash {
+    fn ord_key(&self) -> usize;
+}
+
+impl OrdKey for Value {
+    fn ord_key(&self) -> usize {
+        self.val_uid as usize
+    }
+}
+
+impl<T: ArenaObj + 'static> OrdKey for Ptr<T> {
+    fn ord_key(&self) -> usize {
+        self.ord()
+    }
+}
+
+/// PLIRON: a key span wider than this pays more zeroing than hashing.
+const MAX_DENSE: usize = 1 << 18;
+
+/// PLIRON: backing store for one `IrMapping` key space. `Dense` covers a
+/// caller-provided ordinal range with a `Vec` and routes out-of-range keys
+/// to `spill`; `Hash` is the upstream behavior for unbounded maps.
+#[derive(Debug)]
+enum Tab<K: OrdKey, V: Copy> {
+    Hash(HMap<K, V>),
+    Dense {
+        lo: usize,
+        slots: Vec<Option<V>>,
+        spill: HMap<K, V>,
+    },
+}
+
+impl<K: OrdKey, V: Copy> Default for Tab<K, V> {
+    fn default() -> Self {
+        Tab::Hash(HMap::default())
+    }
+}
+
+impl<K: OrdKey, V: Copy> Tab<K, V> {
+    fn dense(lo: usize, hi: usize, count: usize) -> Self {
+        let span = hi.saturating_sub(lo) + 1;
+        // Wide-sparse spans zero far more than they hold: hash instead.
+        if span > MAX_DENSE || span > count.saturating_mul(8) + 256 {
+            return Tab::Hash(HMap::default());
+        }
+        Tab::Dense {
+            lo,
+            slots: vec![None; span],
+            spill: HMap::default(),
+        }
+    }
+
+    fn insert(&mut self, k: K, v: V) {
+        match self {
+            Tab::Hash(h) => {
+                h.insert(k, v);
+            }
+            Tab::Dense { lo, slots, spill } => match slots.get_mut(k.ord_key().wrapping_sub(*lo)) {
+                Some(s) => *s = Some(v),
+                None => {
+                    spill.insert(k, v);
+                }
+            },
+        }
+    }
+
+    fn get(&self, k: K) -> Option<V> {
+        match self {
+            Tab::Hash(h) => h.get(&k).copied(),
+            Tab::Dense { lo, slots, spill } => match slots.get(k.ord_key().wrapping_sub(*lo)) {
+                Some(&s) => s,
+                None => spill.get(&k).copied(),
+            },
+        }
+    }
+}
+
 /// Mapping between IR entities
 #[derive(Debug, Default)]
 pub struct IrMapping {
-    values: HMap<Value, Value>,
-    blocks: HMap<Ptr<BasicBlock>, Ptr<BasicBlock>>,
-    ops: HMap<Ptr<Operation>, Ptr<Operation>>,
+    values: Tab<Value, Value>,
+    blocks: Tab<Ptr<BasicBlock>, Ptr<BasicBlock>>,
+    ops: Tab<Ptr<Operation>, Ptr<Operation>>,
 }
 
 impl IrMapping {
     /// Create an empty mapping.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// PLIRON: an empty mapping whose keys will live inside the given
+    /// ordinal spans (value uids, op ords, block ords — `Ptr::ord`,
+    /// `Value::uid`), each with an expected key count to bound the dense
+    /// range's fill ratio. Keys outside a span still work, just hashed.
+    /// Bounds need only cover the common case, never exactness.
+    pub fn bounded(
+        v: (usize, usize, usize),
+        o: (usize, usize, usize),
+        b: (usize, usize, usize),
+    ) -> Self {
+        Self {
+            values: Tab::dense(v.0, v.1, v.2),
+            blocks: Tab::dense(b.0, b.1, b.2),
+            ops: Tab::dense(o.0, o.1, o.2),
+        }
     }
 
     /// Record that `from` maps to `to`. Overwrites any existing entry.
@@ -71,17 +167,17 @@ impl IrMapping {
 
     /// Look up mapping for value `from`.
     pub fn lookup_value(&self, from: Value) -> Option<Value> {
-        self.values.get(&from).copied()
+        self.values.get(from)
     }
 
     /// Look up mapping for block `from`.
     pub fn lookup_block(&self, from: Ptr<BasicBlock>) -> Option<Ptr<BasicBlock>> {
-        self.blocks.get(&from).copied()
+        self.blocks.get(from)
     }
 
     /// Look up mapping for op `from`.
     pub fn lookup_op(&self, from: Ptr<Operation>) -> Option<Ptr<Operation>> {
-        self.ops.get(&from).copied()
+        self.ops.get(from)
     }
 
     /// Look up mapping for value `from`. If none exists, returns `from`.
@@ -128,16 +224,16 @@ fn clone_op_shell(op: Ptr<Operation>, ctx: &mut Context, mapper: &mut IrMapping)
     let (concrete_op, result_types, successors, num_operands, num_regions, attributes, loc) = {
         let op_ref = op.deref(ctx);
         let successors: Vec<Ptr<BasicBlock>> = op_ref
-            .successors()
+            .successors(ctx)
             .map(|b| mapper.lookup_block_or_default(b))
             .collect();
         (
             op_ref.concrete_op_info(),
-            op_ref.result_types().collect::<Vec<_>>(),
+            op_ref.result_types(ctx).collect::<Vec<_>>(),
             successors,
             op_ref.get_num_operands(),
             op_ref.num_regions(),
-            op_ref.attributes.clone(),
+            op_ref.attributes().clone(),
             op_ref.loc(),
         )
     };
@@ -153,7 +249,7 @@ fn clone_op_shell(op: Ptr<Operation>, ctx: &mut Context, mapper: &mut IrMapping)
     );
     {
         let mut new_ref = new_op.deref_mut(ctx);
-        new_ref.attributes = attributes;
+        *new_ref.attributes_mut() = attributes;
         new_ref.set_loc(loc);
     }
 
@@ -161,7 +257,7 @@ fn clone_op_shell(op: Ptr<Operation>, ctx: &mut Context, mapper: &mut IrMapping)
     mapper.map_op(op, new_op);
     let old_ref = op.deref(ctx);
     let new_ref = new_op.deref(ctx);
-    for (old, new) in old_ref.results().zip(new_ref.results()) {
+    for (old, new) in old_ref.results(ctx).zip(new_ref.results(ctx)) {
         mapper.map_value(old, new);
     }
 
@@ -180,22 +276,21 @@ fn fill_operation(
         .lookup_op(op)
         .expect("op shell must be created before it is filled");
 
-    // Operands, remapped through the now-complete mapping and pushed in order.
+    // Operands, remapped through the now-complete mapping, set in one
+    // rewrite — a push per operand would rebuild the pool span each time.
     let operands: Vec<Value> = op
         .deref(ctx)
-        .operands()
+        .operands(ctx)
         .map(|v| mapper.lookup_value_or_default(v))
         .collect();
-    for operand in operands {
-        Operation::push_operand(new_op, ctx, operand);
-    }
+    Operation::set_operands(new_op, ctx, operands);
 
     // Clone the blocks of each region into the corresponding (empty) region of
     // the clone.
     let num_regions = op.deref(ctx).num_regions();
     for region_idx in 0..num_regions {
-        let src_region = op.deref(ctx).get_region(region_idx);
-        let dest_region = new_op.deref(ctx).get_region(region_idx);
+        let src_region = op.deref(ctx).get_region(ctx, region_idx);
+        let dest_region = new_op.deref(ctx).get_region(ctx, region_idx);
         clone_region_into(src_region, dest_region, ctx, rewriter, mapper);
     }
 }
@@ -237,11 +332,11 @@ pub fn clone_blocks_into(
     for &src_block in blocks {
         let (arg_types, label, attrs, loc) = {
             let block_ref = src_block.deref(ctx);
-            let arg_types: Vec<_> = block_ref.arguments().map(|arg| arg.get_type(ctx)).collect();
+            let arg_types: Vec<_> = block_ref.arguments(ctx).map(|arg| arg.get_type(ctx)).collect();
             (
                 arg_types,
                 block_ref.label.clone(),
-                block_ref.attributes.clone(),
+                block_ref.attributes().clone(),
                 block_ref.loc(),
             )
         };
@@ -254,13 +349,13 @@ pub fn clone_blocks_into(
 
         {
             let mut new_ref = new_block.deref_mut(ctx);
-            new_ref.attributes = attrs;
+            *new_ref.attributes_mut() = attrs;
             new_ref.set_loc(loc);
         }
 
         let src_ref = src_block.deref(ctx);
         let new_ref = new_block.deref(ctx);
-        for (old, new) in src_ref.arguments().zip(new_ref.arguments()) {
+        for (old, new) in src_ref.arguments(ctx).zip(new_ref.arguments(ctx)) {
             mapper.map_value(old, new);
         }
 
@@ -269,13 +364,15 @@ pub fn clone_blocks_into(
 
     // Phase 2: create each block's op shells (no operands, empty regions) and
     // record their results, so later phases can refer to them in any order.
+    // The op list is collected once here and reused by phase 3.
+    let mut block_ops: Vec<Vec<Ptr<Operation>>> = Vec::with_capacity(blocks.len());
     for &src_block in blocks {
         let new_block = mapper
             .lookup_block(src_block)
             .expect("block was mapped in phase one");
         rewriter.set_insertion_point(OpInsertionPoint::AtBlockEnd(new_block));
-        let ops: Vec<Ptr<Operation>> = src_block.deref(ctx).iter(ctx).collect();
-        for src_op in ops {
+        block_ops.push(src_block.deref(ctx).iter(ctx).collect());
+        for &src_op in block_ops.last().unwrap() {
             let shell = clone_op_shell(src_op, ctx, mapper);
             rewriter.append_operation(ctx, shell);
         }
@@ -283,9 +380,8 @@ pub fn clone_blocks_into(
 
     // Phase 3: add operands and clone nested regions, now that every op result
     // in `blocks` is recorded.
-    for &src_block in blocks {
-        let ops: Vec<Ptr<Operation>> = src_block.deref(ctx).iter(ctx).collect();
-        for src_op in ops {
+    for ops in &block_ops {
+        for &src_op in ops {
             fill_operation(src_op, ctx, &mut rewriter, mapper);
         }
     }
