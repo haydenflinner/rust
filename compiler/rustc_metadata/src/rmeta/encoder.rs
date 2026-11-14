@@ -1541,7 +1541,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         for local_id in local_ids {
             if let Some(body) = self.early_enclosing_body(local_id) {
                 let idx = self.local_defs_remapping.map_local_def_id(local_id);
-                self.tables.def_kind.set(idx, tcx.def_kind(local_id));
+                self.tables.def_kind.set_some(idx, tcx.def_kind(local_id));
                 self.deferred_defs.push((local_id, body));
                 continue;
             }
@@ -1582,7 +1582,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                     | hir::Node::Infer(hir::InferArg { kind: hir::InferArgKind::Const, .. })
             )
         {
-            continue;
+            return;
         }
 
         if def_kind == DefKind::Field
@@ -2678,7 +2678,16 @@ fn early_enclosing_body(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<LocalDefI
 /// Early metadata doesn't consult the reachable set either: computing it
 /// walks the bodies of inline and generic functions.
 fn early_should_encode_mir(tcx: TyCtxt<'_>, def_id: LocalDefId) -> (bool, bool) {
-    let (encode_const, encode_opt) = should_encode_mir(tcx, &LocalDefIdSet::default(), def_id);
+    // `should_codegen` callers must pass a reachable set; an empty one keeps
+    // everything conservative — early metadata doesn't consult it anyway.
+    let empty;
+    let reachable_set = if tcx.sess.opts.output_types.should_codegen() {
+        empty = LocalDefIdSet::default();
+        Some(&empty)
+    } else {
+        None
+    };
+    let (encode_const, encode_opt) = should_encode_mir(tcx, reachable_set, def_id);
     let coroutine = match tcx.def_kind(def_id) {
         DefKind::Closure => tcx.is_coroutine(def_id.to_def_id()),
         DefKind::SyntheticCoroutineBody => true,
@@ -2756,7 +2765,7 @@ fn prepare_early_metadata(tcx: TyCtxt<'_>) {
     #[allow(rustc::potential_query_instability)]
     let mut sorted: Vec<LocalDefId> = bodies.iter().copied().collect();
     sorted.sort_by_key(|def_id| def_id.local_def_index);
-    par_for_each_in(&sorted, |&&def_id| {
+    par_for_each_in(&sorted[..], |&def_id| {
         // Constructors have MIR but no body. As in `check_crate_bodies`, the
         // types of anon consts other than inline consts are fed, not checked.
         if tcx.hir_maybe_body_owned_by(def_id).is_some()
@@ -2766,7 +2775,8 @@ fn prepare_early_metadata(tcx: TyCtxt<'_>) {
             tcx.ensure_ok().typeck(def_id);
         }
     });
-    par_for_each_in(tcx.mir_keys(()), |&&def_id| {
+    let mir_keys: Vec<LocalDefId> = tcx.mir_keys(()).iter().copied().collect();
+    par_for_each_in(&mir_keys[..], |&def_id| {
         if early_enclosing_body(tcx, def_id).is_some_and(|body| !bodies.contains(&body)) {
             return;
         }
