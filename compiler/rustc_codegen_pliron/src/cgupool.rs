@@ -147,7 +147,8 @@ impl CrateCfg {
             },
             sse42: sess
                 .internal_target_features
-                .contains(&rustc_span::Symbol::intern("sse4.2")),
+                .iter()
+                .any(|s| s.as_str() == "sse4.2"),
             fmt,
             aarch64: sess.target.arch == rustc_target::spec::Arch::AArch64,
             small,
@@ -358,7 +359,7 @@ thread_local! {
 pub(crate) fn enabled(tcx: TyCtxt<'_>) -> bool {
     pass_enabled("PLIRON_CGUPAR")
         && pliron_cfg::bisect_limit().is_none()
-        && tcx.sess.opts.jobs.frontend.is_none()
+        && matches!(tcx.sess.opts.jobs.frontend, rustc_session::config::JobsMode::Sequential)
 }
 
 /// Called once at the top of `codegen_crate`: captures the crate-level

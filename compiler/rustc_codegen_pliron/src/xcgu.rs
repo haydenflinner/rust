@@ -23,7 +23,6 @@ fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool
     }
     let a = tcx.codegen_instance_attrs(inst.def);
     let bad = F::NAKED
-        | F::NO_MANGLE
         | F::RUSTC_STD_INTERNAL_SYMBOL
         | F::USED_COMPILER
         | F::USED_LINKER

@@ -10,7 +10,6 @@ use rustc_abi::{
     AddressSpace, Align, BackendRepr, FieldsShape, Float, Integer, Primitive, Reg, RegKind, Scalar,
     Size,
 };
-use rustc_codegen_ssa::common::TypeKind;
 use rustc_codegen_ssa::traits::*;
 use rustc_middle::ty::Ty;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
@@ -106,6 +105,7 @@ impl<'tcx> CodegenCx<'tcx> {
             Float::F64 => self.type_f64(),
             Float::F128 => self.type_f128(),
             Float::PpcF128 => self.type_ppcf128(),
+            Float::X87F80 => self.type_x87_f80(),
         }
     }
     pub fn type_padding_filler(&self, size: Size, align: Align) -> TypeHandle {
@@ -164,7 +164,7 @@ impl<'tcx> CodegenCx<'tcx> {
         }
         match layout.fields {
             FieldsShape::Primitive | FieldsShape::Union(_) => {
-                let fill = self.type_padding_filler(layout.size, layout.align.abi);
+                let fill = self.type_padding_filler(layout.size, layout.align);
                 self.type_struct(&[fill], false)
             }
             FieldsShape::Array { count, .. } => {
@@ -182,17 +182,16 @@ impl<'tcx> CodegenCx<'tcx> {
         let field_count = layout.fields.count();
         let mut packed = false;
         let mut offset = Size::ZERO;
-        let mut prev_align = layout.align.abi;
+        let mut prev_align = layout.align;
         let mut result = Vec::with_capacity(1 + field_count * 2);
         for i in layout.fields.index_by_increasing_offset() {
             let target = layout.fields.offset(i);
             let field = layout.field(self, i);
             let eff = layout
                 .align
-                .abi
-                .min(field.align.abi)
+                .min(field.align)
                 .restrict_for_offset(target);
-            packed |= eff < field.align.abi;
+            packed |= eff < field.align;
             assert!(target >= offset);
             let padding = target - offset;
             if padding != Size::ZERO {
@@ -264,27 +263,11 @@ impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
     fn type_ppcf128(&self) -> TypeHandle {
         panic!("ppc_fp128 is PowerPC-only; pliron has no PowerPC target")
     }
-    fn type_array(&self, ty: TypeHandle, len: u64) -> TypeHandle {
-        ArrayType::get(&mut self.pctx.borrow_mut(), ty, len).into()
+    fn type_x87_f80(&self) -> TypeHandle {
+        panic!("f80 is x87-only; pliron has no x87 target")
     }
     fn type_func(&self, args: &[TypeHandle], ret: TypeHandle) -> TypeHandle {
         FuncType::get(&mut self.pctx.borrow_mut(), ret, args.to_vec(), false).into()
-    }
-    fn type_kind(&self, ty: TypeHandle) -> TypeKind {
-        match self.kind(ty) {
-            TyK::Void => TypeKind::Void,
-            TyK::Int(_) => TypeKind::Integer,
-            TyK::F16 => TypeKind::Half,
-            TyK::F32 => TypeKind::Float,
-            TyK::F64 => TypeKind::Double,
-            TyK::F128 => TypeKind::FP128,
-            TyK::Ptr => TypeKind::Pointer,
-            TyK::Array(..) => TypeKind::Array,
-            TyK::Struct(..) => TypeKind::Struct,
-            TyK::Vector(..) => TypeKind::Vector,
-            TyK::Func(..) => TypeKind::Function,
-            TyK::Other => TypeKind::Token,
-        }
     }
     fn type_ptr(&self) -> TypeHandle {
         self.type_ptr_ext(AddressSpace::ZERO)
@@ -292,19 +275,43 @@ impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
     fn type_ptr_ext(&self, address_space: AddressSpace) -> TypeHandle {
         PointerType::get(&mut self.pctx.borrow_mut(), address_space.0).into()
     }
-    fn element_type(&self, ty: TypeHandle) -> TypeHandle {
+    fn vector_element_type_and_length(&self, ty: TypeHandle) -> Option<(TypeHandle, u64)> {
+        match self.kind(ty) {
+            TyK::Vector(e, n) => Some((e, n as u64)),
+            _ => None,
+        }
+    }
+    fn float_type(&self, ty: TypeHandle) -> Option<Float> {
+        match self.kind(ty) {
+            TyK::F16 => Some(Float::F16),
+            TyK::F32 => Some(Float::F32),
+            TyK::F64 => Some(Float::F64),
+            TyK::F128 => Some(Float::F128),
+            _ => None,
+        }
+    }
+    fn int_width(&self, ty: TypeHandle) -> Option<u64> {
+        match self.kind(ty) {
+            TyK::Int(w) => Some(w as u64),
+            _ => None,
+        }
+    }
+    fn val_ty(&self, v: pliron::value::Value) -> TypeHandle {
+        v.get_type(&self.pctx.borrow())
+    }
+}
+
+impl<'tcx> CodegenCx<'tcx> {
+    /// PLIRON: rustc_codegen_ssa removed `type_kind`/`element_type`/scalar
+    /// `int_width`/`vector_length` from `BaseTypeCodegenMethods`; keep them
+    /// inherent so our own call sites keep their panicking, unwrapped forms.
+    pub fn element_type(&self, ty: TypeHandle) -> TypeHandle {
         match self.kind(ty) {
             TyK::Array(e, _) | TyK::Vector(e, _) => e,
             k => panic!("element_type of {k:?}"),
         }
     }
-    fn vector_length(&self, ty: TypeHandle) -> usize {
-        match self.kind(ty) {
-            TyK::Vector(_, n) => n as usize,
-            k => panic!("vector_length of {k:?}"),
-        }
-    }
-    fn float_width(&self, ty: TypeHandle) -> usize {
+    pub fn float_width(&self, ty: TypeHandle) -> usize {
         match self.kind(ty) {
             TyK::F16 => 16,
             TyK::F32 => 32,
@@ -313,14 +320,13 @@ impl<'tcx> BaseTypeCodegenMethods for CodegenCx<'tcx> {
             k => panic!("float_width of {k:?}"),
         }
     }
-    fn int_width(&self, ty: TypeHandle) -> u64 {
-        match self.kind(ty) {
-            TyK::Int(w) => w as u64,
-            k => panic!("int_width of {k:?}"),
-        }
+    pub fn int_width_unwrap(&self, ty: TypeHandle) -> u64 {
+        self.int_width(ty).unwrap_or_else(|| panic!("int_width of {:?}", self.kind(ty)))
     }
-    fn val_ty(&self, v: pliron::value::Value) -> TypeHandle {
-        v.get_type(&self.pctx.borrow())
+    /// PLIRON: `type_array` was removed from `BaseTypeCodegenMethods` (upstream
+    /// derives it); keep it inherent for our own call sites.
+    pub fn type_array(&self, ty: TypeHandle, len: u64) -> TypeHandle {
+        ArrayType::get(&mut self.pctx.borrow_mut(), ty, len).into()
     }
 }
 

@@ -376,7 +376,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             && (!self.cx.tcx.sess.target.is_like_wasm
                 || crate::pass_enabled("PLIRON_SWITCH_WASM"))
         {
-            let w = self.int_width(ty) as usize;
+            let w = self.int_width_unwrap(ty) as usize;
             let cases = {
                 let c = self.cx.pctx.borrow();
                 let ity = TypedHandle::<IntegerType>::from_handle(ty, &c).unwrap();
@@ -633,7 +633,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
 
     fn alloca_with_ty(&mut self, layout: TyAndLayout<'tcx>) -> Value {
-        self.alloca(layout.size, layout.align.abi)
+        self.alloca(layout.size, layout.align)
     }
 
     fn load(&mut self, ty: TypeHandle, ptr: Value, _align: Align) -> Value {
@@ -744,14 +744,9 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
     }
 
-    fn store(&mut self, val: Value, ptr: Value, _align: Align) -> Value {
+    fn store_with_flags(&mut self, val: Value, ptr: Value, _align: Align, flags: MemFlags) {
         self.mk_op(|c| StoreOp::new(c, val, ptr));
-        val
-    }
-    fn store_with_flags(&mut self, val: Value, ptr: Value, align: Align, flags: MemFlags) -> Value {
-        self.store(val, ptr, align);
         self.mark_volatile(flags.contains(MemFlags::VOLATILE));
-        val
     }
     fn atomic_store(
         &mut self,
@@ -764,12 +759,20 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         self.mk_op(|c| AtomicStoreOp::new(c, val, ptr, ord(order), SyncScopeAttr::System));
     }
 
-    fn gep(&mut self, ty: TypeHandle, ptr: Value, indices: &[Value]) -> Value {
-        let idx = indices.iter().map(|v| GepIndex::Value(*v)).collect();
-        self.mk(|c| GetElementPtrOp::new(c, ptr, idx, ty))
+    // PLIRON: `gep`/`inbounds_gep` take a byte stride + single index upstream;
+    // an i8-element GEP reproduces that directly.
+    fn gep(&mut self, stride: Size, ptr: Value, index: Value) -> Value {
+        let i8t = self.type_i8();
+        let index = if stride.bytes() == 1 {
+            index
+        } else {
+            let s = self.const_uint(self.val_ty(index), stride.bytes());
+            self.mul(index, s)
+        };
+        self.mk(|c| GetElementPtrOp::new(c, ptr, vec![GepIndex::Value(index)], i8t))
     }
-    fn inbounds_gep(&mut self, ty: TypeHandle, ptr: Value, indices: &[Value]) -> Value {
-        let v = self.gep(ty, ptr, indices);
+    fn inbounds_gep(&mut self, stride: Size, ptr: Value, index: Value) -> Value {
+        let v = self.gep(stride, ptr, index);
         if let Some(op) = v.defining_op() {
             self.st.borrow_mut().inbounds.insert(op);
         }
@@ -824,7 +827,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         }
     }
     fn intcast(&mut self, v: Value, t: TypeHandle, is_signed: bool) -> Value {
-        let (fw, tw) = (self.int_width(self.val_ty(v)), self.int_width(t));
+        let (fw, tw) = (self.int_width_unwrap(self.val_ty(v)), self.int_width_unwrap(t));
         if fw < tw {
             if is_signed {
                 self.sext(v, t)
@@ -966,7 +969,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         let cur_slot = if cur_off == 0 {
             list
         } else {
-            self.gep(i8t, list, &[self.const_usize(cur_off)])
+            self.gep(rustc_abi::Size::from_bytes(1), list, self.const_usize(cur_off))
         };
         let cur_p = self.load(ptr, cur_slot, Align::EIGHT);
         let cur = self.ptrtoint(cur_p, isize);
@@ -1006,7 +1009,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     fn extract_element(&mut self, vec: Value, idx: Value) -> Value {
         self.mk(|c| ExtractElementOp::new(c, vec, idx))
     }
-    fn vector_splat(&mut self, num_elts: usize, elt: Value) -> Value {
+    fn vector_splat(&mut self, num_elts: u64, elt: Value) -> Value {
         let ty = self.type_vector(self.val_ty(elt), num_elts as u64);
         if self.native(ty) {
             return self.intrinsic("pliron.vsplat", ty, &[elt]);
@@ -1263,7 +1266,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             if return_slot.is_indirect() {
                 let e = (
                     abi.ret.layout.size.bytes(),
-                    abi.ret.layout.align.abi.bytes(),
+                    abi.ret.layout.align.bytes(),
                 );
                 exts[0] = e;
                 any_ex |= e.0 > 0;
@@ -1334,7 +1337,7 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
                 // scalars keep `Size(0)` and are filtered out.
                 let ext = match &a.mode {
                     PassMode::Indirect { .. } => {
-                        Some((a.layout.size.bytes(), a.layout.align.abi.bytes()))
+                        Some((a.layout.size.bytes(), a.layout.align.bytes()))
                     }
                     PassMode::Direct(attrs) => {
                         let n = attrs.pointee_size.bytes();
@@ -1481,7 +1484,7 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 OperandValue::Ref(rustc_codegen_ssa::mir::place::PlaceValue {
                     llval: a,
                     llextra: Some(b),
-                    align: arg_abi.layout.align.abi,
+                    align: arg_abi.layout.align,
                 })
                 .store(self, dst);
             }
@@ -1515,7 +1518,7 @@ impl<'a, 'tcx> ArgAbiBuilderMethods<'tcx> for Builder<'a, 'tcx> {
             PassMode::Cast { cast, .. } => {
                 // The cast type may be larger than the Rust type; go through a scratch slot.
                 let size = arg_abi.layout.size.max(cast.size(self));
-                let align = arg_abi.layout.align.abi.max(cast.align(self));
+                let align = arg_abi.layout.align.max(cast.align(self));
                 let scratch = self.alloca(size, align);
                 self.store(val, scratch, align);
                 let sz = self.const_usize(arg_abi.layout.size.bytes());

@@ -39,9 +39,9 @@ fn eq_bytes<'a, 'tcx>(
     ] {
         while off + w <= n {
             let o = b.const_usize(off);
-            let ga = b.gep(i8t, pa, &[o]);
+            let ga = b.gep(rustc_abi::Size::from_bytes(1), pa, o);
             let va = b.load(t, ga, Align::ONE);
-            let gb = b.gep(i8t, pb, &[o]);
+            let gb = b.gep(rustc_abi::Size::from_bytes(1), pb, o);
             let vb = b.load(t, gb, Align::ONE);
             let d = b.xor(va, vb);
             if acc.is_none() {
@@ -241,7 +241,7 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                     OverflowOp::Sub
                 };
                 let (r, of) = self.checked_binop(op, t, x, y);
-                let w = self.int_width(ty);
+                let w = self.int_width_unwrap(ty);
                 let sat = if signed {
                     let min = self.const_uint_big(ty, 1u128 << (w - 1));
                     let max = self.const_uint_big(ty, (1u128 << (w - 1)) - 1);
@@ -623,9 +623,9 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
                 // offsets >= 0 send va_arg to `__stack`.
                 self.store(buf, val, Align::EIGHT);
                 let zero = self.const_int(i32t, 0);
-                let p24 = self.gep(i8t, val, &[self.const_usize(24)]);
+                let p24 = self.gep(rustc_abi::Size::from_bytes(1), val, self.const_usize(24));
                 self.store(zero, p24, Align::from_bytes(4).unwrap());
-                let p28 = self.gep(i8t, val, &[self.const_usize(28)]);
+                let p28 = self.gep(rustc_abi::Size::from_bytes(1), val, self.const_usize(28));
                 self.store(zero, p28, Align::from_bytes(4).unwrap());
                 return;
             }
@@ -635,12 +635,12 @@ impl<'a, 'tcx> IntrinsicCallBuilderMethods<'tcx> for Builder<'a, 'tcx> {
         // `overflow_arg_area` (+8).
         let gp = self.const_int(i32t, 48);
         self.store(gp, val, Align::from_bytes(4).unwrap());
-        let p4 = self.gep(i8t, val, &[self.const_usize(4)]);
+        let p4 = self.gep(rustc_abi::Size::from_bytes(1), val, self.const_usize(4));
         let fp = self.const_int(i32t, 304);
         self.store(fp, p4, Align::from_bytes(4).unwrap());
-        let p8 = self.gep(i8t, val, &[self.const_usize(8)]);
+        let p8 = self.gep(rustc_abi::Size::from_bytes(1), val, self.const_usize(8));
         self.store(buf, p8, Align::EIGHT);
-        let p16 = self.gep(i8t, val, &[self.const_usize(16)]);
+        let p16 = self.gep(rustc_abi::Size::from_bytes(1), val, self.const_usize(16));
         self.store(buf, p16, Align::EIGHT);
     }
 }

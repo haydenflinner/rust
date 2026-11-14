@@ -5,7 +5,7 @@
 use pliron::r#type::TypeHandle;
 use pliron::value::Value;
 use pliron_llvm::ops::InsertElementOp;
-use rustc_codegen_ssa::common::{IntPredicate, RealPredicate, TypeKind};
+use rustc_codegen_ssa::common::{IntPredicate, RealPredicate};
 use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
 use rustc_codegen_ssa::traits::*;
 use rustc_middle::ty::Ty;
@@ -292,7 +292,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     vector_type: ret_rty
                 }
             );
-            return Some(self.vector_splat(out_len as usize, a(0)));
+            return Some(self.vector_splat(out_len as u64, a(0)));
         }
         if base == "select_bitmask" {
             require_simd!(args[1].layout.ty, SimdArgument);
@@ -883,7 +883,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
             "bitmask"
                 if matches!(args[0].val, OperandValue::Immediate(v) if self.native(self.val_ty(v)))
-                    && self.type_kind(ret) == TypeKind::Integer =>
+                    && matches!(self.cx.kind(ret), crate::types::TyK::Int(_)) =>
             {
                 Some(self.intrinsic("pliron.vhigh_bits", ret, &[a(0)]))
             }
@@ -940,7 +940,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // so every lane can load unconditionally.
                 let (_, ety) = ret_rty.simd_size_and_type(self.tcx);
                 let el = self.layout_of(ety);
-                let (size, align) = (el.size, el.align.abi);
+                let (size, align) = (el.size, el.align);
                 let et = self.element_type(ret);
                 let slot = self.alloca(size * n, align);
                 let (vs, ps, ms) = (
@@ -965,7 +965,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // can store unconditionally.
                 let (_, ety) = args[0].layout.ty.simd_size_and_type(self.tcx);
                 let el = self.layout_of(ety);
-                let (size, align) = (el.size, el.align.abi);
+                let (size, align) = (el.size, el.align);
                 let slot = self.alloca(size, align);
                 for (v, p, m) in self
                     .lanes(a(0), n)
@@ -986,7 +986,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // the fallback out of a stack slot.
                 let (_, ety) = ret_rty.simd_size_and_type(self.tcx);
                 let el = self.layout_of(ety);
-                let (size, align) = (el.size, el.align.abi);
+                let (size, align) = (el.size, el.align);
                 let et = self.element_type(ret);
                 let slot = self.alloca(size * n, align);
                 let mut out = Vec::new();
@@ -1011,7 +1011,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // mask[i]; masked-off lanes store into a scratch slot.
                 let (_, ety) = args[2].layout.ty.simd_size_and_type(self.tcx);
                 let el = self.layout_of(ety);
-                let (size, align) = (el.size, el.align.abi);
+                let (size, align) = (el.size, el.align);
                 let slot = self.alloca(size, align);
                 for (i, (m, v)) in self
                     .lanes(a(0), n)
@@ -1031,7 +1031,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // llvm.fshl/fshr: concat(a,b) as a 2W-bit int shifted by
                 // s mod W; keep the high (shl) or low (shr) W bits.
                 let et = self.element_type(ret);
-                let w = self.int_width(et);
+                let w = self.int_width_unwrap(et);
                 let wide = self.type_ix(w * 2);
                 let wm = self.const_uint(et, w - 1);
                 let wv = self.const_uint(wide, w);
@@ -1123,7 +1123,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
             "bitmask" => {
                 let xs = self.arg_lanes(&args[0]);
-                let int_ret = self.type_kind(ret) == TypeKind::Integer;
+                let int_ret = matches!(self.cx.kind(ret), crate::types::TyK::Int(_));
                 let acc_ty = if int_ret {
                     ret
                 } else {
@@ -1133,7 +1133,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let mut acc = self.const_null(acc_ty);
                 for (i, x) in xs.into_iter().enumerate() {
                     let lt = self.val_ty(x);
-                    let w = self.int_width(lt);
+                    let w = self.int_width_unwrap(lt);
                     let sh = self.const_uint(lt, w - 1);
                     let b = self.lshr(x, sh);
                     let b = self.intcast(b, acc_ty, false);

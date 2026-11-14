@@ -11,7 +11,11 @@ extern crate rustc_attr_ir;
 extern crate rustc_codegen_ssa;
 extern crate rustc_const_eval;
 extern crate rustc_data_structures;
-#[cfg(not(target_family = "wasm"))]
+// The extern forces a link against the rustc_driver dylib when this crate is
+// itself built as a dylib backend; statically linked into rustc (the
+// `rustc_codegen_pliron_static` stub) there is no dylib to link, so the stub
+// sets `pliron-static` to drop it.
+#[cfg(all(not(target_family = "wasm"), not(feature = "pliron-static")))]
 extern crate rustc_driver;
 extern crate rustc_errors;
 extern crate rustc_hir;
@@ -416,7 +420,8 @@ impl lower::Host for RustcHost<'_> {
     fn sse42(&self) -> bool {
         self.sess
             .internal_target_features
-            .contains(&Symbol::intern("sse4.2"))
+            .iter()
+            .any(|s| s.as_str() == "sse4.2")
     }
 }
 
@@ -1031,7 +1036,7 @@ impl CodegenBackend for PlironCodegenBackend {
         // Which source tree built this dylib (harness/src-rev.sh) — check it
         // before trusting a self-host or bisect result.
         if pliron_cfg::env_set("PLIRON_VERSION") {
-            eprintln!("pliron backend {}", env!("PLIRON_SRC_REV"));
+            eprintln!("pliron backend {}", option_env!("PLIRON_SRC_REV").unwrap_or("unknown"));
         }
         // No ThinLTO: rustc then never runs thin-local LTO at opt-level > 0,
         // and `-Clto=thin` falls back to fat LTO (`lto.rs`), with a warning.
@@ -1369,7 +1374,7 @@ impl ExtraBackendMethods for PlironCodegenBackend {
                 let dc = bx.get_param(3);
                 let _ = est;
                 let decline = bx.append_sibling_block("decline");
-                let fla = bx.gep(i8t, rec, &[bx.const_uint(isz, 4)]);
+                let fla = bx.gep(rustc_abi::Size::from_bytes(1), rec, bx.const_uint(isz, 4));
                 let fl = bx.load(i32t, fla, a1);
                 let m = bx.and(fl, bx.const_uint(i32t, 0x26));
                 let isunw = bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntNE, m, bx.const_uint(i32t, 0));
@@ -1382,19 +1387,19 @@ impl ExtraBackendMethods for PlironCodegenBackend {
                 let body = bx.append_sibling_block("body");
                 bx.cond_br(ismsc, body, decline);
                 bx.switch_to_block(body);
-                let pcp = bx.gep(i8t, dc, &[bx.const_uint(isz, 0)]);
+                let pcp = bx.gep(rustc_abi::Size::from_bytes(1), dc, bx.const_uint(isz, 0));
                 let pcload = bx.load(isz, pcp, a1);
-                let bpp = bx.gep(i8t, dc, &[bx.const_uint(isz, 8)]);
+                let bpp = bx.gep(rustc_abi::Size::from_bytes(1), dc, bx.const_uint(isz, 8));
                 let base = bx.load(isz, bpp, a1);
                 let pc = bx.sub(pcload, base);
-                let hdp = bx.gep(i8t, dc, &[bx.const_uint(isz, 56)]);
+                let hdp = bx.gep(rustc_abi::Size::from_bytes(1), dc, bx.const_uint(isz, 56));
                 let hd = bx.load(isz, hdp, a1);
                 // loop vars in allocas: remaining count, record cursor
                 let nv = bx.alloca(rustc_abi::Size::from_bytes(4), rustc_abi::Align::EIGHT);
                 let pv = bx.alloca(rustc_abi::Size::from_bytes(8), rustc_abi::Align::EIGHT);
                 let n0 = bx.load(i32t, hd, a1);
                 bx.store(n0, nv, a1);
-                let p0 = bx.gep(i8t, hd, &[bx.const_uint(isz, 4)]);
+                let p0 = bx.gep(rustc_abi::Size::from_bytes(1), hd, bx.const_uint(isz, 4));
                 bx.store(p0, pv, a1);
                 let scan = bx.append_sibling_block("scan");
                 bx.br(scan);
@@ -1407,7 +1412,7 @@ impl ExtraBackendMethods for PlironCodegenBackend {
                 let p = bx.load(ptr, pv, a1);
                 let b32v = bx.load(i32t, p, a1);
                 let b64 = bx.zext(b32v, isz);
-                let ep = bx.gep(i8t, p, &[bx.const_uint(isz, 4)]);
+                let ep = bx.gep(rustc_abi::Size::from_bytes(1), p, bx.const_uint(isz, 4));
                 let e32v = bx.load(i32t, ep, a1);
                 let e64 = bx.zext(e32v, isz);
                 let lo = bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntULE, b64, pc);
@@ -1417,24 +1422,24 @@ impl ExtraBackendMethods for PlironCodegenBackend {
                 let next = bx.append_sibling_block("next");
                 bx.cond_br(inr, hit, next);
                 bx.switch_to_block(hit);
-                let x1 = bx.gep(i8t, rec, &[bx.const_uint(isz, 40)]);
+                let x1 = bx.gep(rustc_abi::Size::from_bytes(1), rec, bx.const_uint(isz, 40));
                 let exn = bx.load(isz, x1, a1);
-                let x2 = bx.gep(i8t, rec, &[bx.const_uint(isz, 48)]);
+                let x2 = bx.gep(rustc_abi::Size::from_bytes(1), rec, bx.const_uint(isz, 48));
                 let ti = bx.load(isz, x2, a1);
                 let tls = cx.sym_addr("__pliron_eh");
                 for (o, v) in [(8u64, exn), (16, ti), (24, base)] {
-                    let d = bx.gep(i8t, tls, &[bx.const_uint(isz, o)]);
+                    let d = bx.gep(rustc_abi::Size::from_bytes(1), tls, bx.const_uint(isz, o));
                     bx.store(v, d, a1);
                 }
-                let tp = bx.gep(i8t, p, &[bx.const_uint(isz, 8)]);
+                let tp = bx.gep(rustc_abi::Size::from_bytes(1), p, bx.const_uint(isz, 8));
                 let t32 = bx.load(i32t, tp, a1);
                 let t64 = bx.zext(t32, isz);
                 let tip = bx.add(base, t64);
-                let dip = bx.gep(i8t, dc, &[bx.const_uint(isz, 32)]);
+                let dip = bx.gep(rustc_abi::Size::from_bytes(1), dc, bx.const_uint(isz, 32));
                 bx.store(tip, dip, a1);
                 bx.ret(bx.const_uint(i32t, 4));
                 bx.switch_to_block(next);
-                let np = bx.gep(i8t, p, &[bx.const_uint(isz, 12)]);
+                let np = bx.gep(rustc_abi::Size::from_bytes(1), p, bx.const_uint(isz, 12));
                 bx.store(np, pv, a1);
                 let n1 = bx.sub(n, bx.const_uint(i32t, 1));
                 bx.store(n1, nv, a1);
@@ -1729,7 +1734,6 @@ impl WriteBackendMethods for PlironCodegenBackend {
     fn target_machine_factory(
         &self,
         _sess: &Session,
-        _opt_level: OptLevel,
     ) -> TargetMachineFactoryFn<Self> {
         Arc::new(|_, _| ())
     }

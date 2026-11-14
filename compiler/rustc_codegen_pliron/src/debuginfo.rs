@@ -307,7 +307,7 @@ impl<'tcx> CodegenCx<'tcx> {
         let strukt = |fields: Vec<Field>| Type::Struct {
             name: name.clone(),
             size,
-            align: l.align.abi.bytes() as u32,
+            align: l.align.bytes() as u32,
             fields,
             union: false,
         };
@@ -349,7 +349,7 @@ impl<'tcx> CodegenCx<'tcx> {
                     if tuple { format!("__{i}") } else { v.fields[FieldIdx::from_usize(i)].name.to_string() }
                 });
                 if def.is_union() {
-                    Type::Struct { name, size, align: l.align.abi.bytes() as u32, fields, union: true }
+                    Type::Struct { name, size, align: l.align.bytes() as u32, fields, union: true }
                 } else {
                     strukt(fields)
                 }
@@ -416,7 +416,7 @@ impl<'tcx> CodegenCx<'tcx> {
                         Type::Enum {
                             name,
                             size,
-                            align: l.align.abi.bytes() as u32,
+                            align: l.align.bytes() as u32,
                             tag: (tag_off, tag_size as u32),
                             variants: vs,
                         }

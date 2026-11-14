@@ -331,7 +331,7 @@ impl<'tcx> CodegenCx<'tcx> {
                 }
                 let init = self.sym_addr(sym);
                 let ty = self.type_ptr();
-                let align = self.tcx.data_layout.pointer_align().abi.bytes();
+                let align = self.tcx.data_layout.pointer_align().bytes();
                 self.declare_global(
                     &r,
                     GlobalInfo {
