@@ -263,7 +263,7 @@ fn callee_info(
         };
         return None;
     }
-    let (mut n, mut ncalls, mut nwarm, mut nwarm_ops, mut eh) = (0, 0, 0, 0, false);
+    let (mut n, mut ncalls, mut nwarm, mut nwarm_ops, mut eh) = (0usize, 0usize, 0usize, 0usize, false);
     let mut dvirt_tgt = Vec::new();
     let mut cond_roots = Vec::new();
     for b in blocks_iter(ctx, f.op) {
@@ -302,6 +302,15 @@ fn callee_info(
         if !panic_block {
             nwarm_ops += bn;
         }
+    }
+    // `PLIRON_INLINE_LEAN`: wrappers inlined into this body count as the
+    // calls they replaced.
+    if let Some(&[d, dc, dw]) = st.lean_discount.get(&f.op) {
+        let d = d.min(n.saturating_sub(1));
+        n -= d;
+        nwarm_ops = nwarm_ops.saturating_sub(d).max(1);
+        ncalls = ncalls.saturating_sub(dc);
+        nwarm = nwarm.saturating_sub(dw);
     }
     if eh && !crate::pass_enabled("PLIRON_INLINE_EH") {
         return None;
@@ -1407,10 +1416,40 @@ pub fn run(
     } else {
         FxHashMap::default()
     };
+    let pgo_inline = !crate::env_is("PLIRON_PGO_INLINE", "0");
+    // Ablations of the two older call-site rules: `PLIRON_PGO_COLDSITE=0`
+    // keeps never-run sites inlinable, `PLIRON_PGO_WARM=0` drops the
+    // +2x-limit bonus of sites that ran at least 4 times.
+    let pgo_coldsite = !crate::env_is("PLIRON_PGO_COLDSITE", "0");
+    let pgo_warm = !crate::env_is("PLIRON_PGO_WARM", "0");
+    let pgo_hot: usize = if pgo_inline {
+        pliron_cfg::pgo_knob("PLIRON_PGO_HOT", "13").and_then(|s| s.parse().ok()).unwrap_or(0)
+    } else {
+        0
+    };
+    let pgo_heavy: u64 = if pgo_inline {
+        pliron_cfg::pgo_knob("PLIRON_PGO_HEAVY", "256").and_then(|s| s.parse().ok()).unwrap_or(0)
+    } else {
+        0
+    };
     let verbose = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::inline", tracing::Level::DEBUG);
     // Non-free ops a single caller may absorb (`PLIRON_INLINE_GROWTH`; the
     // model only). `cap` still bounds the caller's absolute size.
+    // `PLIRON_INLINE_LEAN=<k>` (`0` off): a callee that is at most `k`
+    // ops and one call once constant branches, slot traffic and dead
+    // compares are taken out (`inline_cost::lean_cost`) passes the score
+    // whatever its raw op count, and is exempt from `fanin` and the
+    // caller's growth budget: it is a call wrapper, and inlining it costs
+    // about the call it replaces. `drop_glue::<RawVec<u8>>` (63 raw ops,
+    // `cost=83 t=64`) was a call at 1106 sites of lol_html.
+    let lean_k: usize = if always_only {
+        0
+    } else {
+        crate::env_get("PLIRON_INLINE_LEAN").and_then(|s| s.parse().ok()).unwrap_or(0)
+    };
+    let lean_pure = crate::cleanup::Pure::new();
+    let mut lean_memo: FxHashMap<String, crate::inline_cost::SpecCost> = FxHashMap::default();
     let growth: usize = crate::env_get("PLIRON_INLINE_GROWTH")
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| limit.saturating_mul(GROWTH_MULT));
@@ -1490,6 +1529,7 @@ pub fn run(
             Default::default();
         for _round in 0..32 {
             let mut sites = Vec::new();
+            let mut lean_add: Vec<[usize; 3]> = Vec::new();
             let mut loops: Option<FxHashSet<Ptr<BasicBlock>>> = None;
             let mut doomed: Option<FxHashSet<Ptr<BasicBlock>>> = None;
             let mut bi = 0;
@@ -1526,6 +1566,19 @@ pub fn run(
                     }
                     let ci = &infos[cs];
                     let Some(ci) = ci.as_ref() else {
+                        if pliron_cfg::remarks_on() {
+                            let g = &st.funcs[cs];
+                            let why = if !has_body(ctx, g.op) {
+                                "external (no body in this CGU)"
+                            } else if g.no_inline {
+                                "noinline"
+                            } else if g.linkage == Linkage::Preemptible {
+                                "preemptible"
+                            } else {
+                                "ineligible (too big, recursive or variadic)"
+                            };
+                            pliron_cfg::remark!("inline", sym, cs; "reject ({why})");
+                        }
                         if verbose {
                             if pliron_cfg::tracing_on() {
                                 tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: reject (ineligible)", st.cgu)
@@ -1537,8 +1590,11 @@ pub fn run(
                     // PGO: a callsite the profile says never ran isn't
                     // worth growing the caller for (`always_inline` is a
                     // semantic requirement and still fires).
-                    let site_count = crate::pgo::block_count(st, b);
-                    if !f.always_inline && site_count == Some(0) {
+                    // `PLIRON_PGO_INLINE=0`: ablation, the inliner ignores
+                    // callsite counts.
+                    let site_count = if pgo_inline { crate::pgo::block_count(st, b) } else { None };
+                    if pgo_coldsite && !f.always_inline && site_count == Some(0) {
+                        pliron_cfg::remark!("inline", sym, cs; "reject (cold callsite: profile count 0)");
                         if verbose {
                             if pliron_cfg::tracing_on() {
                                 tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: reject (cold callsite)",
@@ -1652,8 +1708,42 @@ pub fn run(
                     }
                     // PGO: a callsite the profile proves runs is worth
                     // more code growth than a static guess.
-                    if site_count.is_some_and(|c| c >= 4) {
+                    // `PLIRON_PGO_HEAVY=<k>` (bundle: 256; 0 off): no profile bonus for
+                    // a callee that runs more than `k` blocks per call in
+                    // the profile. A bonus buys back call overhead, and a
+                    // callee that loops for hundreds of blocks per entry
+                    // has none worth buying: regex's `follow_epsilons`
+                    // (its hottest function, a loop nest) went into
+                    // `next_state` and `exec_byte` on the hot/warm bonus
+                    // and cost 3.3% instructions (two loop nests sharing
+                    // one frame's registers).
+                    let heavy = pgo_heavy > 0
+                        && site_count.is_some()
+                        && st.prof.get(f.op).is_some_and(|p| {
+                            let e = p.blocks.first().copied().unwrap_or(0);
+                            e > 0 && p.blocks.iter().fold(0u64, |a, &b| a.saturating_add(b)) / e > pgo_heavy
+                        });
+                    if heavy {
+                        pliron_cfg::remark!("inline", sym, cs; "no profile bonus (heavy callee)");
+                    }
+                    if pgo_warm && !heavy && site_count.is_some_and(|c| c >= 4) {
                         t = t.saturating_add(limit.saturating_mul(2));
+                    }
+                    // `PLIRON_PGO_HOT=<k>` (opt-in): a call site whose count
+                    // reaches the profile's hot count gets `k` times the
+                    // base limit (LLVM: 3000 against 225) and is exempt
+                    // from the static doubts below (`loopy`, `fanin`, the
+                    // per-caller growth budget): the profile says this is
+                    // where the time goes. LLVM's whole PGO gain on
+                    // pulldown-cmark is this — `parse_line`,
+                    // `escape_html_scalar`, `Tree::append` and
+                    // `item_to_event` folded into their hot callers.
+                    let hot_site = pgo_hot > 0
+                        && !heavy
+                        && !f.cold
+                        && site_count.zip(st.prof_hot).is_some_and(|(c, h)| c >= h);
+                    if hot_site {
+                        t = t.max(limit.saturating_mul(pgo_hot));
                     }
                     // The callee's size at this site: specialized (`spec`) or raw.
                     let (sn, scalls) = if spec {
@@ -1788,6 +1878,7 @@ pub fn run(
                             .is_some_and(|&(_, catch)| catch || !eh_invoke);
                     let loopy = (small || loopy_native)
                         && loopy_min > 0
+                        && !hot_site
                         && !free
                         && !f.inline_hint
                         && ci.n > loopy_min
@@ -1831,6 +1922,18 @@ pub fn run(
                     {
                         t = t.min(droplim);
                     }
+                    // `PLIRON_INLINE_LEAN`: a wrapper passes the score.
+                    let mut lean_n = usize::MAX;
+                    let lean = lean_k > 0 && !f.cold && cost > t && {
+                        let lc = *lean_memo
+                            .entry(cs.clone())
+                            .or_insert_with(|| crate::inline_cost::lean_cost(ctx, st, ci.op, &lean_pure));
+                        lean_n = lc.n;
+                        lc.n <= lean_k && lc.ncalls <= 1
+                    };
+                    if lean {
+                        t = cost;
+                    }
                     // `#[inline(always)]` skips the score like LLVM's
                     // AlwaysInliner (`PLIRON_INLINE_ALWAYS=0` restores it; the
                     // caller `cap` and the recursion/EH rules still apply).
@@ -1862,6 +1965,8 @@ pub fn run(
                         "reject (cap)"
                     } else if fanin > 0
                         && !free
+                        && !hot_site
+                        && !lean
                         && !f.always_inline
                         && adj
                             .as_ref()
@@ -1872,7 +1977,7 @@ pub fn run(
                             .contains(&b)
                     {
                         "reject (fanin)"
-                    } else if model && !free && grown + sn > growth {
+                    } else if model && !free && !hot_site && !lean && grown + sn > growth {
                         "reject (growth)"
                     } else if maxdup > 0
                         && !f.always_inline
@@ -1880,7 +1985,7 @@ pub fn run(
                     {
                         "reject (dup)"
                     } else {
-                        if model && !free {
+                        if model && !free && !lean {
                             grown += sn;
                         }
                         if maxdup > 0 {
@@ -1893,13 +1998,31 @@ pub fn run(
                             *copies.entry(cs.clone()).or_default() += 1;
                         }
                         size += ci.n;
+                        // The callee's own discount moves into the caller
+                        // with its body; a wrapper adds what it has beyond
+                        // the call it replaces.
+                        let mut d = st.lean_discount.get(&ci.op).copied().unwrap_or([0; 3]);
+                        if lean {
+                            d[0] += ci.n.saturating_sub(1);
+                            d[1] += ci.ncalls.saturating_sub(1);
+                            d[2] += ci.nwarm.saturating_sub(1);
+                        }
+                        if d != [0; 3] {
+                            lean_add.push(d);
+                        }
                         sites.push((op, ci.op, cs.clone()));
                         "accept"
                     };
+                    if why != "accept" {
+                        pliron_cfg::remark!("inline", sym, cs; "{why} n={} calls={} warm={}/{} cost={cost} t={t} size={size} cap={cap} grown={grown} growth={growth} lean={}",
+                            ci.n, ci.ncalls, ci.nwarm, ci.nwarm_ops, if lean_n == usize::MAX { -1 } else { lean_n as i64 });
+                    }
                     if verbose {
                         if pliron_cfg::tracing_on() {
-                            tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: n={} calls={} warm={}/{} cost={cost} t={t}: {why} [single={} local={} taken={} callers={} rec={} used={}]",
-                                st.cgu, ci.n, ci.ncalls, ci.nwarm, ci.nwarm_ops, single.contains(cs), f.linkage == Linkage::Local,
+                            tracing::debug!(target: "pliron::inline", "inline {}: {sym} -> {cs}: n={} calls={} warm={}/{} cost={cost} t={t}: {why} [lean={} single={} local={} taken={} callers={} rec={} used={}]",
+                                st.cgu, ci.n, ci.ncalls, ci.nwarm, ci.nwarm_ops,
+                                if lean_n == usize::MAX { -1 } else { lean_n as i64 },
+                                single.contains(cs), f.linkage == Linkage::Local,
                                 adj.as_ref().is_some_and(|a| a.taken.contains(cs.as_str())),
                                 adj.as_ref().and_then(|a| a.callers_of.get(cs.as_str())).map_or(0, |v| v.len()),
                                 rec_caller, free_used.contains(cs.as_str())
@@ -1912,6 +2035,14 @@ pub fn run(
             t0 = std::time::Instant::now();
             if sites.is_empty() {
                 break;
+            }
+            if !lean_add.is_empty() {
+                let e = st.lean_discount.entry(caller).or_default();
+                for d in &lean_add {
+                    for k in 0..3 {
+                        e[k] += d[k];
+                    }
+                }
             }
             for (call, callee, cs) in sites {
                 let tags = tagcache
@@ -3112,6 +3243,18 @@ fn frozen_args(
     // `inline_call` branches to `entry` with `args` positionally, so the
     // entry arg at index k is bound to `call_args[k]`.
     let eargs: Vec<Value> = entry.deref(ctx).arguments(ctx).collect();
+    // `PLIRON_SCOPED_NOALIAS=1` turns the records below into alias facts
+    // loadfwd acts on (`pliron-clif-opt` `loadfwd::ScopedNa`: inside this
+    // clone a `noalias` param's pointee is not touched through pointers
+    // not based on it). The leaf indices describe the declared ABI, so
+    // take them only when the clone's entry still has that layout (as
+    // `nonnull_args` checks); otherwise record nothing for this clone.
+    if crate::env_is("PLIRON_SCOPED_NOALIAS", "1") && !(f.frozen.is_empty() && f.noalias.is_empty()) {
+        let nleaves: usize = eargs.iter().map(|a| crate::types::leaves(ctx, a.get_type(ctx)).len()).sum();
+        if nleaves != f.nparams || eargs.len() != call_args.len() {
+            return;
+        }
+    }
     for &(leaf, bytes) in &f.frozen {
         let Some((a, sub)) = leaf_arg(ctx, entry, leaf) else {
             if dbg {
@@ -3524,10 +3667,23 @@ fn inline_call(
     }
     let callee_entry = st.prof.get(callee).and_then(|p| p.blocks.first().copied());
     let scale = |x: u64| match (callsite_c, callee_entry) {
-        (Some(c), Some(e)) => ((x as u128 * c as u128) / e.max(1) as u128) as u64,
+        // Never round a block that ran, cloned into a site that ran, down
+        // to 0: a zero count means "cold" to every consumer (the inliner
+        // rejects its call sites outright, layout moves it out of line),
+        // and a callee with a large entry count scaled into a rarer site
+        // truncated most of its body to exactly that.
+        (Some(c), Some(e)) => {
+            let v = ((x as u128 * c as u128) / e.max(1) as u128) as u64;
+            if v == 0 && x > 0 && c > 0 { 1 } else { v }
+        }
         _ => x,
     };
 
+    if let (Some(c), Some(e)) = (callsite_c, callee_entry)
+        && c > e.saturating_mul(2)
+    {
+        pliron_cfg::remark!("pgoscale", caller, cs; "site={c} entry={e}");
+    }
     let src = &tags.src;
     let mut map = IrMapping::bounded(tags.vb, tags.ob, tags.bb);
     clone_blocks_into(src, region, ctx, rw, &mut map);
@@ -3637,6 +3793,12 @@ fn inline_call(
     }
     // History node for calls cloned out of this body, pushed on first use.
     let parent = st.inline_hist.get(call).copied().unwrap_or(u32::MAX);
+    // A promoted call (`devirt::promote`) is being inlined.
+    if !st.icp_calls.is_empty()
+        && let Some(r) = st.icp_calls.remove(&call)
+    {
+        st.icp_inlined.push(r);
+    }
     let mut hist_node = None;
     // Plain calls of the body that become invokes to this callsite's pad.
     let mut fresh_invokes: Vec<Ptr<Operation>> = Vec::new();
@@ -3651,6 +3813,12 @@ fn inline_call(
             });
             st.inline_hist.insert(new, node);
             st.calls.insert(new, st.calls[op].clone());
+            // A promoted call (`devirt::promote`) cloned with its caller.
+            if !st.icp_calls.is_empty()
+                && let Some(r) = st.icp_calls.get(&op).cloned()
+            {
+                st.icp_calls.insert(new, r);
+            }
             if let Some(&(lp, catch)) = st.invokes.get(op) {
                 st.invokes
                     .insert(new, (map.lookup_block(lp).unwrap(), catch));

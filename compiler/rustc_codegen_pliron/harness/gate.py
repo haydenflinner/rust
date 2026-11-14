@@ -20,9 +20,13 @@ Runs, after one `cargo build`:
   <stanza>  every `./test.sh` stanza (nostd, std, licm, ...) as its own
             job — TEST_NOBUILD=1 ./test.sh --only=<stanza>
   corpus:*  `clif-check report --check` over each recorded corpus under
-            target/corpus/ (harness/corpus.sh); fails on any verifier error,
+            target/corpus/ (harness/corpus.sh), with the verifier after
+            every step (PLIRON_VERIFY=full); fails on any verifier error,
             panic, or interpreter mismatch not listed in
-            harness/expectations/corpus-known.txt
+            harness/expectations/corpus-known.txt. A corpus over
+            CORPUS_SAMPLE_OVER functions (`harness/corpus.sh clcg`:
+            cranelift-codegen, ~38k) is sampled, every Nth function, to
+            about that many; `--full` replays all of it (~1 min more).
 The `wasm` stanza (tests/wasm/run.sh) is OFF by default: it rebuilds core/std
 through the backend for every backend change (~4 min). The default gate runs
 `wasm_smoke` — emit->link->run, ~1 s — instead. `--full` or `--only wasm`
@@ -40,14 +44,20 @@ OUT = os.path.join(ROOT, "target/gate")
 # r[impl verify.corpus.known]
 KNOWN = os.path.join(ROOT, "harness/expectations/corpus-known.txt")
 WIN = os.name == "nt"
-CLIF_CHECK = os.path.join(ROOT, "target/debug", "clif-check.exe" if WIN else "clif-check")
+# PLIRON_PROFILE=<cargo profile> (default debug) gates that profile's build,
+# e.g. `fast` (docs/dev-loop.md); test.sh and run.py read the same variable.
+PROFILE = os.environ.get("PLIRON_PROFILE", "debug")
+PROFILE_ARGS = [] if PROFILE == "debug" else ["--profile", PROFILE]
+CLIF_CHECK = os.path.join(ROOT, "target", PROFILE, "clif-check.exe" if WIN else "clif-check")
 # Bash for .sh legs: CreateProcess doesn't honor `#!/bin/sh`, so the
 # shell scripts need an explicit interpreter on Windows.
 BASH = shutil.which("bash") or shutil.which("sh")
 
 
 # test.sh stanzas the gate also runs under PLIRON_SM_POISON (`poison:*`).
-POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "inlinecm", "unroll", "sroa", "licm"]
+# `o0std` is the only one at opt-level 0, where std's bodies arrive as
+# optimized MIR with storage markers and no IR pass reshapes them.
+POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "inlinecm", "unroll", "sroa", "licm", "o0std"]
 
 # rustlantis seeds that exposed real bugs: slp same-address splat
 # (538, 683, 730), loadfwd's dead-pair poisoning (810, 1276) and loop
@@ -67,7 +77,10 @@ POISON_STANZAS = ["std", "unwind", "unwindstd", "loopvec", "pgo", "mirshapes", "
 # PRE's iso-aware "clobbered earlier in this block" check (27992), and
 # celim's signed nowrap test for a downward offset (27004), and webmerge
 # closing a cycle in its param map (30177, compile hang), and slotmerge's
-# `slot_at` overflowing on a wrapped offset (31625, ICE), 2026-11-01.
+# `slot_at` overflowing on a wrapped offset (31625, ICE), 2026-11-01;
+# memcpyopt missing accesses through an escaped destination pointer
+# (30621, 30696, 31403) and aarch64 `ubfiz`/`bfi` fusion placing i8/i16
+# fields at bit 16+k (30694, 31084), 2026-11-12.
 # Stanzas re-run with a default-off pass enabled (`optin:<stanza>` jobs).
 OPTIN_STANZAS = {"bytescan": {"PLIRON_BYTESCAN": "1"},
                  "noret": {"PLIRON_NORETUDF": "1"},
@@ -79,7 +92,7 @@ OPTIN_STANZAS = {"bytescan": {"PLIRON_BYTESCAN": "1"},
                  "inlinecm": {"PLIRON_INLINE_WARMCALLS": "0"}}
 FUZZ_REGRESS = [538, 683, 730, 810, 1276, 1776, 1939, 2187, 2542, 2598, 3441, 3938, 4895, 4940, 5042, 5542, 8631, 12309, 21920,
                 13475, 16782, 16787, 16980, 17028, 18889, 24242, 26212, 26694, 27004, 27992, 30177,
-                31625, 22177]
+                31625, 22177, 30621, 30694, 30696, 31084, 31403]
 
 
 def shell(cmd):
@@ -109,10 +122,21 @@ def run(name, cmd, env=None, timeout=1800):
     return {"job": name, "ok": rc == 0, "rc": rc, "secs": round(time.time() - t, 1), "log": log}
 
 
-def corpus_job(dirname):
+# A corpus with more functions than this is replayed as a sample of about
+# this many (every Nth file of the sorted list; `--full` replays it all).
+CORPUS_SAMPLE_OVER = 5000
+
+
+def corpus_job(dirname, full=False):
     name = f"corpus:{dirname}"
     out = os.path.join(OUT, f"corpus_{dirname}.json")
-    res = run(name, [CLIF_CHECK, "report", os.path.join(ROOT, "target/corpus", dirname), out, "--check"])
+    src = os.path.join(ROOT, "target/corpus", dirname)
+    n = sum(f.endswith(".clif") for _, _, fs in os.walk(src) for f in fs)
+    every = 1 if full else max(1, round(n / CORPUS_SAMPLE_OVER))
+    # The verifier after every step: a step that leaves invalid IR which a
+    # later step happens to clean up is otherwise invisible to a replay
+    # (webmerge on a dead self-loop, found compiling cranelift-codegen).
+    res = run(name, [CLIF_CHECK, "report", src, out, "--check", "--every", str(every)], {"PLIRON_VERIFY": "full"})
     known = set()
     if os.path.exists(KNOWN):
         known = {l.split("#")[0].strip() for l in open(KNOWN)} - {""}
@@ -146,7 +170,7 @@ def main():
     ap.add_argument("--skip", default="")
     ap.add_argument("--only", default="")
     ap.add_argument("--full", action="store_true",
-                    help="include heavyweight legs off by default (wasm sysroot builds)")
+                    help="include heavyweight legs off by default (wasm sysroot builds, whole big corpora)")
     ap.add_argument("--record", action="store_true")
     ap.add_argument("--install-hook", action="store_true")
     a = ap.parse_args()
@@ -167,7 +191,7 @@ def main():
         os.replace(tmp, os.path.join(OUT, "summary.json"))
 
     save()
-    build = run("build", ["cargo", "build", "-p", "rustc_codegen_pliron", "-p", "pliron-clif-check"])
+    build = run("build", ["cargo", "build", *PROFILE_ARGS, "-p", "rustc_codegen_pliron", "-p", "pliron-clif-check"])
     summary["jobs"].append(build)
     if not build["ok"]:
         summary["state"] = "failed"
@@ -182,7 +206,7 @@ def main():
     want = lambda n: (not only or n in only or n.split(":")[0] in only) and n not in skip and n.split(":")[0] not in skip
     jobs = []
     if want("unit"):
-        jobs.append(("unit", lambda: run("unit", ["cargo", "test", "-q", "-p", "pliron-cfg", "-p",
+        jobs.append(("unit", lambda: run("unit", ["cargo", "test", "-q", *PROFILE_ARGS, "-p", "pliron-cfg", "-p",
                                                   "pliron-clif-opt", "-p", "pliron-ir-opt", "-p",
                                                   "pliron-clif-check"])))
     # Slowest first so the pool's tail is short.
@@ -223,7 +247,7 @@ def main():
     cdir = os.path.join(ROOT, "target/corpus")
     for d in sorted(os.listdir(cdir)) if os.path.isdir(cdir) else []:
         if want(f"corpus:{d}"):
-            jobs.append((f"corpus:{d}", lambda d=d: corpus_job(d)))
+            jobs.append((f"corpus:{d}", lambda d=d: corpus_job(d, a.full)))
     with cf.ThreadPoolExecutor(a.jobs) as ex:
         futs = {ex.submit(fn): n for n, fn in jobs}
         for fut in cf.as_completed(futs):

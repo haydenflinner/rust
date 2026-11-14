@@ -64,14 +64,38 @@ pub fn mem_finalize(
                     uimm12,
                 };
                 (smallvec![], mem)
+            } else if let Some(imm12) = u64::try_from(off).ok().and_then(Imm12::maybe_from_u64) {
+                // PLIRON: an offset an `add` immediate holds (a 16-byte
+                // vector slot at an offset that is not a multiple of 16,
+                // past the unscaled range): `add tmp, base, #off` and a
+                // plain `[tmp]`, not `mov tmp, #off` and `[base, tmp,
+                // sxtx]`. Same count, one register read less on the
+                // access, and a form every tool decodes (valgrind does
+                // not know the extended-register `ldr q`).
+                let tmp = writable_spilltmp_reg();
+                (
+                    smallvec![Inst::AluRRImm12 {
+                        alu_op: ALUOp::Add,
+                        size: OperandSize::Size64,
+                        rd: tmp,
+                        rn: basereg,
+                        imm12,
+                    }],
+                    AMode::UnsignedOffset { rn: tmp.to_reg(), uimm12: UImm12Scaled::zero(access_ty) },
+                )
             } else {
+                // PLIRON: `[base, tmp]` (the LSL form, no shift) instead
+                // of `[base, tmp, sxtx]`. With a 64-bit index the two
+                // address the same byte, the base may be SP in both, and
+                // valgrind decodes only this one for `ldr q` (regex's
+                // `ExecBuilder::build` has a 14KB frame: `ldr q0, [sp,
+                // x16, sxtx]` stopped callgrind with SIGILL).
                 let tmp = writable_spilltmp_reg();
                 (
                     Inst::load_constant(tmp, off as u64),
-                    AMode::RegExtended {
+                    AMode::RegReg {
                         rn: basereg,
                         rm: tmp.to_reg(),
-                        extendop: ExtendOp::SXTX,
                     },
                 )
             }
@@ -725,6 +749,12 @@ impl EmitInfo {
     pub fn new(flags: settings::Flags, isa_flags: aarch64::settings::Flags) -> Self {
         Self { flags, isa_flags }
     }
+}
+
+/// PLIRON: `PLIRON_PROBE_SP` (default on): the stack-probe loop moves `sp`.
+fn pliron_probe_sp() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_PROBE_SP").map_or(true, |v| v != "0"))
 }
 
 impl MachInstEmit for Inst {
@@ -3599,6 +3629,8 @@ impl MachInstEmit for Inst {
                         let r = rn;
                         (r, Some((rm, extendop)), 0)
                     }
+                    // PLIRON: `mem_finalize`'s large-offset form (patch 132).
+                    AMode::RegReg { rn, rm } => (rn, Some((rm, ExtendOp::UXTX)), 0),
                     AMode::Unscaled { rn, simm9 } => {
                         let r = rn;
                         (r, None, simm9.value())
@@ -3877,15 +3909,47 @@ impl MachInstEmit for Inst {
                     imm12: step,
                 }
                 .emit(sink, emit_info, state);
-                Inst::Store32 {
-                    rd: regs::zero_reg(),
-                    mem: AMode::RegReg {
+                // PLIRON: move `sp` with the probe and store at `[sp]`
+                // (`PLIRON_PROBE_SP=0` restores the store below `sp`).
+                // Upstream writes `[sp, start]` with `sp` unmoved; the
+                // kernel grows the stack for that, but valgrind only
+                // extends it for accesses at or above `sp`, so any
+                // program with a frame of more than three guard pages
+                // died under valgrind with SIGSEGV in the prologue
+                // (rust-compression's `main`, 17KB; the unrolled probes
+                // already move `sp`, wasmtime#7454). One more
+                // instruction a page, and one after the loop to put
+                // `sp` back (`start` is minus the distance moved).
+                let move_sp = pliron_probe_sp();
+                if move_sp {
+                    Inst::AluRRImm12 {
+                        alu_op: ALUOp::Sub,
+                        size: OperandSize::Size64,
+                        rd: regs::writable_stack_reg(),
                         rn: regs::stack_reg(),
-                        rm: start.to_reg(),
-                    },
-                    flags: MemFlagsData::trusted(),
+                        imm12: step,
+                    }
+                    .emit(sink, emit_info, state);
+                    Inst::Store32 {
+                        rd: regs::zero_reg(),
+                        mem: AMode::UnsignedOffset {
+                            rn: regs::stack_reg(),
+                            uimm12: UImm12Scaled::zero(I32),
+                        },
+                        flags: MemFlagsData::trusted(),
+                    }
+                    .emit(sink, emit_info, state);
+                } else {
+                    Inst::Store32 {
+                        rd: regs::zero_reg(),
+                        mem: AMode::RegReg {
+                            rn: regs::stack_reg(),
+                            rm: start.to_reg(),
+                        },
+                        flags: MemFlagsData::trusted(),
+                    }
+                    .emit(sink, emit_info, state);
                 }
-                .emit(sink, emit_info, state);
                 Inst::AluRRR {
                     alu_op: ALUOp::AddS,
                     size: OperandSize::Size64,
@@ -3903,6 +3967,17 @@ impl MachInstEmit for Inst {
                 }
                 .emit(sink, emit_info, state);
                 sink.bind_label(loop_end, &mut state.ctrl_plane);
+                if move_sp {
+                    Inst::AluRRRExtend {
+                        alu_op: ALUOp::Sub,
+                        size: OperandSize::Size64,
+                        rd: regs::writable_stack_reg(),
+                        rn: regs::stack_reg(),
+                        rm: start.to_reg(),
+                        extendop: ExtendOp::UXTX,
+                    }
+                    .emit(sink, emit_info, state);
+                }
             }
         }
 

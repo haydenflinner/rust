@@ -19,18 +19,23 @@ extern crate rustc_data_structures;
 extern crate rustc_driver;
 extern crate rustc_errors;
 extern crate rustc_hir;
+extern crate rustc_metadata;
 extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_structures;
 extern crate rustc_symbol_mangling;
 extern crate rustc_target;
+extern crate rustc_type_ir;
 
 mod abi;
 mod asm;
+mod hot_layout;
 mod builder;
 mod cgupool;
 mod debuginfo;
+mod devirt;
+mod field_order;
 mod consts;
 mod context;
 mod intrinsic;
@@ -1059,6 +1064,15 @@ impl CodegenBackend for PlironCodegenBackend {
         }
     }
 
+    // `PLIRON_FIELD_ORDER=<file>`: profile-guided field order wraps
+    // `layout_of`. Unset, no provider is touched.
+    fn provide(&self, providers: &mut rustc_middle::util::Providers) {
+        field_order::provide(providers);
+        // Profile-use builds: profiled indirect-call targets become
+        // instantiable downstream (`reachable_set`).
+        devirt::provide(providers);
+    }
+
     fn target_cpu(&self, _sess: &Session) -> String {
         "generic".to_string()
     }
@@ -1082,10 +1096,13 @@ impl CodegenBackend for PlironCodegenBackend {
         _outputs: &OutputFilenames,
         crate_info: &CrateInfo,
     ) -> (CompiledModules, WorkProductMap) {
-        ongoing_codegen
+        let r = ongoing_codegen
             .downcast::<rustc_codegen_ssa::back::write::OngoingCodegen<PlironCodegenBackend>>()
             .expect("expected PlironCodegenBackend's OngoingCodegen")
-            .join(sess, incr_comp_session, crate_info)
+            .join(sess, incr_comp_session, crate_info);
+        // `PLIRON_FIELD_HEAT`: every CGU is done, append the crate's totals.
+        field_order::flush();
+        r
     }
 }
 
@@ -1125,7 +1142,9 @@ impl ExtraBackendMethods for PlironCodegenBackend {
             };
             let from = mangle_internal_symbol(tcx, &global_fn_name(method.name));
             let to = mangle_internal_symbol(tcx, &default_fn_name(method.name));
-            wrapper(&cx, &from, Some(&to), &types, output);
+            if !asm::alloc_shim_jump(&cx, &from, &to) {
+                wrapper(&cx, &from, Some(&to), &types, output);
+            }
         }
         wrapper(
             &cx,
@@ -1513,6 +1532,14 @@ fn module_codegen(
     cx.st.borrow_mut().deadfree = env_is("PLIRON_DEADFREE", "1");
     cx.st.borrow_mut().earlydead =
         pass_enabled("PLIRON_EARLYDEAD") && env_get("PLIRON_OPT_FNS").is_none();
+    // `PLIRON_HOT_LAYOUT=1`: the crate's type-layout table, for the
+    // hot-reload loader's patch check.
+    {
+        let t = hot_layout::asm(tcx);
+        if !t.is_empty() {
+            cx.st.borrow_mut().asm.push_str(&t);
+        }
+    }
     let mono_items = cgu.items_in_deterministic_order(tcx);
     let mut extra = if tcx.sess.opts.optimize != OptLevel::No
         && pass_enabled("PLIRON_XCGU")
@@ -1668,6 +1695,13 @@ fn module_codegen(
         }
     }
     maybe_create_entry_wrapper::<Builder<'_, '_>>(&cx, cgu);
+    if field_order::heat_on() {
+        let fns = mono_items.iter().filter_map(|&(m, _)| match m {
+            rustc_middle::mono::MonoItem::Fn(i) => Some(i),
+            _ => None,
+        });
+        field_order::record_cgu(&cx, cgu_name.as_str(), fns.chain(extra.iter().copied()));
+    }
     drop(_sdef);
     let m = if cgupool::enabled(tcx) {
         // Hand the finished pliron module to the worker pool: IR-opt,

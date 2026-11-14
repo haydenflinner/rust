@@ -1373,6 +1373,60 @@ impl<I: VCodeInst> VCode<I> {
         Some(out)
     }
 
+    /// PLIRON (`PLIRON_PGO_FREQ=1`, opt-in): the profile count of every
+    /// block, for `placement::with_counts`; empty when the knob is off or
+    /// the function carries no counts.
+    ///
+    /// The knob is a bit set: 1 = block placement, 2 = the register
+    /// allocator's spill weights (`which` is the caller's bit).
+    fn pliron_prof_counts(&self, which: u8) -> Vec<Option<u64>> {
+        static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        // Default 1 (placement) when a profile is in use, like the rest of
+        // the profile bundle (`pliron_cfg::pgo_knob`).
+        let bits = *ON.get_or_init(|| {
+            std::env::var("PLIRON_PGO_FREQ").ok().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                (std::env::var_os("PLIRON_PGO_USE").is_some()
+                    && std::env::var("PLIRON_PGO_BUNDLE").as_deref() != Ok("0")) as u8
+            })
+        });
+        if bits & which == 0 {
+            return Vec::new();
+        }
+        let v: Vec<Option<u64>> =
+            (0..self.num_blocks()).map(|b| self.block_order.prof_count(BlockIndex::new(b))).collect();
+        // `PLIRON_PGO_FREQ_STATS=1`: coverage, one line per function.
+        static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *STATS.get_or_init(|| std::env::var_os("PLIRON_PGO_FREQ_STATS").is_some()) {
+            let nb = self.num_blocks();
+            let have = v.iter().filter(|c| c.is_some_and(|c| c != u64::MAX)).count();
+            let (mut br, mut meas) = (0, 0);
+            for b in 0..nb {
+                let ss = self.block_succs(BlockIndex::new(b));
+                if ss.len() > 1 {
+                    br += 1;
+                    if ss.iter().all(|s| {
+                        let mut t = s.index();
+                        for _ in 0..4 {
+                            if t < nb && v[t].is_some() {
+                                return true;
+                            }
+                            let ts = if t < nb { self.block_succs(BlockIndex::new(t)) } else { &[] };
+                            if ts.len() != 1 {
+                                return false;
+                            }
+                            t = ts[0].index();
+                        }
+                        false
+                    }) {
+                        meas += 1;
+                    }
+                }
+            }
+            std::eprintln!("pgofreq: blocks {nb} counted {have} branches {br} measured {meas}");
+        }
+        if v.iter().any(|c| c.is_some_and(|c| c != u64::MAX)) { v } else { Vec::new() }
+    }
+
     /// PLIRON: fill `block_freq` (see the field) before regalloc when
     /// `PLIRON_RA2_FREQ` is set: the same graph, cold marks and branch
     /// hints the emission-time placement uses.
@@ -1396,7 +1450,10 @@ impl<I: VCodeInst> VCode<I> {
         let unlikely: Vec<Vec<bool>> = (0..nb)
             .map(|b| (0..succs[b].len()).map(|k| self.block_order.is_unlikely_succ(BlockIndex::new(b), k)).collect())
             .collect();
-        if let Some(freq) = super::placement::frequencies(self.entry.index(), &succs, &cold, &unlikely) {
+        let counts = self.pliron_prof_counts(2);
+        if let Some(freq) = super::placement::with_counts(counts, || {
+            super::placement::frequencies(self.entry.index(), &succs, &cold, &unlikely)
+        }) {
             self.block_freq = freq.into_iter().map(|f| f as f32).collect();
         }
     }
@@ -1594,6 +1651,102 @@ impl<I: VCodeInst> VCode<I> {
         (clobbered_regs, function_calls)
     }
 
+    /// PLIRON: FASTCC (see `machinst/abi.rs`) — every register this
+    /// function's machine code may write before it *returns*, from the
+    /// regalloc result: move destinations, def allocations, and each
+    /// instruction's clobber set. Unlike
+    /// `compute_clobbers_and_function_calls` this includes the clobbers of
+    /// same-ABI calls (no `is_included_in_clobbers` filter), which is what
+    /// makes the set transitive over callees. Registers the emitter writes
+    /// without telling regalloc (scratch registers, the link register,
+    /// prologue/epilogue temporaries) are not here: the backend that
+    /// consumes the set adds them back at the call site.
+    ///
+    /// Only blocks from which a `ret` is reachable count
+    /// (`PLIRON_FASTCC_NORET=0` counts every block): what a path that ends
+    /// in a trap, a noreturn call (panic) or an endless loop writes is
+    /// never seen by a caller that resumes after its `call`. A caller that
+    /// resumes at a landing pad used a `try_call`, which never takes a
+    /// reduced set. Without this a single bounds-check panic gives a leaf
+    /// the whole ABI clobber set.
+    ///
+    /// `None` when the function contains a tail call — the tail callee
+    /// runs in this function's place and its writes are not known here.
+    fn pliron_written_regs(&self, regalloc: &regalloc2::Output) -> Option<PRegSet> {
+        static NORET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let noret = *NORET.get_or_init(|| std::env::var("PLIRON_FASTCC_NORET").as_deref() != Ok("0"));
+        let nb = self.num_blocks();
+        // Blocks that can reach a return, by a backward walk from the
+        // returning blocks.
+        let mut returns = vec![!noret; nb];
+        let mut insn_block = vec![0u32; self.insts.len()];
+        let mut work: Vec<usize> = Vec::new();
+        for b in 0..nb {
+            let r = self.block_ranges.get(b);
+            for i in r.start..r.end {
+                insn_block[i] = b as u32;
+                if self.insts[i].call_type() == CallType::TailCall {
+                    return None;
+                }
+                match self.insts[i].is_term() {
+                    MachTerminator::Ret => {
+                        if !returns[b] {
+                            returns[b] = true;
+                        }
+                        work.push(b);
+                    }
+                    MachTerminator::RetCall => return None,
+                    _ => {}
+                }
+            }
+        }
+        if noret {
+            let mut seen = vec![false; nb];
+            while let Some(b) = work.pop() {
+                if std::mem::replace(&mut seen[b], true) {
+                    continue;
+                }
+                returns[b] = true;
+                for p in &self.block_preds[self.block_pred_range.get(b)] {
+                    if !seen[p.index()] {
+                        work.push(p.index());
+                    }
+                }
+            }
+        }
+        let mut written = PRegSet::default();
+        for (pp, Edit::Move { to, .. }) in &regalloc.edits {
+            if let Some(preg) = to.as_reg()
+                && returns[insn_block[pp.inst().index()] as usize]
+            {
+                written.add(preg);
+            }
+        }
+        for (i, range) in self.operand_ranges.iter() {
+            if !returns[insn_block[i] as usize] {
+                continue;
+            }
+            let operands = &self.operands[range.clone()];
+            let allocs = &regalloc.allocs[range];
+            for (operand, alloc) in operands.iter().zip(allocs.iter()) {
+                if operand.kind() == OperandKind::Def {
+                    if let Some(preg) = alloc.as_reg() {
+                        written.add(preg);
+                    }
+                    // A fixed def names its register even if the
+                    // allocation were ever reported differently.
+                    if let OperandConstraint::FixedReg(preg) = operand.constraint() {
+                        written.add(preg);
+                    }
+                }
+            }
+            if let Some(&inst_clobbered) = self.clobbers.get(&InsnIndex::new(i)) {
+                written.union_from(inst_clobbered);
+            }
+        }
+        Some(written)
+    }
+
     /// Emit the instructions to a `MachBuffer`, containing fixed-up
     /// code and external reloc/trap/etc. records ready for use. Takes
     /// the regalloc results as well.
@@ -1694,7 +1847,10 @@ impl<I: VCodeInst> VCode<I> {
             let unlikely: Vec<Vec<bool>> = (0..nb)
                 .map(|b| (0..succs[b].len()).map(|k| self.block_order.is_unlikely_succ(BlockIndex::new(b), k)).collect())
                 .collect();
-            if let Some((order, heads)) = super::placement::place(self.entry.index(), &succs, &cold, &empty, &unlikely) {
+            let counts = self.pliron_prof_counts(1);
+            if let Some((order, heads)) = super::placement::with_counts(counts, || {
+                super::placement::place(self.entry.index(), &succs, &cold, &empty, &unlikely)
+            }) {
                 if order.len() == final_order.len() {
                     final_order = order.into_iter().map(BlockIndex::new).collect();
                     chain_heads = Some(heads);
@@ -1702,6 +1858,53 @@ impl<I: VCodeInst> VCode<I> {
             }
         }
         final_order.extend(cold_blocks.clone());
+
+        // `PLIRON_LAYOUT_STATS=1`: score this order against the profile
+        // (always the measured counts, whatever `PLIRON_PGO_FREQ` says):
+        // one `layout:` line per profiled function with its entry count
+        // and the expected taken jumps, taken branches and block
+        // executions. Summed over a build they say how good a placement
+        // is without a timing run (`harness/layout_score.py`).
+        static LSTATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LSTATS.get_or_init(|| {
+            std::env::var_os("PLIRON_LAYOUT_STATS").is_some() || std::env::var_os("PLIRON_REMARKS").is_some()
+        })
+            && let Some(ec) = self.block_order.prof_count(self.entry).filter(|&c| c > 0 && c != u64::MAX)
+        {
+            let nb = self.num_blocks();
+            let succs: Vec<Vec<usize>> = (0..nb)
+                .map(|b| self.block_succs(BlockIndex::new(b)).iter().map(|s| s.index()).filter(|&s| s < nb).collect())
+                .collect();
+            let cold: Vec<bool> = (0..nb).map(|b| self.block_order.is_cold(BlockIndex::new(b))).collect();
+            let empty: Vec<bool> = (0..nb)
+                .map(|b| {
+                    let r = self.block_ranges.get(b);
+                    r.len() == 1
+                        && ra_edits_per_block[b] == 0
+                        && succs[b].len() == 1
+                        && self.insts[r.start].is_term() == MachTerminator::Branch
+                })
+                .collect();
+            let unlikely: Vec<Vec<bool>> = (0..nb)
+                .map(|b| (0..succs[b].len()).map(|k| self.block_order.is_unlikely_succ(BlockIndex::new(b), k)).collect())
+                .collect();
+            let counts: Vec<Option<u64>> =
+                (0..nb).map(|b| self.block_order.prof_count(BlockIndex::new(b))).collect();
+            let order: Vec<usize> = final_order.iter().map(|b| b.index()).collect();
+            if let Some((j, br, bl, fl, bj, bb)) = super::placement::with_counts(counts, || {
+                super::placement::score(self.entry.index(), &succs, &cold, &unlikely, &empty, &order)
+            }) {
+                let e = ec as f64;
+                super::abi::PLIRON_LAST_LAYOUT
+                    .with(|c| c.set(Some([e, j * e, br * e, bl * e, fl * e, bj * e, bb * e])));
+                if std::env::var_os("PLIRON_LAYOUT_STATS").is_some() {
+                    std::eprintln!(
+                    "layout: entries {ec} jumps {:.0} branches {:.0} blocks {:.0} floor {:.0} backjumps {:.0} backbranches {:.0}",
+                    j * e, br * e, bl * e, fl * e, bj * e, bb * e
+                );
+                }
+            }
+        }
 
         // PLIRON: mark blocks that are targets of backward edges in the
         // final emission order — loop headers — so their first instruction
@@ -1774,6 +1977,10 @@ impl<I: VCodeInst> VCode<I> {
         // relatively cheap.
         let ti = std::time::Instant::now();
         let (clobbers, function_calls) = self.compute_clobbers_and_function_calls(regalloc);
+        // PLIRON: FASTCC — record what this function may write.
+        if crate::machinst::pliron_fastcc_recording() {
+            crate::machinst::pliron_fastcc_record(self.pliron_written_regs(regalloc));
+        }
         self.abi.compute_frame_layout(
             &self.sigs,
             regalloc.num_spillslots,
@@ -2416,6 +2623,27 @@ impl<I: VCodeInst> VCode<I> {
                     }
                 }
             }
+            // PLIRON (`PLIRON_PADJUMP=<n>`, opt-in, default `0` = off; not
+            // measured yet, see the handoff notes in
+            // docs/history/2026-11-13-six-features.md): a pad of
+            // `n` or more instructions starts with a jump to the block it
+            // pads. The pad sits on the fallthrough path into a loop
+            // head, and the 64-byte rule above pads up to 15 `nop`s:
+            // pulldown-cmark executed 510k of them (LLVM's code 3.6k),
+            // 1% of its instructions, 99k on one path of
+            // `FirstPass::parse_block`.
+            static PADJUMP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let padjump = *PADJUMP.get_or_init(|| {
+                std::env::var("PLIRON_PADJUMP").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+            });
+            if let Some(sz) = I::fixed_inst_size()
+                && padjump > 0
+                && block != self.entry
+                && new_offset - buffer.cur_offset() >= padjump * sz
+            {
+                let j = I::gen_jump(MachLabel::from_block(block));
+                j.emit(&mut buffer, &self.emit_info, &mut Default::default());
+            }
             while new_offset > buffer.cur_offset() {
                 // Pad with NOPs up to the aligned block offset.
                 let nop = I::gen_nop((new_offset - buffer.cur_offset()) as usize);
@@ -2927,9 +3155,14 @@ impl<I: VCodeInst> VCode<I> {
             // header rather than executing a trampoline branch over them
             // (MachBuffer can only fold a jump into the following label when
             // they're byte-adjacent, which pre-label padding breaks).
+            // Not when the header's own code is skipped (`merged`: a
+            // bare-jump header aliased to its target by `PLIRON_BJALIAS`,
+            // an `EDGEMERGE` duplicate): the fallthrough would land in
+            // whatever block is emitted next (blind-sig under a profile:
+            // `rsa::internals::blind` fell into the wrong loop).
             let skip_jmp = final_order
                 .get(oi + 1)
-                .filter(|nb| loop_head[nb.index()])
+                .filter(|nb| loop_head[nb.index()] && !merged[nb.index()])
                 .and_then(|_nb| {
                     let succs =
                         &self.block_succs[self.block_succ_range.get(block.index())];
@@ -4700,6 +4933,11 @@ impl<I: VCodeInst> RegallocFunction for VCode<I> {
 
     fn block_hotness(&self, block: BlockIndex) -> Option<f32> {
         self.block_freq.get(block.index()).copied()
+    }
+
+    // PLIRON: the frontend's cold marks, for `PLIRON_RA2_COLDSPLIT`.
+    fn block_is_cold(&self, block: BlockIndex) -> bool {
+        self.block_order.is_cold(block)
     }
 
     fn num_blocks(&self) -> usize {

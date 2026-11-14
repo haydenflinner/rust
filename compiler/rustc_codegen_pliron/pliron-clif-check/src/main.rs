@@ -18,7 +18,11 @@
 //!                                          also weighted 8^loop-depth (the
 //!                                          register-allocation score)
 //!                                          (--check: also diffcheck each fn,
-//!                                          --jobs N, --limit N)
+//!                                          --jobs N, --limit N, --every N:
+//!                                          each Nth file of the sorted list;
+//!                                          PLIRON_VERIFY=full: the verifier
+//!                                          after every step, a failure is a
+//!                                          `panic` row naming the step)
 //!   clif-check steps                       list step names
 //!
 //! Options (after the subcommand args): --trials N, --seed N, --fuel N, --print.
@@ -41,6 +45,8 @@ struct Opts {
     check: bool,
     jobs: usize,
     limit: usize,
+    /// `report`/`codegen`: every Nth file (a deterministic sample of a big corpus).
+    every: usize,
 }
 
 #[global_allocator]
@@ -69,6 +75,7 @@ fn main() -> ExitCode {
         check: false,
         jobs: std::thread::available_parallelism().map_or(4, |n| n.get()),
         limit: usize::MAX,
+        every: 1,
     };
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -85,6 +92,7 @@ fn main() -> ExitCode {
             "--check" => opts.check = true,
             "--jobs" => opts.jobs = num().max(1) as usize,
             "--limit" => opts.limit = num() as usize,
+            "--every" => opts.every = num().max(1) as usize,
             _ => pos.push(a.clone()),
         }
     }
@@ -214,7 +222,16 @@ fn load(path: &Path) -> (Function, OwnedFacts) {
     let mut fs = cranelift_reader::parse_functions(&text)
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     assert!(!fs.is_empty(), "{}: no function", path.display());
-    (fs.remove(0), OwnedFacts::parse(&text))
+    let func = fs.remove(0);
+    let facts = parse_facts(&text, &func);
+    (func, facts)
+}
+
+/// A file's fact headers, with `self=` bound to the function's own id.
+fn parse_facts(text: &str, func: &Function) -> OwnedFacts {
+    let mut facts = OwnedFacts::parse(text);
+    facts.bind_self(func);
+    facts
 }
 
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -282,7 +299,8 @@ fn with_pipe<R>(
         .and_then(|n| n.strip_prefix("u0:"))
         .and_then(|n| n.parse().ok())
         .map(FuncId::from_u32)
-        .unwrap_or(FuncId::from_u32(0));
+        // No self-call in the text: an id no callee can have.
+        .unwrap_or(FuncId::from_u32(u32::MAX - 1));
     let x64 = isa.triple().architecture == target_lexicon::Architecture::X86_64;
     let (e1, e2, e3, mut e5, mut e6, mut e7, e8): (
         _,
@@ -435,8 +453,10 @@ fn with_pipe<R>(
         has_eh: false,
         flags: &flags,
         // `PLIRON_CLIF=<substr of the file's self name>` dumps steps.
-        dump: std::env::var("PLIRON_CLIF").is_ok_and(|f| facts.self_name.as_deref().is_some_and(|n| n.contains(&f))),
-        verify_full: false,
+        dump: std::env::var("PLIRON_CLIF").is_ok_and(|f| facts.self_symbol.as_deref().or(facts.self_name.as_deref()).is_some_and(|n| n.contains(&f))),
+        // `PLIRON_VERIFY=full`: the verifier after every step, as in the
+        // backend (a failing step panics; `report` records it as `panic`).
+        verify_full: pliron_cfg::env_is("PLIRON_VERIFY", "full"),
         since_reap: false,
         unopt: false,
         stats: &mut stats,
@@ -522,6 +542,35 @@ fn bench_corpus(isa: &dyn TargetIsa, dir: &Path, reps: usize) -> bool {
             rows.sort_by_key(|(_, d)| std::cmp::Reverse(**d));
             for (n, d) in rows.iter().take(200) {
                 println!("  {d:>9.1?}  {n}");
+            }
+            // Cost with no effect: time each step spent on functions it
+            // left unchanged, with how often it changed one. A step high
+            // in this table with a low hit rate wants a tighter shape
+            // gate; a `...2`/late repeat of a step that almost never
+            // fires is a round to cut.
+            let mut rep: Vec<_> = stats.repeat.iter().collect();
+            rep.sort_by_key(|(_, e)| std::cmp::Reverse(e.2));
+            let rep_sum: std::time::Duration = rep.iter().map(|(_, e)| e.2).sum();
+            println!("  repeats with nothing changed since the family's last no-effect run: {rep_sum:.1?}");
+            println!("  {:>9}  {:>7}  {:>7}  step", "time", "repeats", "changed");
+            for (n, (runs, fired, d)) in rep.iter().take(25) {
+                println!("  {d:>9.1?}  {runs:>7}  {fired:>7}  {n}");
+            }
+            let total: std::time::Duration = stats.timing.values().sum();
+            let mut idle: Vec<_> = stats.effect.iter().collect();
+            idle.sort_by_key(|(_, e)| std::cmp::Reverse(e.2));
+            let idle_sum: std::time::Duration = idle.iter().map(|(_, e)| e.2).sum();
+            println!(
+                "  no-effect time: {idle_sum:.1?} of {total:.1?} ({:.0}%)",
+                100.0 * idle_sum.as_secs_f64() / total.as_secs_f64().max(1e-9)
+            );
+            println!("  {:>9}  {:>6}  {:>7}  {:>6}  step", "idle", "of all", "ran", "fired");
+            for (n, (ran, fired, d)) in idle.iter().take(40) {
+                println!(
+                    "  {d:>9.1?}  {:>5.1}%  {ran:>7}  {:>5.1}%  {n}",
+                    100.0 * d.as_secs_f64() / total.as_secs_f64().max(1e-9),
+                    100.0 * *fired as f64 / (*ran).max(1) as f64
+                );
             }
         }
     }
@@ -610,7 +659,11 @@ fn report_one(isa: &dyn TargetIsa, root: &Path, file: &Path, o: &Opts, steps: &s
     let mut row = FnRow { file: rel, insts: (0, 0), blocks: (0, 0), us: 0, status: "ok", msg: String::new() };
     let loaded = std::fs::read_to_string(file).ok().and_then(|text| {
         let mut fs = cranelift_reader::parse_functions(&text).ok()?;
-        (!fs.is_empty()).then(|| (fs.remove(0), OwnedFacts::parse(&text)))
+        (!fs.is_empty()).then(|| {
+            let func = fs.remove(0);
+            let facts = parse_facts(&text, &func);
+            (func, facts)
+        })
     });
     let Some((mut func, facts)) = loaded else {
         row.status = "parse";
@@ -690,6 +743,9 @@ fn report_corpus(isa: &std::sync::Arc<dyn TargetIsa>, dir: &Path, out: &Path, o:
     let mut files = Vec::new();
     collect_clif(dir, &mut files);
     files.sort();
+    if o.every > 1 {
+        files = files.into_iter().step_by(o.every).collect();
+    }
     files.truncate(o.limit);
     std::panic::set_hook(Box::new(|_| {}));
     let t0 = std::time::Instant::now();
@@ -830,7 +886,11 @@ fn codegen_one(isa: &dyn TargetIsa, root: &Path, file: &Path) -> CgRow {
     let mut row = CgRow { file: file.strip_prefix(root).unwrap_or(file).display().to_string(), status: "ok", ..Default::default() };
     let loaded = std::fs::read_to_string(file).ok().and_then(|text| {
         let mut fs = cranelift_reader::parse_functions(&text).ok()?;
-        (!fs.is_empty()).then(|| (fs.remove(0), OwnedFacts::parse(&text)))
+        (!fs.is_empty()).then(|| {
+            let func = fs.remove(0);
+            let facts = parse_facts(&text, &func);
+            (func, facts)
+        })
     });
     let Some((func, facts)) = loaded else {
         row.status = "parse";
@@ -877,6 +937,9 @@ fn codegen_corpus(dir: &Path, out: &Path, o: &Opts) -> bool {
     let mut files = Vec::new();
     collect_clif(dir, &mut files);
     files.sort();
+    if o.every > 1 {
+        files = files.into_iter().step_by(o.every).collect();
+    }
     files.truncate(o.limit);
     std::panic::set_hook(Box::new(|_| {}));
     let next = std::sync::atomic::AtomicUsize::new(0);

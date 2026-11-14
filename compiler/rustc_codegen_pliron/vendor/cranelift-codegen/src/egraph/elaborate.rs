@@ -7,7 +7,7 @@ use crate::ctxhash::NullCtx;
 use crate::dominator_tree::DominatorTree;
 use crate::hash_map::Entry as HashEntry;
 use crate::inst_predicates::is_pure_for_egraph;
-use crate::ir::{Block, Function, Inst, Value, ValueDef};
+use crate::ir::{Block, Function, Inst, Opcode, Value, ValueDef};
 use crate::loop_analysis::{Loop, LoopAnalysis};
 use crate::scoped_hash_map::ScopedHashMap;
 use crate::trace;
@@ -29,7 +29,97 @@ pub(crate) fn remat_call_on() -> bool {
 /// domtree preorder leaves a loop. See `Elaborator::start_block`.
 pub(crate) fn elab_loops_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("PLIRON_ELABLOOPS").as_deref() == Ok("1"))
+    *ON.get_or_init(|| {
+        matches!(std::env::var("PLIRON_ELABLOOPS").as_deref(), Ok("1") | Ok("2"))
+    })
+}
+
+/// PLIRON: `PLIRON_ELABHOT=1` (opt-in) — a narrow part of
+/// `PLIRON_ELABLOOPS=1`: a block that lost its own loop's stack entry
+/// to the pop-on-leave rule gets it back when the loop contains no
+/// call and the block runs on every completed iteration (it dominates
+/// each latch). See `Elaborator::start_block`. Opt-in: with no trip
+/// count to go by it hoists out of loops that make a trip or less
+/// (pulldown-cmark +0.5% executed instructions, exact count).
+pub(crate) fn elab_hot_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_ELABHOT").as_deref() == Ok("1"))
+}
+
+/// PLIRON: `PLIRON_ELABKEEP` (default on; `=0` off) — elaboration does
+/// not move a pure instruction into a loop the incoming function had it
+/// outside of. See `Elaborator::keep_out_of_loop`.
+pub(crate) fn elab_keep_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_ELABKEEP").as_deref() != Ok("0"))
+}
+
+/// PLIRON (`PLIRON_ELABKEEP`): the blocks that use a value in the
+/// function the egraph pass was given, up to three.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct UseBlocks {
+    n: u8,
+    b: [u32; 3],
+}
+
+impl UseBlocks {
+    pub(crate) fn add(&mut self, block: Block) {
+        use cranelift_entity::EntityRef;
+        let x = block.index() as u32;
+        let n = self.n as usize;
+        if n > 3 || self.b[..n].contains(&x) {
+            return;
+        }
+        if n < 3 {
+            self.b[n] = x;
+        }
+        self.n += 1;
+    }
+
+    /// Known to have no use in loop `lp`.
+    fn none_in(&self, la: &LoopAnalysis, lp: Loop) -> bool {
+        use cranelift_entity::EntityRef;
+        self.n <= 3 && self.b[..self.n as usize].iter().all(|&x| !la.is_in_loop(Block::new(x as usize), lp))
+    }
+}
+
+/// PLIRON: `PLIRON_ELABLOOPS=2` (opt-in) — `=1`, pressure-aware: a cheap
+/// invariant is not hoisted out of a loop that contains a call. Hoisted,
+/// it is live across the whole loop, so across the call: it takes a
+/// callee-saved register for the loop's duration or is spilled and
+/// reloaded every iteration, to save one ALU instruction per iteration.
+/// (`=1` cost `strwork` spills that way; relax's allocator makes the same
+/// trade from the other side, recomputing cheap values after a call
+/// instead of keeping them in a callee-saved register.) Loops without
+/// calls hoist as under `=1`: caller-saved registers are free there
+/// (parse_only's `ptr + len` end pointer). See the hoist-level choice in
+/// `Elaborator::process_elab_stack`.
+pub(crate) fn elab_loops_pressure() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PLIRON_ELABLOOPS").as_deref() == Ok("2"))
+}
+
+/// One instruction with register operands that costs about a cycle:
+/// what `PLIRON_ELABLOOPS=2` would rather recompute than keep across a
+/// call.
+fn cheap_to_recompute(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::Iadd
+            | Opcode::Isub
+            | Opcode::Ineg
+            | Opcode::Band
+            | Opcode::Bor
+            | Opcode::Bxor
+            | Opcode::Bnot
+            | Opcode::Ishl
+            | Opcode::Ushr
+            | Opcode::Sshr
+            | Opcode::Uextend
+            | Opcode::Sextend
+            | Opcode::Ireduce
+            | Opcode::Icmp
+    )
 }
 
 pub(crate) struct Elaborator<'a> {
@@ -68,6 +158,10 @@ pub(crate) struct Elaborator<'a> {
     /// whose header has been visited, so `start_block` can rebuild
     /// `loop_stack` from a block's loop nest.
     loop_entries: FxHashMap<Loop, LoopStackEntry>,
+    /// PLIRON (`PLIRON_ELABKEEP`): where each pure instruction was
+    /// before the egraph pass removed it from the layout.
+    orig_block: &'a FxHashMap<Inst, (Block, SmallVec<[Value; 3]>)>,
+    use_blocks: &'a SecondaryMap<Value, UseBlocks>,
     /// The current block into which we are elaborating.
     cur_block: Block,
     /// Values that opt rules have indicated should be rematerialized
@@ -88,6 +182,9 @@ pub(crate) struct Elaborator<'a> {
     /// the hoisted value it replaces lives across that call in a
     /// callee-saved register or a spill slot.
     call_loops: FxHashSet<Loop>,
+    /// PLIRON (`PLIRON_ELABHOT`): each loop's latches (in-loop
+    /// predecessors of its header).
+    loop_latches: FxHashMap<Loop, SmallVec<[Block; 2]>>,
     /// Stats for various events during egraph processing, to help
     /// with optimization of this infrastructure.
     stats: &'a mut Stats,
@@ -168,6 +265,8 @@ impl<'a> Elaborator<'a> {
         domtree: &'a DominatorTree,
         loop_analysis: &'a LoopAnalysis,
         remat_values: &'a FxHashSet<Value>,
+        orig_block: &'a FxHashMap<Inst, (Block, SmallVec<[Value; 3]>)>,
+        use_blocks: &'a SecondaryMap<Value, UseBlocks>,
         stats: &'a mut Stats,
         ctrl_plane: &'a mut ControlPlane,
     ) -> Self {
@@ -176,7 +275,7 @@ impl<'a> Elaborator<'a> {
             SecondaryMap::with_default(BestEntry(Cost::infinity(), Value::reserved_value()));
         value_to_best_value.resize(num_values);
         let mut call_loops = FxHashSet::default();
-        if remat_call_on() {
+        if remat_call_on() || elab_loops_pressure() {
             for block in func.layout.blocks() {
                 let Some(mut lp) = loop_analysis.innermost_loop(block) else {
                     continue;
@@ -200,14 +299,41 @@ impl<'a> Elaborator<'a> {
                 }
             }
         }
+        let mut loop_latches: FxHashMap<Loop, SmallVec<[Block; 2]>> = FxHashMap::default();
+        if elab_hot_on() && loop_analysis.loops().next().is_some() {
+            for block in func.layout.blocks() {
+                if loop_analysis.innermost_loop(block).is_none() {
+                    continue;
+                }
+                let Some(t) = func.layout.last_inst(block) else {
+                    continue;
+                };
+                for bc in func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                {
+                    let dest = bc.block(&func.dfg.value_lists);
+                    if let Some(lp) = loop_analysis.is_loop_header(dest)
+                        && loop_analysis.is_in_loop(block, lp)
+                    {
+                        let l = loop_latches.entry(lp).or_default();
+                        if !l.contains(&block) {
+                            l.push(block);
+                        }
+                    }
+                }
+            }
+        }
         Self {
             func,
             domtree,
             loop_analysis,
+            loop_latches,
             value_to_elaborated_value: ScopedHashMap::with_capacity(num_values),
             value_to_best_value,
             loop_stack: smallvec![],
             loop_entries: FxHashMap::default(),
+            orig_block,
+            use_blocks,
             cur_block: Block::reserved_value(),
             remat_values,
             elab_stack: vec![],
@@ -218,6 +344,67 @@ impl<'a> Elaborator<'a> {
             stats,
             ctrl_plane,
         }
+    }
+
+    /// PLIRON (`PLIRON_ELABKEEP`): the entry of the outermost loop that
+    /// holds `insert_block`, where elaboration is about to put `inst`,
+    /// but did not hold the block the incoming function had `inst` in.
+    ///
+    /// Elaboration places a pure value at its first use in the domtree
+    /// preorder and hoists it as far as `loop_stack` reaches. That stack
+    /// loses a loop's entry as soon as the preorder visits a block
+    /// outside the loop, and a loop's exit and cold blocks are domtree
+    /// children of loop blocks, so they often come before the rest of
+    /// the body: every body block visited after them places its
+    /// invariants at their use. The pipeline's LICM had put them ahead of
+    /// the loop; they came back inside it, once per using block, and
+    /// their operands stayed live around the loop instead (a rotated
+    /// loop's end pointer `base + len * 8`, recomputed in each latch with
+    /// `base` and `len` held in callee-saved registers across the call:
+    /// `tests/parity/prog_loop.rs`, why `PLIRON_LOOPROT_MERGE` lost).
+    /// `PLIRON_ELABLOOPS=1` restores every entry, which also hoists what
+    /// the pipeline deliberately left on a conditional path of a loop
+    /// (pulldown-cmark +2.4% instructions); this only refuses to undo a
+    /// hoist the pipeline made, and of those only the ones that cost no
+    /// register: an instruction with an operand the loop does not use
+    /// otherwise (`use_blocks`: the operand had no use inside the loop in
+    /// the incoming function). Placed in the loop, the instruction is
+    /// what keeps that operand alive through it; hoisted, its result
+    /// takes the operand's place. An instruction whose operands the
+    /// loop needs anyway (`b as u8` next to tests of `b`) adds a live
+    /// value instead, and keeping every hoist cost pulldown-cmark 1.3M
+    /// instructions (`parse_block`, +0.9M) for the 0.9M it gained in
+    /// `scan_list_marker`. Instructions the rewrite rules created have
+    /// no original block and are placed as before.
+    ///
+    /// The hoist block dominates `insert_block` (it is the immediate
+    /// dominator of a header of a loop that holds it) and its scope is
+    /// still open; an operand not in that loop is defined on the
+    /// dominator chain above the header, as for the stack's own hoists.
+    fn keep_out_of_loop(
+        loop_analysis: &LoopAnalysis,
+        orig_block: &FxHashMap<Inst, (Block, SmallVec<[Value; 3]>)>,
+        use_blocks: &SecondaryMap<Value, UseBlocks>,
+        loop_entries: &FxHashMap<Loop, LoopStackEntry>,
+        inst: Inst,
+        insert_block: Block,
+        args: &[ElaboratedValue],
+    ) -> Option<LoopStackEntry> {
+        let (orig, ops) = orig_block.get(&inst)?;
+        let mut best = None;
+        let mut lp = loop_analysis.innermost_loop(insert_block);
+        while let Some(l) = lp {
+            if loop_analysis.is_in_loop(*orig, l)
+                || args.iter().any(|a| loop_analysis.is_in_loop(a.in_block, l))
+                || !ops.iter().any(|&x| use_blocks[x].none_in(loop_analysis, l))
+            {
+                break;
+            }
+            let Some(e) = loop_entries.get(&l) else { break };
+            best = Some(e.clone());
+            lp = loop_analysis.loop_parent(l);
+        }
+        best
     }
 
     fn start_block(&mut self, idom: Option<Block>, block: Block) {
@@ -284,7 +471,7 @@ impl<'a> Elaborator<'a> {
         // and loop depths will not match.
         if let Some(idom) = idom {
             if let Some(lp) = self.loop_analysis.is_loop_header(block) {
-                self.loop_stack.push(LoopStackEntry {
+                let e = LoopStackEntry {
                     lp,
                     // Any code hoisted out of this loop will have code
                     // placed in `idom`, and will have def mappings
@@ -292,11 +479,37 @@ impl<'a> Elaborator<'a> {
                     // level.
                     hoist_block: idom,
                     scope_depth: (self.value_to_elaborated_value.depth() - 1) as u32,
-                });
+                };
+                if elab_hot_on() || elab_keep_on() {
+                    self.loop_entries.insert(lp, e.clone());
+                }
+                self.loop_stack.push(e);
                 trace!(
                     " -> loop header, pushing; depth now {}",
                     self.loop_stack.len()
                 );
+            } else if elab_hot_on()
+                && let Some(lp) = self.loop_analysis.innermost_loop(block)
+                && self.loop_stack.last().is_none_or(|e| e.lp != lp)
+                && !self.call_loops.contains(&lp)
+                && let Some(e) = self.loop_entries.get(&lp)
+                && self.loop_latches.get(&lp).is_some_and(|ls| {
+                    ls.iter().all(|&l| self.domtree.block_dominates(block, l))
+                })
+            {
+                // PLIRON_ELABHOT: the domtree preorder visited one of the
+                // loop's exit blocks before `block` and popped the loop
+                // (see the `PLIRON_ELABLOOPS=1` note above). `block` runs
+                // on every completed iteration of a call-free loop, so an
+                // invariant placed here costs an instruction per trip and
+                // a register either way: hoist as if the entry were still
+                // there. Blocks on conditional paths keep the popped
+                // stack — their invariants stay next to their use
+                // (`ELABLOOPS=1` hoists those too: pulldown-cmark +2.4%
+                // executed instructions). The header dominates `block`,
+                // so the hoist block's scope is still open.
+                self.loop_stack.push(e.clone());
+                trace!(" -> restored popped loop entry; depth now {}", self.loop_stack.len());
             }
         } else {
             debug_assert!(
@@ -557,6 +770,35 @@ impl<'a> Elaborator<'a> {
             {
                 return false;
             }
+            // PLIRON (default since 2026-11-13; `PLIRON_REMAT_CARRIED=1`
+            // restores the remat): no remat of a
+            // value its own block passes on as a branch argument. Remat
+            // pays when it lets the *result* die at the end of its block;
+            // a loop counter's step (`i + 1`, handed to the header) is
+            // live out regardless, so a clone on the exit edge only keeps
+            // the old `i` alive past the step. The two then overlap, the
+            // header's parameter cannot share a register with its
+            // argument, and every iteration pays a `mov` and a `b`
+            // (pulldown-cmark `scan_ch`: 8 instructions a trip, 6 without
+            // the clone).
+            static CARRIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if !*CARRIED.get_or_init(|| std::env::var("PLIRON_REMAT_CARRIED").as_deref() == Ok("1"))
+                && let Some(def) = func.dfg.value_def(arg.value).inst()
+                && !func.dfg.inst_args(def).is_empty()
+                && let Some(t) = func.layout.last_inst(arg.in_block)
+            {
+                let carried = func.dfg.insts[t]
+                    .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
+                    .iter()
+                    .any(|bc| {
+                        bc.args(&func.dfg.value_lists).any(|a| {
+                            matches!(a, crate::ir::BlockArg::Value(v) if func.dfg.resolve_aliases(v) == arg.value)
+                        })
+                    });
+                if carried {
+                    return false;
+                }
+            }
             let new_value = match remat_copies.entry((insert_block, arg.value)) {
                 HashEntry::Occupied(o) => *o.get(),
                 HashEntry::Vacant(v) => {
@@ -711,6 +953,22 @@ impl<'a> Elaborator<'a> {
                         })
                         .max()
                         .unwrap_or(self.loop_stack.len().saturating_sub(1));
+                    // PLIRON_ELABLOOPS=2: a cheap op stops below the
+                    // innermost enclosing loop that has a call.
+                    let loop_hoist_level = if elab_loops_pressure()
+                        && loop_hoist_level < self.loop_stack.len()
+                        && cheap_to_recompute(self.func.dfg.insts[inst].opcode())
+                    {
+                        let mut k = self.loop_stack.len();
+                        while k > loop_hoist_level
+                            && !self.call_loops.contains(&self.loop_stack[k - 1].lp)
+                        {
+                            k -= 1;
+                        }
+                        k
+                    } else {
+                        loop_hoist_level
+                    };
                     trace!(
                         " -> loop hoist level: {:?}; cur loop depth: {:?}, loop_stack: {:?}",
                         loop_hoist_level,
@@ -750,6 +1008,24 @@ impl<'a> Elaborator<'a> {
                         // insert in `data.hoist_block`.
                         let before = self.func.layout.last_inst(data.hoist_block).unwrap();
                         (data.scope_depth as usize, before, data.hoist_block)
+                    };
+
+                    // PLIRON_ELABKEEP: not deeper than the pipeline had it.
+                    let (scope_depth, before, insert_block) = match Self::keep_out_of_loop(
+                        self.loop_analysis,
+                        self.orig_block,
+                        self.use_blocks,
+                        &self.loop_entries,
+                        inst,
+                        insert_block,
+                        arg_values,
+                    ) {
+                        Some(e) => {
+                            self.stats.elaborate_licm_hoist += 1;
+                            let before = self.func.layout.last_inst(e.hoist_block).unwrap();
+                            (e.scope_depth as usize, before, e.hoist_block)
+                        }
+                        None => (scope_depth, before, insert_block),
                     };
 
                     trace!(

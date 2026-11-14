@@ -204,6 +204,10 @@ pub struct LiveBundle {
     pub prio: u32, // recomputed after every bulk update
     pub spill_weight_and_props: u32,
     pub limit: Option<u8>,
+    /// PLIRON (`PLIRON_RA2_COLDSPLIT`): this bundle is a piece (hot
+    /// remainder or cold region) of a cold-region split, or was split off
+    /// one; the rule does not apply to it again.
+    pub cold_split: bool,
 }
 
 pub const BUNDLE_MAX_SPILL_WEIGHT: u32 = (1 << 28) - 1;
@@ -302,6 +306,10 @@ pub struct SpillSet {
     pub spill_bundle: LiveBundleIndex,
     pub required: bool,
     pub splits: u8,
+    /// PLIRON (`PLIRON_RA2_COLDSPLIT`): the spill bundle holds ranges a
+    /// cold split put on the stack; its second-chance register must not
+    /// be a callee-saved one nobody else uses (`spill.rs`).
+    pub cold_spill: bool,
 
     /// The aggregate [`CodeRange`] of all involved [`LiveRange`]s. The effect of this abstraction
     /// is that we attempt to allocate one spill slot for the extent of a bundle. For fragmented
@@ -416,6 +424,7 @@ impl LiveBundles {
             prio: 0,
             spill_weight_and_props: 0,
             limit: None,
+            cold_split: false,
         })
     }
 }

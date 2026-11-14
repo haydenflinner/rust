@@ -987,6 +987,17 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     dominate their bodies, so the entry exists, and the hoist block still
     dominates the body, so the scope depth it carries is still open).
     Test: `pliron-clif-opt/tests/elabloops.rs`.
+    `PLIRON_ELABHOT=1` (opt-in) is a narrower form: in the pop-on-leave
+    mode, a block whose own loop was popped gets the entry back when the
+    loop contains no call and the block dominates every latch (it runs
+    on each completed iteration). Loop-exit edge blocks (`edgesink`) are
+    domtree children of in-loop blocks, so a byte-scan loop with sunk
+    exit values hits the pop: `scan_while`'s 64-bit mask constant and
+    `base + len` are rebuilt each trip (10 instructions against 7 with
+    the knob). Exact counts on pulldown-cmark say the hoist still loses
+    without a trip count: +0.5% executed instructions (`ELABLOOPS=1`:
+    +2.4%) — its loops make a trip or less, so the preheader work is
+    the larger cost. Opt-in until hoisting can see trip counts.
 
 68. aarch64 `fvdemote_f16` to a 64-bit `f16x4` (`src/isa/aarch64/lower.isle`):
     one `fcvtn v.4h, v.4s` (matching x64's `(multi_lane 16 4)` arm). CubeCL's
@@ -1587,7 +1598,11 @@ the sum; plain `ushr` lowering zero-extends first. They now require
     of the using block — `q` the kept bump's result, which dominates
     those blocks because `p` does. On `chars_alpha`'s ASCII loop the
     hoisted `p+1` restores the fusion patch 115 needed:
-    `ldrb w10, [x23], #0x1`.
+    `ldrb w10, [x23], #0x1`. A second `iadd p, k` with the kept bump's
+    own constant in a dominated block (the elaborator gives every using
+    successor its own copy; a loop exit that reads `q` after
+    `edgesink::exit_sink`) aliases to the kept result instead of being
+    rematerialized as `(q - k) + k`.
 
 117. aarch64 `x + (a cc b ? 1 : 0)` to `csinc` (`PLIRON_CINC`, opt-in,
     `=1` on; `isa/aarch64/lower.isle` `iadd_cinc_{r,l}` +
@@ -1891,3 +1906,75 @@ the sum; plain `ushr` lowering zero-extends first. They now require
      `!unplaced_other` (blocks reaching `innermost.is_some()`).
      Ties only — explicit edge weights still dominate. Regression:
      `pliron-clif-opt/tests/x64_loopft.rs`.
+
+132. aarch64 large frame offsets use the plain register amode
+     (`src/isa/aarch64/inst/emit.rs`, `mem_finalize`): an `SPOffset`/
+     `FPOffset`/`RegOffset` access whose offset fits no immediate form
+     is `mov tmp, #off; ldr x, [base, tmp]` (option `011`, LSL #0)
+     instead of `[base, tmp, sxtx]` (option `111`). The index is a
+     64-bit register, so both address the same byte, and SP is a legal
+     base in both. valgrind decodes only the LSL form for `ldr q`/`str
+     q`: regex's `ExecBuilder::build` (14KB frame) stopped
+     `bench/heldout/irdiff.py` with SIGILL on `ldr q0, [sp, x16, sxtx]`.
+
+133. aarch64 stack-probe loop moves `sp` (default-on; `PLIRON_PROBE_SP=0`
+    restores; `isa/aarch64/inst/emit.rs`, `Inst::StackProbeLoop`).
+    Upstream's loop stores at `[sp, x16]` with `sp` unmoved. Linux grows
+    the stack for that; valgrind extends it only for accesses at or
+    above `sp`, so a program with a frame of more than three guard
+    pages died under valgrind with SIGSEGV in that prologue
+    (rust-compression's `main`, 17KB; regex's `RegexBuilder::build`
+    once more was inlined into it). The loop is now `sub x16, x16,
+    #step; sub sp, sp, #step; str wzr, [sp]; cmn x16, x17; b.gt`, then
+    `sub sp, sp, x16, uxtx` puts `sp` back. The unrolled probes (up to
+    three pages) already moved `sp` (wasmtime#7454). Test:
+    `pliron-clif-opt/tests/stack_probe.rs`.
+
+134. Elaboration keeps the pipeline's hoists (default-on;
+    `PLIRON_ELABKEEP=0` off; `egraph/mod.rs` records, per pure
+    instruction, its block and operands and, per value, the blocks that
+    use it; `egraph/elaborate.rs` `Elaborator::keep_out_of_loop`). The
+    elaborator's loop stack loses a loop's entry when the domtree
+    preorder visits a block outside the loop, so body blocks visited
+    after an exit or cold block place their invariants at the use: a
+    value our LICM had put ahead of the loop came back inside it, once
+    per using block. A pure instruction is now placed at the entry of
+    the outermost loop that holds its use but held neither its original
+    block nor any use of one of its operands (hoisted, the result then
+    takes that operand's register; without the operand test the rule
+    cost pulldown-cmark 1.3M instructions). `PLIRON_ELABLOOPS=1` hoists
+    every invariant instead. Exact counts: rust-compression -0.23M,
+    pulldown-cmark +0.08M, others within 0.02M; `tests/parity/
+    prog_loop.rs` with `PLIRON_LOOPROT_MERGE=1` keeps its end pointer
+    in one register. Test: `pliron-clif-opt/tests/elabkeep.rs`.
+
+## `PLIRON_ELABLOOPS=2` (opt-in): pressure-aware egraph hoisting
+
+`src/egraph/elaborate.rs` (`elab_loops_pressure`, `cheap_to_recompute`,
+the hoist-level choice in the `PendingInst` arm): `=1`'s loop-stack fix,
+except that a cheap single-instruction invariant (add/sub/logic/shift/
+extend/compare) is not hoisted out of a loop that contains a call — it
+stops below the innermost enclosing call loop. Hoisted, the value is
+live across the call for the whole loop and takes a callee-saved
+register or a spill slot with a reload per iteration. `call_loops` is
+built under this knob as well as under `PLIRON_REMATCALL`.
+
+## `PLIRON_FASTCC=1` (opt-in): per-callee call clobber sets
+
+`src/machinst/abi.rs` (`PlironRegSet`, `pliron_fastcc_begin`/`_end`, the
+thread-local callee table and recorded set; re-exported from `lib.rs`),
+`src/machinst/vcode.rs` (`VCode::pliron_written_regs`, called from
+`emit` next to `compute_clobbers_and_function_calls` while recording),
+`src/isa/aarch64/lower/isle.rs` (`gen_call_info`): a direct `call` to a
+callee whose written-register set the embedder installed gets
+`ABI clobbers ∩ (callee set ∪ {x16, x17, x30, x9 if a stack return})`
+as its clobber set. Never for `try_call` or patchable calls. Nothing
+changes unless the embedder calls `pliron_fastcc_begin` on the thread.
+The recorded set counts only blocks from which a `ret` is reachable
+(`PLIRON_FASTCC_NORET=0`: every block): a path that ends in a trap, a
+noreturn call or an endless loop is never resumed by a caller of a
+plain `call`, and without the rule one bounds-check panic gave a leaf
+the whole ABI set. `PlironRegSet::contains_enc` exposes membership by
+hardware encoding for the embedder's trace (`fastcc-set` lines, read by
+`harness/fastcc_check.py`, which checks the sets against the
+disassembled code).

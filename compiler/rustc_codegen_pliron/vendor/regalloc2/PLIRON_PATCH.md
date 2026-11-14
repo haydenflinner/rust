@@ -223,3 +223,117 @@ permutation is a pure relabeling so semantics are unchanged. Bails
 or any stack allocation whose extent is unknown. Pairs with the
 emit-side `PLIRON_EDITPAIR` peek in `vcode.rs` and the fp-relative
 `pair_amode` fallback in aarch64 `emit.rs` (`PLIRON_PATCH.md` there).
+
+## `PLIRON_RA2_POSTOPT=<bits>` (runtime, default 0): spill-traffic cleanup after allocation
+
+`src/ion/postopt.rs`, called from `ion::run` before the slot-pair
+repack; knobs in `src/lib.rs` (`postopt_bits`, `postopt_stats`). Two
+whole-function dataflows over the finished `Output` (edits + operand
+allocations); operands, slots and registers are never changed, only
+edits deleted or a load turned into a register copy:
+
+- forward "register `r` mirrors slot `s`", intersection over all
+  predecessors, optimistic around loops (8 sweeps, then one pessimistic
+  sweep): bit 1 drops a reload into a register that already mirrors the
+  slot, bit 2 turns a reload into a copy from another register that
+  mirrors it, bit 4 drops a spill store whose slot is already clean;
+- backward slot liveness: bit 8 drops stores to slots no path reads
+  before the next write (can leave `debug_locations` naming a stale
+  slot).
+
+The stock eliminator (`redundant_moves.rs`) forgets its state at block
+boundaries (`PLIRON_RA2_XBLOCK` extends it to single-predecessor
+fallthrough only). After relax's post-allocation spill windows,
+`redundant_saves` and `dead_spill_stores`. `PLIRON_RA2_POSTOPT_STATS=1`
+prints one `ra2post:` line per changed function. Checked with
+`PLIRON_RA_CHECK=1` on the eight held-out programs (identical output);
+static effect at `=15`: stack stores -1..3%, instructions -0.1..0.3%.
+
+## `PLIRON_RA2_SRCVREG=1` (runtime, default off): block-parameter moves carry the argument's vreg
+
+`src/ion/moves.rs` (`block_param_src_vreg`, the block-param move
+insertion), `src/lib.rs` (`srcvreg_on`): the `edit_vregs` entry of a
+block-parameter move names the branch argument's vreg instead of the
+parameter's. After the move both hold the same value; Cranelift only
+uses the entry to decide rematerialization, and the argument is the one
+that can be a constant. A constant passed to a spilled parameter was a
+load of the constant's own spill slot plus a store (through the scratch
+register, both legs keep the label); it becomes `mov #k` + store, and a
+slot read only that way loses its stores (`PLIRON_REMAT_STORE`).
+pulldown's `scalar_iterate_special_bytes` initialised a dozen spilled
+loop states that way on every call. Static, release held-out binaries:
+stack loads -4.3% (pulldown-cmark), -3.5% (regex), -3.6%
+(rust-compression); stores -0.7..-1.3%. Checked with `PLIRON_RA_CHECK=1`.
+
+## `PLIRON_RA2_COLDSPLIT=1` (runtime, opt-in): cut cold call blocks out of a hot bundle
+
+`src/ion/process.rs` (`try_cold_split` with the rule in its doc comment,
+`cold_split_range`, `cold_remainder_fits`, two hooks in `process_bundle`,
+flag inheritance in `split_and_requeue_bundle`), `src/cfg.rs`
+(`CFGInfo::clobber_prefix`, `cold_freq`, filled only under the knob),
+`src/ion/data_structures.rs` (`LiveBundle::cold_split`,
+`SpillSet::cold_spill`), `src/ion/spill.rs` (a `cold_spill` spill bundle
+does not open an unused callee-saved register at second chance),
+`src/lib.rs` (`Function::block_is_cold`, `coldsplit_on`/`_mode`/`_ratio`/
+`_colddiv`/`_bias`). Cranelift implements `block_is_cold` from its cold
+block marks (`machinst/vcode.rs`).
+
+When a bundle is given a callee-saved register that nothing else uses,
+or gets no register at all, the cold blocks in which it is live across a
+clobbering instruction are cut out of it at block boundaries; the cold
+part goes to the spill slot (uses inside become minimal bundles), the
+rest stays one bundle and takes a caller-saved register. The first case
+is cost-tested against 2 x entry frequency and requires that the rest
+fits a caller-saved register. `=2`/`=3` select one trigger;
+`PLIRON_RA2_COLDSPLIT_RATIO` (16), `_COLDDIV` (64), `_BIAS` (1.0).
+`tests/coldsplit/main.rs` shows the pattern (6 -> 0 saved registers
+around a `#[cold]` call in a loop). Held-out programs: prologue
+callee-saved saves -0.1..-5.1%, retired instructions unchanged
+(0.993..1.007); `PLIRON_RA_CHECK=1` clean. See
+`docs/history/2026-11-13-six-features.md` section 5 for the accounting.
+
+## `PLIRON_RA2_REHOME` (runtime, default `2`; `0` off, `1` loop latches only): a value's register in a block that only joins
+
+`src/ion/rehome.rs` (new), called from `Env::run` (`src/ion/mod.rs`)
+after `allocate_spillslots` and before the move insertion;
+`src/lib.rs` (`rehome_mode`).
+
+A bundle that must split is cut at program points, and each piece is a
+contiguous stretch of the lowered block order. A block that several
+paths jump to comes after all of them in that order, so it falls into
+the piece that covers the code just ahead of it, usually the one that
+crosses a call and sits in a callee-saved register. When the block's
+successor is back in the first piece (a loop latch jumping to its
+header), the value is moved into the block's register on every path in
+and moved back on the way out. pulldown-cmark's `scanners::unescape`
+with one latch (`PLIRON_LOOPROT_MERGE=1`) ran `mov x19, x2; mov x22, x3;
+cmp; b.hs; mov x2, x19; mov x3, x22; b` on every trip; the explain log
+showed the header in `[6..51)` with `x2`, the latch at instruction 545
+inside `[84..714)` with `x19`.
+
+The pass takes each block with two or more predecessors together with
+its jump-only successor blocks (the split critical edges) as a region.
+For every value live through the region (its live-ins and its block
+parameters) it prices the moves on the edges into and out of the region
+with the block frequencies (`CFGInfo::hot_bonus`), once for the
+allocation the value has there and once for each register it has on the
+far side of one of those edges. If another register costs at most 15/16
+of the current one and is free over the region's blocks (the per-register
+allocation maps, which also hold clobbers and fixed uses), the value's
+live range is cut at the region's block boundaries and the middle range
+gets a bundle of its own with that register. The edge moves then come
+from the normal insertion in `moves.rs`. Left alone: values whose live
+ranges overlap (a spilled value with per-use register pieces), bundles
+with a register limit, and values with a use in the region that is not a
+plain `Reg`/`Any` use.
+
+`tests/parity/latch.rs`: the latch above becomes `cmp; b.lo` (the moves
+go to the arms that call). Exact executed instructions, off -> `2`
+(2026-11-13): regex 51.58M -> 51.38M, rust-protobuf 65.69M -> 65.41M,
+rust-html-rewriter -0.13M, rust-compression -0.06M, pulldown-cmark
+-0.04M, rust-json and blind-sig unchanged, blake3-scalar +0.02M (eight
+alignment `nop`s moved in front of a loop entered 3027 times; the moves
+are the same). Mode `1` (regions with an edge to an earlier block only)
+gives about half of it. Compile time: regex-syntax 80.62G -> 80.65G
+retired instructions. Checked with `PLIRON_RA_CHECK=1` on the eight
+held-out programs.

@@ -1227,6 +1227,75 @@ fn split(
     let syncable: Vec<bool> = (0..sl.len())
         .map(|i| sl[i].pinned && covered[i] && !bad[i])
         .collect();
+    // `PLIRON_SROA_PINWHOLE` (default on since 2026-11-13; `=0` off): an aggregate a call fills in and
+    // the function then moves whole stays whole. Every slice is pinned
+    // under a syncable call operand (an `sret` temporary), some `memcpy`
+    // covers the whole alloca, and direct loads/stores touch at most a
+    // third of the slices (a tag test). Split, each call pays a writeback
+    // of every slice before it and a reload of every slice after it, the
+    // whole-copy becomes one load and one store per slice, and the
+    // slices ride registers across whatever sits between: pulldown-cmark's
+    // `let event = item_to_event(..); if let Event::Start(..) = event
+    // {..}; Some(event)` carried nine values (most in callee-saved
+    // registers, across `Vec::push`'s grow path) for a 48-byte enum that
+    // LLVM copies with three vector moves — 94 instructions against 57,
+    // 13% of that program's instruction gap (parse.rs:3051-3052).
+    //
+    // The same when no slice can leave memory at all (every slice pinned
+    // and none syncable: the callee is not known to be nonretaining —
+    // the real `item_to_event` lives in another CGU): the split then
+    // promotes nothing and only chops the whole-copy into one load/store
+    // pair per slice, byte-offset slices included (a 64-byte `Event`
+    // copied as eleven pieces at offsets 0, 1, 9, 17, ..).
+    let all_pinned = sl.iter().all(|x| x.pinned);
+    let none_sync = !syncable.iter().any(|&x| x);
+    if !crate::env_is("PLIRON_SROA_PINWHOLE", "0")
+        && sl.len() >= 3
+        && all_pinned
+        && (none_sync || syncable.iter().all(|&x| x))
+    {
+        let whole_copy = acc
+            .iter()
+            .any(|x| matches!(x.kind, Kind::Copy { n, .. } if x.off == 0 && n == size));
+        let mut touched = vec![false; sl.len()];
+        for x in &acc {
+            if !matches!(x.kind, Kind::Load | Kind::Store) || x.flow {
+                continue;
+            }
+            let n = access_ty(ctx, x).map(|t| size_align(ctx, t).0).unwrap_or(size);
+            for (i, sx) in sl.iter().enumerate() {
+                if x.off < sx.off + sx.size && sx.off < x.off + n {
+                    touched[i] = true;
+                }
+            }
+        }
+        let nt = touched.iter().filter(|&&t| t).count();
+        if whole_copy && (none_sync || nt * 3 <= sl.len()) {
+            return false;
+        }
+    }
+    // `PLIRON_SROA_FRAGCOPY=<k>` (default 8, `=0` off): an aggregate that
+    // is copied whole, that direct accesses cut into more pieces than it
+    // has words (at least two of them off word boundaries), and that sees
+    // at most `k` direct loads and stores per piece stays whole. Split,
+    // every whole-copy is one load and one store per piece and the
+    // pieces ride registers in between: pulldown-cmark's `CowStr` (24
+    // bytes; the inline variant is written as a tag byte and 4-, 2- and
+    // 1-byte chunks) became six pieces at offsets 0, 1, 5, 7, 8 and 16 in
+    // `FirstPass::parse_block`. Arrays the function computes on have many
+    // accesses per piece and still split: with no bound, blake3's block
+    // words stayed in memory (49.1M -> 73.4M executed instructions).
+    let per: usize = crate::env_get("PLIRON_SROA_FRAGCOPY").and_then(|v| v.parse().ok()).unwrap_or(8);
+    if per > 0 {
+        let whole_copy = acc
+            .iter()
+            .any(|x| matches!(x.kind, Kind::Copy { n, .. } if x.off == 0 && n == size));
+        let direct = acc.iter().filter(|x| matches!(x.kind, Kind::Load | Kind::Store)).count();
+        let pieces: Vec<(u64, u64)> = sl.iter().map(|x| (x.off, x.size)).collect();
+        if whole_copy && frag_copy_stays_whole(size, &pieces, direct, per) {
+            return false;
+        }
+    }
     // `PLIRON_SROA_TAILSPLIT=1`: a pinned-but-unsyncable slice whose pin
     // is a bodiless-callee operand may turn syncable once `iropt_tail`
     // adopts cross-CGU nocapture/nowrite facts. Deferring keeps the
@@ -2224,10 +2293,35 @@ fn forward_single_store_d(
     n
 }
 
+/// `PLIRON_SROA_FRAGCOPY`: a whole-copied aggregate of `size` bytes cut
+/// into `pieces` (`(offset, size)`) with `direct` loads and stores stays
+/// whole: more pieces than words, at least two of them not a whole word
+/// on a word boundary, and at most `per` direct accesses a piece.
+fn frag_copy_stays_whole(size: u64, pieces: &[(u64, u64)], direct: usize, per: usize) -> bool {
+    pieces.len() as u64 > size.div_ceil(8)
+        && pieces.iter().filter(|&&(off, sz)| off % 8 != 0 || sz % 8 != 0).count() >= 2
+        && direct <= per * pieces.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::inline::{blocks, ops};
+
+    /// pulldown-cmark's `CowStr` stays whole; a struct of whole words, a
+    /// byte tag ahead of two words, and an array the function computes
+    /// on (many accesses a piece) split.
+    #[test]
+    fn frag_copy_rule() {
+        let cowstr = [(0, 1), (1, 4), (5, 2), (7, 1), (8, 8), (16, 8)];
+        assert!(frag_copy_stays_whole(24, &cowstr, 7, 8));
+        assert!(!frag_copy_stays_whole(24, &[(0, 8), (8, 8), (16, 8)], 6, 8));
+        assert!(!frag_copy_stays_whole(24, &[(0, 1), (8, 8), (16, 8)], 6, 8));
+        let words: Vec<(u64, u64)> = (0..16).map(|i| (4 * i, 4)).collect();
+        assert!(frag_copy_stays_whole(64, &words, 32, 8));
+        assert!(!frag_copy_stays_whole(64, &words, 16 * 8 + 1, 8));
+    }
+
     use pliron::builtin::ops::ModuleOp;
     use pliron::irfmt::parsers::spaced;
     use pliron::parsable::parse_from_str;

@@ -15,6 +15,13 @@ use rustc_span::Spanned;
 
 // r[impl par.xcgu.eligible]
 fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool {
+    copyable_as(tcx, inst, limit, None)
+}
+
+/// [`copyable`], with the symbol the profile knows `inst` by when that
+/// is not its symbol in this crate (a dependency's function this crate
+/// instantiates for itself, `devirt::Targets::dep_copy`).
+fn copyable_as<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize, prof_sym: Option<&str>) -> bool {
     // Items and shims (drop glue, closure-once, reify/fnptr, ...) all have
     // MIR bodies LLVM can inline across CGUs; other kinds (virtual,
     // intrinsic, vtable) have no copyable body here.
@@ -68,7 +75,24 @@ fn copyable<'tcx>(tcx: TyCtxt<'tcx>, inst: Instance<'tcx>, limit: usize) -> bool
     // copyable at any size; they inline wherever they land, so a copy
     // costs IR-opt time, not code. memchr's `search_slice_with_raw` kept
     // pulldown's 7-statement `scan_nextline` from reaching its callers.
-    tcx.size_estimate(inst) <= limit
+    // `PLIRON_PGO_XCGU=<size>` (opt-in, with `PLIRON_PGO_USE`): a callee
+    // the profile saw entered at least as often as its hot count is
+    // copyable up to `<size>`. The default limit keeps copies small
+    // because most are speculative; a hot callee is where the calls are,
+    // and without its body here `PLIRON_PGO_HOT` has nothing to inline
+    // (LLVM's thin-local LTO imports hot callees at 10x its limit).
+    let size = tcx.size_estimate(inst);
+    if size > limit && limit != usize::MAX {
+        static HOT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let hot_size =
+            *HOT.get_or_init(|| pliron_cfg::pgo_knob("PLIRON_PGO_XCGU", "4000").and_then(|s| s.parse().ok()).unwrap_or(0));
+        if size <= hot_size
+            && pliron_ir_opt::pgo::hot_symbol(prof_sym.unwrap_or_else(|| tcx.symbol_name(inst).name))
+        {
+            return true;
+        }
+    }
+    size <= limit
         || (crate::env_is("PLIRON_XCGU_ALWAYS", "1")
             && matches!(
                 a.inline,
@@ -153,6 +177,10 @@ pub fn promoted<'tcx>(tcx: TyCtxt<'tcx>) -> &'static FxHashSet<String> {
         if tcx.sess.target.is_like_wasm {
             return out;
         }
+        // `PLIRON_DEVIRT`: guard targets (vtable slot instances) private
+        // to one CGU, so guards in other CGUs — of this crate or, by
+        // symbol, of another — can name them. Also for a one-CGU crate.
+        out.extend(crate::devirt::promotable(tcx).iter().cloned());
         let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
         if parts.len() <= 1 {
             return out;
@@ -434,7 +462,7 @@ fn copies_legacy<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Instan
     // Copies exist to feed the cross-CGU inliner; more copies than the
     // CGU's own fns would double its IR-opt work for marginal picks.
     // `PLIRON_XCGU_CAP` overrides (absolute count; >=usize::MAX disables).
-    let cap = crate::env_get("PLIRON_XCGU_CAP")
+    let cap = pliron_cfg::pgo_knob("PLIRON_XCGU_CAP", "100000")
         .and_then(|s| s.parse().ok())
         .unwrap_or(ours.len());
     let mut direct: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
@@ -588,12 +616,24 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
         .unwrap_or(8usize);
     let ours = cgu.items();
     let parts = tcx.collect_and_partition_mono_items(()).codegen_units;
-    if parts.len() <= 1 {
+    // Indirect-call promotion (profile-use build): the profiled targets
+    // of a function's indirect-call sites are candidates like its direct
+    // callees — `devirt::promote` will call them directly behind a
+    // guard, and only a body in this CGU lets the inliner take that
+    // call. Same size rules (a hot target up to `PLIRON_PGO_XCGU`), and
+    // a target that cannot be copied costs its caller nothing: these are
+    // not dependencies. `PLIRON_DEVIRT_COPY=0` turns it off.
+    let icp = Some(crate::devirt::bodies(tcx))
+        .filter(|t| !t.is_empty())
+        .filter(|_| !crate::env_is("PLIRON_DEVIRT_COPY", "0"));
+    // A one-CGU crate holds all its mono items; only a dependency's
+    // function can still be missing.
+    if parts.len() <= 1 && icp.is_none_or(|t| t.dep_copy.is_empty()) {
         return Vec::new();
     }
     // Same bound as the legacy path: copies never exceed the CGU's own
     // item count (`PLIRON_XCGU_CAP` overrides; 0 would take none).
-    let cap = crate::env_get("PLIRON_XCGU_CAP")
+    let cap = pliron_cfg::pgo_knob("PLIRON_XCGU_CAP", "100000")
         .and_then(|s| s.parse().ok())
         .unwrap_or(ours.len());
     let why = crate::env_get("PLIRON_STATS_XCGU");
@@ -667,6 +707,29 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
             }
         }
     }
+    let icp_ok = |name: &str, t: Instance<'tcx>| {
+        let m = MonoItem::Fn(t);
+        let ok = copyable_as(tcx, t, limit, Some(name))
+            || (inl_size && inlined.contains(&m) && copyable(tcx, t, usize::MAX));
+        if let Some(w) = &why
+            && with_no_trimmed_paths!(t.to_string()).contains(*w)
+            && pliron_cfg::tracing_on()
+        {
+            tracing::info!(target: "pliron::stats", "xcgu icp cand {} in {}: copyable={ok} size={}",
+                with_no_trimmed_paths!(t.to_string()), cgu.name(), tcx.size_estimate(t));
+        }
+        ok
+    };
+    if let Some(targets) = icp {
+        for item in ours.keys() {
+            let MonoItem::Fn(inst) = *item else { continue };
+            for (name, t) in targets.wanted_by(tcx, inst) {
+                if !ours.contains_key(&MonoItem::Fn(t)) && !frontier.contains(&t) && icp_ok(name, t) {
+                    frontier.push(t);
+                }
+            }
+        }
+    }
 
     // Items bindable without a copy: some partition emits the symbol
     // externally. An Internal dep (e.g. `RawVecInner::deallocate` under a
@@ -699,17 +762,47 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
     let mut candidates = Vec::new();
     let mut refs: FxHashMap<Instance<'tcx>, &[Spanned<MonoItem<'tcx>>]> = FxHashMap::default();
     let mut needed: FxHashSet<MonoItem<'tcx>> = FxHashSet::default();
+    // `PLIRON_XCGU_GLUEDEPTH` (default on, `=0` off): drop glue does not
+    // spend descent depth. Glue calls glue along the type's structure,
+    // one mono item per level, and a closure that captures a closure that
+    // captures a guard is a chain of them: `Iter::fold`'s copy needs
+    // `drop_glue::<{map_fold closure}>` -> `<{for_each closure}>` ->
+    // `<{extend_trusted closure}>` -> `<SetLenOnDrop>` ->
+    // `SetLenOnDrop::drop`, five levels under the three calls that lead
+    // to it, so the copy closure of `[u8]::to_ascii_lowercase`'s
+    // `extend_trusted` was cut at the depth limit and `Map::fold` stayed
+    // a call in every CGU but its own (lol_html's `as_lowercase_string`).
+    // A raised limit admits the chain too, but with it every other deep
+    // call chain (`PLIRON_XCGU_DEPTH=16`: pulldown-cmark +0.33M,
+    // rust-protobuf +0.26M executed instructions).
+    let glue_free = !crate::env_is("PLIRON_XCGU_GLUEDEPTH", "0");
+    let is_glue = |i: Instance<'tcx>| {
+        matches!(i.def, InstanceKind::Shim(rustc_middle::ty::ShimKind::DropGlue(..)))
+    };
     for _ in 0..=depth {
         if frontier.is_empty() {
             break;
         }
         let mut next = Vec::new();
-        for c in frontier {
+        let mut work = frontier;
+        let mut wi = 0;
+        while let Some(&c) = work.get(wi) {
+            wi += 1;
             let Some(us) = used(tcx, c) else {
                 continue;
             };
             refs.insert(c, us);
             candidates.push(c);
+            // A copy brings its indirect-call sites along.
+            if let Some(targets) = icp {
+                for (name, t) in targets.wanted_by(tcx, c) {
+                    let m = MonoItem::Fn(t);
+                    if !ours.contains_key(&m) && !seen.contains(&m) && icp_ok(name, t) {
+                        seen.insert(m);
+                        next.push(t);
+                    }
+                }
+            }
             for u in us {
                 if !ours.contains_key(&u.node) {
                     needed.insert(u.node);
@@ -729,7 +822,13 @@ fn copies_fixpoint<'tcx>(tcx: TyCtxt<'tcx>, cgu: &CodegenUnit<'tcx>) -> Vec<Inst
                             && inlined.contains(&u.node)
                             && copyable(tcx, c2, usize::MAX))
                     {
-                        next.push(c2);
+                        // Glue under glue (or under anything) and what
+                        // glue calls stay in this round.
+                        if glue_free && (is_glue(c2) || is_glue(c)) {
+                            work.push(c2);
+                        } else {
+                            next.push(c2);
+                        }
                     }
                 }
             }

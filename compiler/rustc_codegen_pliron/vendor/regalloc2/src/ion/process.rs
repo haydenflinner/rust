@@ -679,6 +679,9 @@ impl<'a, F: Function> Env<'a, F> {
         let new_bundle = self.ctx.bundles.add(self.ctx.scratch_bump.clone());
         trace!(" -> creating new bundle {:?}", new_bundle);
         self.ctx.bundles[new_bundle].spillset = spillset;
+        // PLIRON (`PLIRON_RA2_COLDSPLIT`): a piece of a cold-split piece
+        // stays exempt from the rule (the flag is never set otherwise).
+        self.ctx.bundles[new_bundle].cold_split = self.ctx.bundles[bundle].cold_split;
         for entry in &new_lr_list {
             self.ctx.ranges[entry.index].bundle = new_bundle;
         }
@@ -1082,6 +1085,8 @@ impl<'a, F: Function> Env<'a, F> {
         let mut attempts = 0;
         let mut scratch = core::mem::take(&mut self.ctx.scratch_conflicts);
         let mut lowest_cost_evict_conflict_set = core::mem::take(&mut self.ctx.scratch_bundle);
+        // PLIRON (`PLIRON_RA2_COLDSPLIT`): see `try_cold_split`.
+        let coldsplit = crate::coldsplit_on() && !self.ctx.bundles[bundle].cold_split;
         'outer: loop {
             attempts += 1;
             trace!("attempt {}, req {:?}", attempts, req);
@@ -1111,6 +1116,10 @@ impl<'a, F: Function> Env<'a, F> {
             let mut lowest_cost_split_conflict_cost: Option<u32> = None;
             let mut lowest_cost_split_conflict_point = ProgPoint::before(Inst::new(0));
             let mut lowest_cost_split_conflict_reg = PReg::invalid();
+            // PLIRON (`PLIRON_RA2_COLDSPLIT`): the clobber in the coldest
+            // block that kept this bundle out of a register:
+            // `(point, block hot bonus, preg)`.
+            let mut cold_conflict: Option<(ProgPoint, f32, PReg)> = None;
 
             // Heuristic: start the scan for an available
             // register at an offset influenced both by our
@@ -1152,6 +1161,27 @@ impl<'a, F: Function> Env<'a, F> {
                     &mut scratch,
                 ) {
                     AllocRegResult::Allocated(alloc) => {
+                        // PLIRON `PLIRON_RA2_COLDSPLIT=1`: the bundle fits a
+                        // callee-saved register that nothing else is in, so
+                        // taking it costs the function a save and a
+                        // restore. If only cold call blocks kept it out of
+                        // a caller-saved one, cutting them out is cheaper
+                        // (see `try_cold_split`, which then undoes this
+                        // allocation).
+                        if coldsplit
+                            && crate::coldsplit_mode() != 3
+                            && fixed_preg.is_none()
+                            && !self.minimal_bundle(bundle)
+                            && !self.env.preferred_regs_by_class[class as u8 as usize]
+                                .contains(preg)
+                            && self.ctx.pregs[preg.index()].allocations.btree.len()
+                                == self.ctx.bundles[bundle].ranges.len()
+                        {
+                            let entry = self.ctx.cfginfo.hot_bonus[self.func.entry_block().index()];
+                            if self.try_cold_split(bundle, Some(2.0 * entry), None) {
+                                break 'outer;
+                            }
+                        }
                         explain!("  -> {:?} gets {:?}", bundle, alloc);
                         self.ctx.output.stats.process_bundle_reg_success_any += 1;
                         trace!(" -> allocated to any {:?}", preg_idx);
@@ -1212,6 +1242,15 @@ impl<'a, F: Function> Env<'a, F> {
                             /* is_def = */ true,
                         )
                         .to_int();
+
+                        // PLIRON (`PLIRON_RA2_COLDSPLIT`).
+                        if coldsplit
+                            && crate::coldsplit_mode() != 2
+                            && cold_conflict.is_none_or(|(_, h, _)| hot < h)
+                            && self.func.inst_clobbers(point.inst()).contains(preg)
+                        {
+                            cold_conflict = Some((point, hot, preg));
+                        }
 
                         if lowest_cost_split_conflict_cost.is_none()
                             || (max_cost + move_cost) < lowest_cost_split_conflict_cost.unwrap()
@@ -1328,6 +1367,20 @@ impl<'a, F: Function> Env<'a, F> {
                 }
 
                 panic!("Could not allocate minimal bundle, but the allocation problem should be possible to solve");
+            }
+
+            // PLIRON `PLIRON_RA2_COLDSPLIT=1`: before choosing between
+            // evicting and splitting at the first conflict, take the cold
+            // call blocks out of the bundle (see `try_cold_split`). When
+            // the rule does not apply, nothing has changed and the
+            // existing choice below runs.
+            if let Some((point, _, preg)) = cold_conflict {
+                if fixed_preg.is_none()
+                    && !self.minimal_bundle(bundle)
+                    && self.try_cold_split(bundle, None, Some((point, preg)))
+                {
+                    break 'outer;
+                }
             }
 
             // If our bundle's weight is less than or equal to(*) the
@@ -1474,6 +1527,10 @@ impl<'a, F: Function> Env<'a, F> {
                             }
                         }
                     }
+                    let cycle_insts = |(h, u): (u32, u32)| {
+                        cfg.block_exit[u as usize].inst().index().saturating_sub(cfg.block_entry[h as usize].inst().index())
+                    };
+                    let best = best.filter(|&e| cycle_insts(e) <= crate::loopsplit_max());
                     if let Some((h, u)) = best {
                         let region_start = cfg.block_entry[h as usize];
                         if bundle_start < region_start && region_start < bundle_end {
@@ -1555,6 +1612,524 @@ fn minimal_range_for_use(u: &Use) -> CodeRange {
 }
 
 impl<'a, F: Function> Env<'a, F> {
+    /// PLIRON `PLIRON_RA2_COLDSPLIT=1` (opt-in): region splitting around
+    /// cold code, using the block frequencies behind the spill weights
+    /// (`CFGInfo::hot_bonus`).
+    ///
+    /// The case: a value that is hot in a loop is also live across a cold
+    /// block with a call (a panic path, an allocation slow path). The
+    /// call's clobbers keep the whole bundle out of every caller-saved
+    /// register, so it takes a callee-saved one for its whole life (a
+    /// save and a restore on every call of the function, and there are
+    /// few of them), or, when none is free, evicts something or is split
+    /// at the first conflict and reloaded in hot code. The rule instead
+    /// takes the cold blocks out of the bundle: the cold part lives on
+    /// the stack, the store and the reload land on the edges into and out
+    /// of the cold code, and the rest can take a caller-saved register.
+    ///
+    /// Two triggers in `process_bundle`, both only for a bundle without
+    /// a fixed-register requirement that is not minimal and does not
+    /// carry `LiveBundle::cold_split`:
+    /// - `callee_cost = Some(c)`: the probe just put the bundle in a
+    ///   non-preferred (callee-saved) register that held nothing else,
+    ///   so accepting it costs `c` = 2 x the entry block's frequency (the
+    ///   save and the restore; a register some bundle is already in
+    ///   costs nothing more and is simply taken; shrink-wrapping, which
+    ///   can make the real cost lower, is ignored). The split is done
+    ///   only if (a) its cost times `PLIRON_RA2_COLDSPLIT_BIAS` is below
+    ///   `c` and (b) what remains of the bundle fits a preferred
+    ///   register right now. The allocation is then undone and the
+    ///   remainder put in that register at once.
+    /// - `conflict = Some(..)`: no register at all was free and a clobber
+    ///   in a cold block was among the obstacles (the coldest such
+    ///   clobber and its preg). No cost test: the alternatives are an
+    ///   eviction or a split at the first conflict. The remainder is
+    ///   requeued with the preg as hint.
+    ///
+    /// The rule:
+    /// - Frequencies: `CFGInfo::cold_freq`, the hot bonus divided by
+    ///   `PLIRON_RA2_COLDSPLIT_COLDDIV` (default 64) in blocks the
+    ///   frontend marked cold. The static model gives a cold-marked arm
+    ///   1/33 of its predecessor, so a `#[cold]` call inside a loop
+    ///   still counts about twice the entry block and no split around
+    ///   it would ever beat a callee-saved register.
+    /// - Cold: a block is cold for the bundle when its frequency is at
+    ///   most `1/K` of the highest frequency of a block the bundle has a
+    ///   use or def in (`PLIRON_RA2_COLDSPLIT_RATIO`, default 16).
+    /// - Regions: the cold blocks in which the bundle is live across a
+    ///   clobbering instruction (exact, from `CFGInfo::clobber_prefix`);
+    ///   consecutive ones (in regalloc2's linear block order) form one
+    ///   region. A cold block without such a clobber forces nothing and
+    ///   stays in the bundle, also when it is next to a region: the
+    ///   function's exit block is often "cold" next to a loop and holds
+    ///   the value's last uses. All regions are found in one walk of the
+    ///   bundle's ranges.
+    /// - Cost of the split, in hot-bonus units: for every region block
+    ///   the bundle is live into, each edge from outside the regions
+    ///   (the store) at `min(pred, block)`; each edge out of a region to
+    ///   a block outside them that the bundle is live into (the reload)
+    ///   at `min(block, succ)`; and every use or def inside a region at
+    ///   its block's frequency (it becomes a reload or a store there). A
+    ///   region that ends in a trap or a noreturn call has no exits and
+    ///   so no reload.
+    /// - Split: every range is cut at each region's entry
+    ///   (`block_entry[lo]`) and exit (the point after `block_exit[hi]`),
+    ///   with the range-level steps of `split_and_requeue_bundle`. The
+    ///   ranges outside the regions stay in the original bundle, as
+    ///   *one* bundle with holes: the lowered block order interleaves
+    ///   cold blocks with hot ones (they are only sunk at emission), and
+    ///   separate bundles for the hot code before and after a cold block
+    ///   could get different registers and a move on a hot edge. The
+    ///   remainder is not trimmed to its uses.
+    /// - The cold pieces, one per region: without uses, its ranges go
+    ///   straight to the stack (a bundle that is never queued and
+    ///   resolves to the spillset's slot). With uses (a call
+    ///   argument, say): under the first trigger it is split into
+    ///   minimal bundles around the uses with the rest in the spill
+    ///   bundle (requeued whole it would be live across the call and
+    ///   take the callee-saved register after all); under the second it
+    ///   is requeued as a bundle and its low weight decides. Under the
+    ///   first trigger the spillset is marked `cold_spill`, so the
+    ///   spill bundle's second-chance allocation (`spill.rs`) does not
+    ///   open an unused callee-saved register either.
+    /// - Termination: the remainder and requeued cold pieces carry
+    ///   `cold_split`, which `split_and_requeue_bundle` hands on, so the
+    ///   rule runs at most once per original bundle. Nothing is lost by
+    ///   that for the remainder: any part of it has a hottest use no
+    ///   hotter than the original's, so every block cold for the part
+    ///   was cold for the original and has been cut out already. It
+    ///   does not count against `MAX_SPLITS_PER_SPILLSET`.
+    ///
+    /// Only block-boundary points are split at, and the moves between
+    /// the pieces come from the normal edge/range move insertion
+    /// (`moves.rs`), so the checker's view is that of any other split.
+    /// Returns false, with nothing changed, when the rule does not apply.
+    pub(crate) fn try_cold_split(
+        &mut self,
+        bundle: LiveBundleIndex,
+        callee_cost: Option<f32>,
+        conflict: Option<(ProgPoint, PReg)>,
+    ) -> bool {
+        let cfg = &self.ctx.cfginfo;
+        if cfg.clobber_prefix.len() != self.func.num_insts() + 1
+            || cfg.cold_freq.len() != cfg.hot_bonus.len()
+        {
+            return false;
+        }
+        let mut max_hot = 0.0f32;
+        for entry in &self.ctx.bundles[bundle].ranges {
+            for u in &self.ctx.ranges[entry.index].uses {
+                let h = cfg.cold_freq[cfg.insn_block[u.pos.inst().index()].index()];
+                if h > max_hot {
+                    max_hot = h;
+                }
+            }
+        }
+        if !(max_hot > 0.0) {
+            return false;
+        }
+        let thr = max_hot / crate::coldsplit_ratio();
+        if let Some((point, _)) = conflict {
+            if !(cfg.cold_freq[cfg.insn_block[point.inst().index()].index()] <= thr) {
+                return false;
+            }
+        }
+
+        // The regions, as inclusive block runs, in order.
+        let mut regions: SmallVec<[(usize, usize); 4]> = smallvec![];
+        // The open run: first block, last block.
+        let mut run: Option<(usize, usize)> = None;
+        let mut close = |run: Option<(usize, usize)>| {
+            if let Some((lo, hi)) = run {
+                regions.push((lo, hi));
+            }
+        };
+        for entry in &self.ctx.bundles[bundle].ranges {
+            if entry.range.from >= entry.range.to {
+                continue;
+            }
+            let b0 = cfg.insn_block[entry.range.from.inst().index()].index();
+            let b1 = cfg.insn_block[entry.range.to.prev().inst().index()].index();
+            for b in b0..=b1 {
+                if !(cfg.cold_freq[b] <= thr) {
+                    continue;
+                }
+                // The clobber of instruction `i` is at `After(i)`; the
+                // range covers it for `from.inst() <= i < to.inst()`.
+                let i0 = core::cmp::max(
+                    entry.range.from.inst().index(),
+                    cfg.block_entry[b].inst().index(),
+                );
+                let i1 = core::cmp::min(
+                    entry.range.to.inst().index(),
+                    cfg.block_exit[b].inst().index() + 1,
+                );
+                if !(i0 < i1 && cfg.clobber_prefix[i1] > cfg.clobber_prefix[i0]) {
+                    continue;
+                }
+                run = match run {
+                    Some((lo, hi)) if hi == b || hi + 1 == b => Some((lo, b)),
+                    _ => {
+                        close(run.take());
+                        Some((b, b))
+                    }
+                };
+            }
+        }
+        close(run.take());
+        if regions.is_empty() {
+            return false;
+        }
+        let bounds: SmallVec<[(ProgPoint, ProgPoint); 4]> = regions
+            .iter()
+            .map(|&(lo, hi)| (cfg.block_entry[lo], cfg.block_exit[hi].next()))
+            .collect();
+
+        // The first trigger's two tests.
+        let mut fit = PReg::invalid();
+        let mut cost = 0.0f32;
+        if let Some(callee_cost) = callee_cost {
+            let in_region = |b: usize| {
+                regions
+                    .binary_search_by(|&(lo, hi)| {
+                        if hi < b {
+                            core::cmp::Ordering::Less
+                        } else if lo > b {
+                            core::cmp::Ordering::Greater
+                        } else {
+                            core::cmp::Ordering::Equal
+                        }
+                    })
+                    .is_ok()
+            };
+            let ranges = &self.ctx.bundles[bundle].ranges;
+            let live = |p: ProgPoint| {
+                ranges
+                    .binary_search_by(|e| {
+                        if e.range.to <= p {
+                            core::cmp::Ordering::Less
+                        } else if e.range.from > p {
+                            core::cmp::Ordering::Greater
+                        } else {
+                            core::cmp::Ordering::Equal
+                        }
+                    })
+                    .is_ok()
+            };
+            for &(lo, hi) in &regions {
+                for b in lo..=hi {
+                    let hb = cfg.cold_freq[b];
+                    if live(cfg.block_entry[b]) {
+                        for &p in self.func.block_preds(Block::new(b)) {
+                            if !in_region(p.index()) {
+                                cost += hb.min(cfg.cold_freq[p.index()]);
+                            }
+                        }
+                    }
+                    for &s in self.func.block_succs(Block::new(b)) {
+                        if !in_region(s.index()) && live(cfg.block_entry[s.index()]) {
+                            cost += hb.min(cfg.cold_freq[s.index()]);
+                        }
+                    }
+                }
+            }
+            for entry in ranges {
+                for u in &self.ctx.ranges[entry.index].uses {
+                    let b = cfg.insn_block[u.pos.inst().index()].index();
+                    if in_region(b) {
+                        cost += cfg.cold_freq[b];
+                    }
+                }
+            }
+            if !(cost * crate::coldsplit_bias() < callee_cost) {
+                explain!(
+                    "  coldsplit-skip cost {}: split {cost} x bias >= callee-saved {callee_cost}, {} region(s)",
+                    self.explain_bundle(bundle),
+                    regions.len()
+                );
+                return false;
+            }
+            let class = self.ctx.spillsets[self.ctx.bundles[bundle].spillset].class;
+            let limit = self.ctx.bundles[bundle].limit.map_or(usize::MAX, |l| l as usize);
+            // Registers the rest is kept out of by a fixed reservation (a
+            // clobber outside the regions, a fixed operand) and by other
+            // bundles, for the log.
+            let (mut by_fixed, mut by_bundle) = (0, 0);
+            for preg in self.env.preferred_regs_by_class[class as u8 as usize] {
+                if preg.hw_enc() >= limit {
+                    continue;
+                }
+                match self.cold_remainder_fits(bundle, &bounds, preg) {
+                    0 => {
+                        fit = preg;
+                        break;
+                    }
+                    1 => by_bundle += 1,
+                    _ => by_fixed += 1,
+                }
+            }
+            if fit == PReg::invalid() {
+                explain!(
+                    "  coldsplit-skip nofit {}: split {cost} < callee-saved {callee_cost}, {} region(s), but no caller-saved register is free for the rest: {by_fixed} fixed, {by_bundle} bundles only",
+                    self.explain_bundle(bundle),
+                    regions.len()
+                );
+                return false;
+            }
+        }
+
+        explain!(
+            "  coldsplit {}: hottest use {max_hot}, cold <= {thr}, {} region(s) {:?}, cost {cost} vs callee-saved {:?}, rest -> {:?}",
+            self.explain_bundle(bundle),
+            regions.len(),
+            bounds,
+            callee_cost,
+            fit
+        );
+        trace!("coldsplit {bundle:?}: regions {bounds:?}");
+        self.ctx.output.stats.splits += regions.len();
+
+        // Undo the callee-saved allocation (first trigger).
+        if let Some(preg) = self.ctx.bundles[bundle].allocation.as_reg() {
+            for entry in &self.ctx.bundles[bundle].ranges {
+                self.ctx.pregs[preg.index()]
+                    .allocations
+                    .btree
+                    .remove(&LiveRangeKey::from_range(&entry.range));
+            }
+            self.ctx.bundles[bundle].allocation = Allocation::none();
+        }
+
+        // Distribute the ranges: outside every region -> `hot`, inside
+        // region `r` -> `cold` tagged `r`; a range across a boundary is
+        // cut there.
+        let empty_vec = LiveRangeList::new_in(self.ctx.bump());
+        let old = core::mem::replace(&mut self.ctx.bundles[bundle].ranges, empty_vec);
+        let mut hot = LiveRangeList::new_in(self.ctx.bump());
+        let mut cold: SmallVec<[(usize, LiveRangeListEntry); 8]> = smallvec![];
+        let mut r = 0;
+        for entry in old.iter().cloned() {
+            let mut cur = entry;
+            loop {
+                while r < bounds.len() && bounds[r].1 <= cur.range.from {
+                    r += 1;
+                }
+                if r == bounds.len() || bounds[r].0 >= cur.range.to {
+                    hot.push(cur);
+                    break;
+                }
+                let (from, to) = bounds[r];
+                if cur.range.from < from {
+                    let tail = self.cold_split_range(cur.index, from);
+                    cur.range.to = from;
+                    hot.push(cur);
+                    cur = LiveRangeListEntry {
+                        range: self.ctx.ranges[tail].range,
+                        index: tail,
+                    };
+                } else if cur.range.to > to {
+                    let tail = self.cold_split_range(cur.index, to);
+                    cur.range.to = to;
+                    cold.push((r, cur));
+                    cur = LiveRangeListEntry {
+                        range: self.ctx.ranges[tail].range,
+                        index: tail,
+                    };
+                } else {
+                    cold.push((r, cur));
+                    break;
+                }
+            }
+        }
+        // A use in the hottest block is outside every region.
+        debug_assert!(!hot.is_empty());
+        debug_assert!(!cold.is_empty());
+
+        let spillset = self.ctx.bundles[bundle].spillset;
+        // The bundle for the use-less cold ranges (see below).
+        let mut stack_piece = LiveBundleIndex::invalid();
+        let mut i = 0;
+        while i < cold.len() {
+            let region = cold[i].0;
+            let mut j = i;
+            let mut has_uses = false;
+            while j < cold.len() && cold[j].0 == region {
+                has_uses |= !self.ctx.ranges[cold[j].1.index].uses.is_empty();
+                j += 1;
+            }
+            if has_uses {
+                let piece = self.ctx.bundles.add(self.ctx.scratch_bump.clone());
+                self.ctx.bundles[piece].spillset = spillset;
+                self.ctx.bundles[piece].cold_split = true;
+                for &(_, entry) in &cold[i..j] {
+                    self.ctx.ranges[entry.index].bundle = piece;
+                    self.ctx.bundles[piece].ranges.push(entry);
+                }
+                if callee_cost.is_some() {
+                    explain!("    cold piece {:?} has uses -> minimal bundles + spill", piece);
+                    self.split_into_minimal_bundles(piece, PReg::invalid());
+                    self.ctx.spillsets[spillset].cold_spill = true;
+                } else {
+                    self.recompute_bundle_properties(piece);
+                    explain!("    cold piece {} requeued", self.explain_bundle(piece));
+                    let prio = self.ctx.bundles[piece].prio;
+                    self.ctx
+                        .allocation_queue
+                        .insert(piece, prio as usize, PReg::invalid());
+                }
+            } else {
+                // Straight to the stack: a bundle of its own that is never
+                // queued and keeps `Allocation::none()`, which resolves to
+                // the spillset's slot (`get_alloc_for_range`), with the
+                // slot marked required as for a `Requirement::Stack`
+                // bundle. Not the spill bundle: that one gets a register
+                // only if all of it fits one, and these ranges (live
+                // across a call) would keep the ranges ordinary splits
+                // trimmed into it on the stack too, reloaded where the
+                // next piece starts, which can be inside the loop.
+                if stack_piece.is_invalid() {
+                    stack_piece = self.ctx.bundles.add(self.ctx.scratch_bump.clone());
+                    self.ctx.bundles[stack_piece].spillset = spillset;
+                    self.ctx.bundles[stack_piece].cold_split = true;
+                    self.ctx.spillsets[spillset].required = true;
+                }
+                explain!(
+                    "    cold piece [{:?}..{:?}) has no uses -> stack ({:?})",
+                    cold[i].1.range.from,
+                    cold[j - 1].1.range.to,
+                    stack_piece
+                );
+                for &(_, entry) in &cold[i..j] {
+                    self.ctx.ranges[entry.index].bundle = stack_piece;
+                    self.ctx.bundles[stack_piece].ranges.push(entry);
+                }
+            }
+            i = j;
+        }
+
+        // The tail of a range cut at a region's exit is a new range: it
+        // has no bundle yet.
+        for entry in &hot {
+            self.ctx.ranges[entry.index].bundle = bundle;
+        }
+        self.ctx.bundles[bundle].ranges = hot;
+        self.ctx.bundles[bundle].cold_split = true;
+        self.recompute_bundle_properties(bundle);
+        explain!("    hot remainder {}", self.explain_bundle(bundle));
+        let mut requeue_hint = conflict.map_or(PReg::invalid(), |(_, preg)| preg);
+        if fit != PReg::invalid() {
+            let mut scratch = LiveBundleVec::new();
+            if let AllocRegResult::Allocated(_) = self.try_to_allocate_bundle_to_reg(
+                bundle,
+                PRegIndex::new(fit.index()),
+                None,
+                &mut scratch,
+            ) {
+                explain!("    hot remainder {:?} gets {:?}", bundle, fit);
+                self.ctx.spillsets[spillset].hint = fit;
+                return true;
+            }
+            debug_assert!(false, "cold split: remainder did not fit {:?}", fit);
+            requeue_hint = fit;
+        }
+        let prio = self.ctx.bundles[bundle].prio;
+        self.ctx
+            .allocation_queue
+            .insert(bundle, prio as usize, requeue_hint);
+        true
+    }
+
+    /// PLIRON (`try_cold_split`): would the bundle's ranges, without the
+    /// parts inside `bounds` (sorted `[from, to)` regions), be free in
+    /// `preg` right now? 0 = yes, 1 = no, only other bundles are in the
+    /// way, 2 = no, a fixed reservation is.
+    fn cold_remainder_fits(
+        &self,
+        bundle: LiveBundleIndex,
+        bounds: &[(ProgPoint, ProgPoint)],
+        preg: PReg,
+    ) -> u8 {
+        let btree = &self.ctx.pregs[preg.index()].allocations.btree;
+        let mut r = 0;
+        let mut res = 0;
+        for entry in &self.ctx.bundles[bundle].ranges {
+            let mut from = entry.range.from;
+            let to = entry.range.to;
+            while from < to {
+                while r < bounds.len() && bounds[r].1 <= from {
+                    r += 1;
+                }
+                let end = if r < bounds.len() && bounds[r].0 < to {
+                    bounds[r].0
+                } else {
+                    to
+                };
+                if from < end {
+                    // Every reservation overlapping `[from, end)`.
+                    let mut at = from;
+                    while let Some((k, lr)) = btree
+                        .range(LiveRangeKey::from_range(&CodeRange { from: at, to: end })..)
+                        .next()
+                    {
+                        let kr = k.to_range();
+                        if kr.from >= end {
+                            break;
+                        }
+                        if lr.is_invalid() {
+                            return 2;
+                        }
+                        res = 1;
+                        if kr.to >= end {
+                            break;
+                        }
+                        at = kr.to;
+                    }
+                }
+                if end == to {
+                    break;
+                }
+                from = core::cmp::min(bounds[r].1, to);
+            }
+        }
+        res
+    }
+
+    /// PLIRON (`try_cold_split`): cut live range `orig` at `at` (strictly
+    /// inside it, a block entry). `orig` keeps `[from, at)`; the new range
+    /// gets `[at, to)` with the uses from `at` on and is appended to the
+    /// vreg's range list (sorted after allocation, as for any split). The
+    /// caller puts both into bundles.
+    fn cold_split_range(&mut self, orig: LiveRangeIndex, at: ProgPoint) -> LiveRangeIndex {
+        debug_assert!(self.ctx.ranges[orig].range.from < at && at < self.ctx.ranges[orig].range.to);
+        debug_assert!(at.pos() == InstPosition::Before);
+        let to = self.ctx.ranges[orig].range.to;
+        let new_lr = self
+            .ctx
+            .ranges
+            .add(CodeRange { from: at, to }, self.ctx.scratch_bump.clone());
+        self.ctx.ranges[new_lr].vreg = self.ctx.ranges[orig].vreg;
+        let first_use = self.ctx.ranges[orig]
+            .uses
+            .iter()
+            .position(|u| u.pos >= at)
+            .unwrap_or(self.ctx.ranges[orig].uses.len());
+        let mut rest_uses = UseList::new_in(self.ctx.bump());
+        rest_uses.extend(self.ctx.ranges[orig].uses.iter().cloned().skip(first_use));
+        self.ctx.ranges[new_lr].uses = rest_uses;
+        self.ctx.ranges[orig].uses.truncate(first_use);
+        self.ctx.ranges[orig].uses.shrink_to_fit();
+        self.ctx.ranges[orig].range.to = at;
+        self.recompute_range_properties(orig);
+        self.recompute_range_properties(new_lr);
+        let range = self.ctx.ranges[new_lr].range;
+        let vreg = self.ctx.ranges[new_lr].vreg;
+        self.ctx.vregs[vreg].ranges.push(LiveRangeListEntry {
+            range,
+            index: new_lr,
+        });
+        new_lr
+    }
+
     /// PLIRON explain: `bundle(vregs) [from..to) w=weight depth=d..d`.
     pub(crate) fn explain_bundle(&self, bundle: LiveBundleIndex) -> alloc::string::String {
         let ranges = &self.ctx.bundles[bundle].ranges;

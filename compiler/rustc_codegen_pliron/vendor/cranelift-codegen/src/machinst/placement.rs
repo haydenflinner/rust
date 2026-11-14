@@ -92,6 +92,107 @@ pub fn frequencies(entry: usize, succs: &[Vec<usize>], cold: &[bool], unlikely: 
     analyze(entry, succs, cold, unlikely).map(|a| a.freq)
 }
 
+/// Score an emission order: the expected number of taken unconditional
+/// jumps, taken conditional branches and block executions per entry of
+/// the function, under `analyze`'s frequencies (measured ones inside
+/// `with_counts`). `order` lists every block that is emitted; `empty[b]`
+/// blocks emit nothing and are looked through. `None` where `analyze`
+/// gives up. For `PLIRON_LAYOUT_STATS`.
+pub fn score(
+    entry: usize,
+    succs: &[Vec<usize>],
+    cold: &[bool],
+    unlikely: &[Vec<bool>],
+    empty: &[bool],
+    order: &[usize],
+) -> Option<(f64, f64, f64, f64, f64, f64)> {
+    let a = analyze(entry, succs, cold, unlikely)?;
+    let n = succs.len();
+    let res = |mut b: usize| {
+        for _ in 0..8 {
+            if !empty[b] {
+                break;
+            }
+            b = succs[b][0];
+        }
+        b
+    };
+    // The block emitted right after each block, empties skipped.
+    let mut next = vec![usize::MAX; n];
+    let mut prev: Option<usize> = None;
+    for &b in order {
+        if empty[b] {
+            continue;
+        }
+        if let Some(p) = prev {
+            next[p] = b;
+        }
+        prev = Some(b);
+    }
+    let (mut jumps, mut branches, mut blocks) = (0.0, 0.0, 0.0);
+    // Of those, the ones that go backward in the order (loop back edges).
+    let (mut back_jumps, mut back_branches) = (0.0, 0.0);
+    let mut pos = vec![usize::MAX; n];
+    for (i, &b) in order.iter().enumerate() {
+        pos[b] = i;
+    }
+    // What no order can avoid: every block's mass that does not go to its
+    // likeliest successor (each block has one fallthrough slot at best).
+    let mut floor = 0.0;
+    for b in 0..n {
+        if empty[b] || a.freq[b] <= 0.0 {
+            continue;
+        }
+        blocks += a.freq[b];
+        if !succs[b].is_empty() {
+            let best = a.prob[b].iter().cloned().fold(0.0, f64::max);
+            floor += a.freq[b] * (1.0 - best);
+        }
+        for (k, &s0) in succs[b].iter().enumerate() {
+            let w = a.freq[b] * a.prob[b][k];
+            if res(s0) != next[b] {
+                let back = pos[res(s0)] <= pos[b];
+                if succs[b].len() == 1 {
+                    jumps += w;
+                    if back {
+                        back_jumps += w;
+                    }
+                } else {
+                    branches += w;
+                    if back {
+                        back_branches += w;
+                    }
+                }
+            }
+        }
+        // A two-way branch neither of whose targets follows costs a
+        // conditional branch and then a jump on the not-taken side; the
+        // loop above counted both edges as taken branches, which is the
+        // same number of redirects.
+    }
+    Some((jumps, branches, blocks, floor, back_jumps, back_branches))
+}
+
+std::thread_local! {
+    /// PLIRON (`PLIRON_PGO_FREQ=1`): profile counts per block for the
+    /// `analyze` call in progress (`with_counts`). A thread-local so the
+    /// two entry points keep their signatures.
+    static COUNTS: core::cell::RefCell<Vec<Option<u64>>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `f` (a `frequencies` or `place` call) with real profile counts:
+/// where every successor of a block has a count, the edge probabilities
+/// are the counts' shares instead of the static guesses (back edges 8:1,
+/// hints, cold). A successor without a count of its own (a critical-edge
+/// block) takes its single successor's. LLVM's profile gain is largely
+/// this: block placement and spill weights from measured frequencies.
+pub fn with_counts<R>(counts: Vec<Option<u64>>, f: impl FnOnce() -> R) -> R {
+    COUNTS.with(|c| *c.borrow_mut() = counts);
+    let r = f();
+    COUNTS.with(|c| c.borrow_mut().clear());
+    r
+}
+
 fn analyze(entry: usize, succs: &[Vec<usize>], cold: &[bool], unlikely: &[Vec<bool>]) -> Option<Freq> {
     let n = succs.len();
     if n < 3 || n > MAX_BLOCKS || cold[entry] {
@@ -256,11 +357,48 @@ fn analyze(entry: usize, succs: &[Vec<usize>], cold: &[bool], unlikely: &[Vec<bo
     }
     // Edge probabilities.
     let is_back = |b: usize, s: usize| rpo_idx[s] <= rpo_idx[b];
+    let counts: Vec<Option<u64>> = COUNTS.with(|c| c.borrow().clone());
+    let count_of = |mut s: usize| -> Option<u64> {
+        for _ in 0..4 {
+            match counts.get(s).copied().flatten() {
+                // A critical-edge block: as often as the edge it splits
+                // (capped by its source below; its target may have other
+                // predecessors).
+                Some(u64::MAX) if succs[s].len() == 1 => s = succs[s][0],
+                // A measured count wins over a static cold mark: the
+                // marks come from shape rules (paths to a panic) and the
+                // profile has seen the block run.
+                Some(c) if c != u64::MAX => return Some(c),
+                // No count: a cold block counts as never run, anything
+                // else is unknown.
+                _ => return cold[s].then_some(0),
+            }
+        }
+        None
+    };
     let prob: Vec<Vec<f64>> = (0..n)
         .map(|b| {
             let ss = &succs[b];
             if ss.is_empty() {
                 return Vec::new();
+            }
+            // Measured: every successor counted, and the branch ran.
+            if counts.len() == n && ss.len() > 1 {
+                // An edge can carry no more than its source ran.
+                let cap = counts[b].filter(|&c| c != u64::MAX);
+                let cs: Vec<Option<u64>> =
+                    ss.iter().map(|&s| count_of(s).map(|c| cap.map_or(c, |m| c.min(m)))).collect();
+                if cs.iter().all(|c| c.is_some()) {
+                    let sum: u64 = cs.iter().map(|c| c.unwrap()).sum();
+                    if sum > 0 {
+                        // Never exactly 0: the walk below divides mass
+                        // along every edge, and a path the profiled run
+                        // skipped can still run.
+                        let w: Vec<f64> = cs.iter().map(|c| (c.unwrap() as f64 / sum as f64).max(1e-4)).collect();
+                        let t: f64 = w.iter().sum();
+                        return w.into_iter().map(|x| x / t).collect();
+                    }
+                }
             }
             let any_back = ss.iter().any(|&s| is_back(b, s) && !cold[s]);
             let lp = innermost[b];
@@ -412,12 +550,49 @@ fn analyze(entry: usize, succs: &[Vec<usize>], cold: &[bool], unlikely: &[Vec<bo
         };
         loops[id].factor = (f * loops[id].entry * loops[id].scale).min(FREQ_CAP);
     }
-    let freq: Vec<f64> = (0..n)
+    let mut freq: Vec<f64> = (0..n)
         .map(|b| match innermost[b] {
             Some(l) => (loops[l].factor * rel[b]).min(FREQ_CAP),
             None => rel[b].min(FREQ_CAP),
         })
         .collect();
+    // `PLIRON_PLACE_PIN=1` (opt-in): where a block has a measured count,
+    // its frequency is that count over the entry's, not what the walk
+    // above propagated. The walk only sees successor shares: a loop all
+    // of whose exits the profiled run took from count-less blocks, or
+    // whose latch never left, comes out thousands of iterations long
+    // (pulldown-cmark `scan_containers`: 64M modelled iterations where
+    // the whole profile's largest count is 0.85M). A block without a
+    // count is rescaled by its nearest counted dominator's correction.
+    static PIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *PIN.get_or_init(|| std::env::var("PLIRON_PLACE_PIN").as_deref() == Ok("1"))
+        && counts.len() == n
+        && let Some(ec) = counts[entry].filter(|&c| c > 0 && c != u64::MAX)
+    {
+        let measured = |b: usize| counts[b].filter(|&c| c != u64::MAX).map(|c| c as f64 / ec as f64);
+        let old = freq.clone();
+        for b in 0..n {
+            if rpo_idx[b] == usize::MAX {
+                continue;
+            }
+            if let Some(m) = measured(b) {
+                freq[b] = m.min(FREQ_CAP);
+                continue;
+            }
+            let mut d = b;
+            let mut steps = 0;
+            while d != entry && idom[d] != usize::MAX && steps < 64 {
+                d = idom[d];
+                steps += 1;
+                if let Some(m) = measured(d) {
+                    if old[d] > 0.0 {
+                        freq[b] = (old[b] * m / old[d]).min(FREQ_CAP);
+                    }
+                    break;
+                }
+            }
+        }
+    }
     Some(Freq { n, preds, rpo, rpo_idx, loops, asc, innermost, in_loop, prob, freq })
 }
 
@@ -741,6 +916,110 @@ pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], 
     if order.first() != Some(&entry) {
         return None;
     }
+    // `PLIRON_PLACE_OPT=1` (opt-in): local search on the finished order.
+    // The chain walk commits greedily; a block whose likeliest successor
+    // ended up elsewhere pays a taken transfer on its hottest edge. For
+    // each such block, try moving the successor's fallthrough run (the
+    // successor and the blocks that already follow it by their own
+    // likeliest edges) to right behind the block, and keep the move when
+    // the order's expected taken-transfer mass drops. Quadratic, so only
+    // for functions up to `MAX_OPT` placed blocks; up to 3 passes.
+    static OPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    const MAX_OPT: usize = 320;
+    if *OPT.get_or_init(|| std::env::var("PLIRON_PLACE_OPT").as_deref() == Ok("1")) && order.len() <= MAX_OPT {
+        let hottest = |b: usize| -> Option<usize> {
+            let mut best: Option<(f64, usize)> = None;
+            for (k, &t) in succs[b].iter().enumerate() {
+                if best.is_none_or(|(w, _)| prob[b][k] > w) {
+                    best = Some((prob[b][k], res[t]));
+                }
+            }
+            best.map(|(_, t)| t)
+        };
+        let cost = |order: &[usize]| -> f64 {
+            let mut next = vec![usize::MAX; n];
+            let mut prev: Option<usize> = None;
+            for &b in order {
+                if empty[b] {
+                    continue;
+                }
+                if let Some(p) = prev {
+                    next[p] = b;
+                }
+                prev = Some(b);
+            }
+            let mut c = 0.0;
+            for &b in order {
+                if empty[b] {
+                    continue;
+                }
+                for (k, &t) in succs[b].iter().enumerate() {
+                    if res[t] != next[b] {
+                        c += edge_w(b, k);
+                    }
+                }
+            }
+            c
+        };
+        let mut cur = cost(&order);
+        for _pass in 0..3 {
+            let mut improved = false;
+            let mut i = 0;
+            while i < order.len() {
+                let b = order[i];
+                i += 1;
+                if empty[b] || freq[b] <= 0.0 {
+                    continue;
+                }
+                let Some(s) = hottest(b) else { continue };
+                if s == entry || s == b || cold[s] || empty[s] {
+                    continue;
+                }
+                let Some(ps) = order.iter().position(|&x| x == s) else { continue };
+                // Already the next placed block?
+                if order[i..].iter().find(|&&x| !empty[x]) == Some(&s) {
+                    continue;
+                }
+                // The run that follows `s` by likeliest edges.
+                let mut end = ps + 1;
+                while end < order.len() {
+                    let x = order[end - 1];
+                    if order[end] == b || hottest(x) != Some(order[end]) {
+                        break;
+                    }
+                    end += 1;
+                }
+                if (ps..end).contains(&(i - 1)) {
+                    continue;
+                }
+                let run: Vec<usize> = order[ps..end].to_vec();
+                let mut trial: Vec<usize> = Vec::with_capacity(order.len());
+                for (j, &x) in order.iter().enumerate() {
+                    if (ps..end).contains(&j) {
+                        continue;
+                    }
+                    trial.push(x);
+                    if x == b {
+                        trial.extend(run.iter().copied());
+                    }
+                }
+                let c = cost(&trial);
+                if c < cur * (1.0 - 1e-6) - 1e-9 {
+                    order = trial;
+                    cur = c;
+                    improved = true;
+                    // `b` may have moved: rescan from the start of the order.
+                    i = 0;
+                    if !improved {
+                        break;
+                    }
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+    }
     static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *DEBUG.get_or_init(|| std::env::var("PLIRON_PLACE_DEBUG").as_deref() == Ok("1")) {
         let mut s = alloc::string::String::new();
@@ -750,9 +1029,15 @@ pub fn place(entry: usize, succs: &[Vec<usize>], cold: &[bool], empty: &[bool], 
                 .enumerate()
                 .map(|(k, &t)| alloc::format!("{}@{:.2}", t, prob[b][k]))
                 .collect();
+            let cnt = COUNTS.with(|c| c.borrow().get(b).copied().flatten());
             s.push_str(&alloc::format!(
-                "place: b{} freq={:.3} loop={:?}{}{} -> {}\n",
+                "place: b{} count={} freq={:.3} loop={:?}{}{} -> {}\n",
                 b,
+                match cnt {
+                    Some(u64::MAX) => alloc::string::String::from("edge"),
+                    Some(c) => alloc::format!("{c}"),
+                    None => alloc::string::String::from("-"),
+                },
                 freq[b],
                 innermost[b],
                 if cold[b] { " cold" } else { "" },

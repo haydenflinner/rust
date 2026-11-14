@@ -35,6 +35,13 @@ pub struct PassConfig {
 /// 2026-10-28-overnight.md.
 // r[impl par.cfg.defaults]
 pub const DEFAULT_ON: &[&str] = &[
+    // Fold branches a dominating check decides before LICM looks for
+    // escapes (regex's `follow_epsilons`: `assert!(len < cap)` then
+    // `Vec::push`'s dead grow call, which took the set). Exact counts:
+    // regex 55.09M -> 53.17M (x1.199 -> x1.157; `follow_epsilons` below
+    // LLVM's), rust-protobuf, json, html-rewriter unchanged, pulldown
+    // +0.03M (`scan_setext_heading` no longer unrolls).
+    "PLIRON_LICM_DOMCOND",
     // Stack-slot merging (docs/history/2026-10-25-slot-coloring.md,
     // 2026-10-26-slot-interference.md).
     "PLIRON_SLOTMERGE_MARK",
@@ -139,9 +146,12 @@ pub const DEFAULT_ON: &[&str] = &[
     // (sym + n) - sym folds, so static-string copies get a constant size
     // and expand inline: json 1.118 -> 1.058, pulldown -0.9% (6 layouts).
     "PLIRON_SYMSUB",
-    // Outer-only loads stay out of nested-loop preheaders: geomean
-    // 0.997 / 0.998 in two layout-averaged runs (regex -0.8% both).
-    "PLIRON_LICM_INNERPRESS",
+    // (`PLIRON_LICM_INNERPRESS` is a valued default now: `DEFAULT_VALUES`.)
+    // Loop-only unswitching when the loop's closed region is too big to
+    // clone (docs/loop-unswitch-pressure.md section 3): regex's
+    // `next_state` tests `b == EOF` once instead of per `Bytes` state.
+    // Exact counts 2026-11-13: regex -0.29M, the other seven unchanged.
+    "PLIRON_UNSWITCH_LOOP",
     // Static branch hints for emission-time placement (Cranelift patch 98
     // reads PLIRON_PLACE itself, on by default; docs/codegen-plan.md
     // 2026-11-02/03): held-out 1.111 -> 1.104 with the check set.
@@ -219,6 +229,21 @@ pub const DEFAULT_ON: &[&str] = &[
     // 1.001 neutral, rust-compression 0.984; regex-syntax .text +64B.
     // `=0` off.
     "PLIRON_LOADFWD_SRCCOPY",
+    // Per-callee clobber sets (aarch64, not Windows): a direct call to a
+    // function compiled in the same object destroys only the registers
+    // that function's code writes on a path that returns
+    // (`pliron-clif-lower` `fastcc_compile`). Exact counts 2026-11-13:
+    // pulldown-cmark 52.82M -> 52.53M (-0.55%), the other five held-out
+    // programs within 0.01% (their hot calls leave the CGU or are
+    // `try_call`s); compile CPU +0..1.5%, peak RSS +0..3% (regex,
+    // rust-html-rewriter). Validation:
+    // docs/history/2026-11-13-six-features.md. `=0` off.
+    "PLIRON_FASTCC",
+    // Cold `call f(..); trap` tails of one callee share one block per
+    // function (`panicstub`). A size change only: .text -0.1..-0.2% on
+    // regex and html-rewriter, less elsewhere, executed instructions
+    // within +-0.05%. `=0` off.
+    "PLIRON_PANICSTUB",
 ];
 
 /// Valued defaults: an unset variable reads as the given string.
@@ -227,6 +252,16 @@ pub const DEFAULT_ON: &[&str] = &[
 /// the same way `env_is` sees `DEFAULT_ON`. Kill switch for a cap is
 /// usually `=0` (off).
 pub const DEFAULT_VALUES: &[(&str, &str)] = &[
+    // Outer-only loads stay out of nested-loop preheaders (`1`: geomean
+    // 0.997 / 0.998 in two layout-averaged runs) unless every inner loop
+    // has register room for them (`2`, docs/loop-unswitch-pressure.md
+    // section 2). `2` lost 1.07M instructions on regex until `loadfwd`
+    // stopped threading the hoisted loads through the nest as block
+    // params (`PLIRON_LF_TRIVPHI`); with that, exact counts 2026-11-13:
+    // regex -1.21M (`next_state`'s decode loop keeps the `SparseSet`
+    // fields in registers), pulldown-cmark -0.18M, rust-protobuf and
+    // blind-sig -0.04M, the rest within 0.03M. `=1` restores, `=0` off.
+    ("PLIRON_LICM_INNERPRESS", "2"),
     // At most 8 CGUs past the start of stage A (2026-10-27-memory2.md).
     // Tuned on a 14-core Mac; `=0` disables the cap.
     ("PLIRON_CGU_ACAP", "8"),
@@ -536,6 +571,19 @@ pub fn env_get(var: &str) -> Option<&'static str> {
     config().get(var)
 }
 
+/// A profile-use knob's value: what the environment says, else `bundle`
+/// when a profile is in use (`PLIRON_PGO_USE`) and the bundle is not
+/// switched off (`PLIRON_PGO_BUNDLE=0`). The bundle is the set of
+/// consumers that measurably pay on the held-out programs
+/// (docs/pgo.md): hot-call-site inlining, hot callees copied across
+/// codegen units, small inline copies at hot sites, measured block
+/// placement.
+pub fn pgo_knob(var: &str, bundle: &'static str) -> Option<&'static str> {
+    env_get(var).or_else(|| {
+        (env_get("PLIRON_PGO_USE").is_some() && !env_is("PLIRON_PGO_BUNDLE", "0")).then_some(bundle)
+    })
+}
+
 /// `PLIRON_TRACE_FILE=<path>`: append one timing line per pipeline step (and per
 /// `*pipeline*`/`*compile*` CGU summary) the moment it is measured, so a
 /// watcher can read live progress instead of waiting for the process to
@@ -597,6 +645,47 @@ pub fn mark(label: &str) {
     {
         let _ = f.write_all(line.as_bytes());
     }
+}
+
+/// `PLIRON_REMARKS=<path>`: optimization remarks, one tab-separated line
+/// per decision *not* to optimize (`<pass>\t<function>\t<what>\t<why>`),
+/// appended to `<path>.<pid>`. Unlike the `PLIRON_TRACE` debug lines these
+/// have one fixed shape, cost nothing when the knob is unset, and are
+/// meant to be joined with a profile: `harness/remarks.py` answers "why
+/// is this call still a call" / "why did this loop not vectorize" for the
+/// functions a profile names (after relax's `remarks <fn>`).
+pub fn remarks_on() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| env_get("PLIRON_REMARKS").is_some());
+    *ON
+}
+
+/// Record one remark (see [`remarks_on`]; callers check it first so the
+/// arguments are not formatted when off). `what` names the subject (a
+/// callee, a loop header), `why` the reason with its numbers.
+pub fn remark(pass: &str, func: &str, what: &dyn std::fmt::Display, why: &dyn std::fmt::Display) {
+    use std::io::Write;
+    static SINK: std::sync::LazyLock<Option<std::sync::Mutex<std::io::LineWriter<std::fs::File>>>> =
+        std::sync::LazyLock::new(|| {
+            let path = format!("{}.{}", env_get("PLIRON_REMARKS")?, std::process::id());
+            let f = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+            Some(std::sync::Mutex::new(std::io::LineWriter::new(f)))
+        });
+    if let Some(m) = SINK.as_ref()
+        && let Ok(mut w) = m.lock()
+    {
+        let _ = writeln!(w, "{pass}\t{func}\t{what}\t{why}");
+    }
+}
+
+/// `remark!(pass, func, what; "why {}", args)`: a remark when
+/// `PLIRON_REMARKS` is set, nothing otherwise.
+#[macro_export]
+macro_rules! remark {
+    ($pass:expr, $func:expr, $what:expr; $($t:tt)*) => {
+        if $crate::remarks_on() {
+            $crate::remark($pass, &*$func, &$what, &format_args!($($t)*));
+        }
+    };
 }
 
 /// `PLIRON_OPT_BISECT=N`: allow only the first N optimization-pass
@@ -728,7 +817,14 @@ fn parse_fn_sel(spec: &str) -> Option<(bool, FnSel)> {
 // r[impl par.cfg.opt-fns]
 pub fn fn_opt_selected(name: &str) -> bool {
     static SEL: LazyLock<Option<(bool, FnSel)>> = LazyLock::new(|| {
-        let spec = env_get("PLIRON_OPT_FNS")?;
+        // An instrumented build (`PLIRON_PGO`) only has to count: its
+        // counters sit on the pre-optimization CFG, so optimizing it buys
+        // nothing but a faster profiling run, and costs a third of its
+        // build time. `PLIRON_PGO_OPT=1` optimizes it anyway (a long
+        // profiling workload).
+        let spec = env_get("PLIRON_OPT_FNS").or_else(|| {
+            (env_get("PLIRON_PGO").is_some() && !env_is("PLIRON_PGO_OPT", "1")).then_some("0..0")
+        })?;
         Some(
             parse_fn_sel(spec)
                 .unwrap_or_else(|| panic!("PLIRON_OPT_FNS: bad selector `{spec}`")),

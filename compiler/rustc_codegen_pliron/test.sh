@@ -8,8 +8,9 @@
 # Links with the pure-Rust `wild` linker when it is on PATH (cargo install wild-linker).
 # --only runs only the comma-listed test names:
 #   nostd std unwind asm unroll licm loadpre pairfuse edgespec cparm celim
-#   punroll icmpfold coldargs coldcopy bcheck unswitch slotmerge bittab polsw tailrec
+#   punroll icmpfold coldargs coldcopy fastcc scopedna neonpair bcheck unswitch slotmerge bittab polsw tailrec
 #   sroa spills slotpromlt byvalhome inlinecm retattr facts loopalign commute xpack loopvec proc_macro lto wasm pgo
+#   o0std
 #   asmcfi asmextern debuginfo dbgnested dbgextpath nocapfields stackmove xfactsall
 #   wasm_smoke — wasm emit smoke, no sysroot build (~1 s)
 #   (sysroot/mold still need their flags)
@@ -33,14 +34,21 @@ done
 want() { [[ -z "$only" ]] || [[ ",$only," == *",$1,"* ]]; }
 
 # TEST_NOBUILD=1: the caller (harness/gate.py) already built the backend.
-[[ -n "${TEST_NOBUILD:-}" ]] || cargo build
+# PLIRON_PROFILE=<cargo profile> (default debug) tests that profile's dylib,
+# e.g. `fast` (docs/dev-loop.md).
+PROF=${PLIRON_PROFILE:-debug}
+if [[ -z "${TEST_NOBUILD:-}" ]]; then
+  if [[ "$PROF" == debug ]]; then cargo build; else cargo build --profile "$PROF"; fi
+fi
 export RUSTC_ICE=${RUSTC_ICE:-$PWD/target/ices}
 case "$(uname -s)" in
   Darwin)              lib=librustc_codegen_pliron.dylib; exe= ;;
   MINGW*|MSYS*|CYGWIN*) lib=rustc_codegen_pliron.dll;     exe=.exe ;;
   *)                   lib=librustc_codegen_pliron.so;    exe= ;;
 esac
-BE="-Zcodegen-backend=$PWD/target/debug/$lib"
+BE="-Zcodegen-backend=$PWD/target/$PROF/$lib"
+# The stanza scripts under tests/ take the dylib from these.
+[[ "$PROF" == debug ]] || export BACKEND="$PWD/target/$PROF/$lib" PLIRON_BACKEND="$PWD/target/$PROF/$lib"
 # Extra rustc flags for every stanza (experiments, e.g. -Zmir-move-elimination).
 BE="$BE ${PLIRON_TEST_RUSTFLAGS:-}"
 if [[ "$(uname -s)" == Linux ]] && command -v wild >/dev/null; then
@@ -185,6 +193,82 @@ t_coldcopy() {
   diff <($out/coldcopy-stock$exe) <($out/coldcopy$exe)
 }
 
+t_fastcc() {
+  # PLIRON_FASTCC (aarch64): a direct call to a function compiled in the same
+  # object clobbers only what that function's code writes. Callers keep
+  # sixteen values live across calls to a leaf, a chain, recursion, fn
+  # pointers and `dyn`, std, multi-register and stack returns, and a callee
+  # whose cold path panics (caught above the narrowed call); the output
+  # matches stock rustc's with one and with several codegen units, and with
+  # the noreturn-path rule off. On aarch64 the caller of the leaf must come
+  # out shorter than with PLIRON_FASTCC=0, and no function may write a
+  # register outside its recorded set (harness/fastcc_check.py).
+  rustc --edition 2021 -O tests/fastcc/main.rs -o $out/fastcc-stock$exe || return 1
+  local v i=0
+  for v in "PLIRON_FASTCC=1 CGU=1" "PLIRON_FASTCC=1 CGU=4" "PLIRON_FASTCC=1 PLIRON_FASTCC_NORET=0 CGU=1" "PLIRON_FASTCC=1 PLIRON_FASTCC_HIDDEN=0 CGU=4"; do
+    i=$((i + 1))
+    env ${v% CGU=*} rustc $BE --edition 2021 -O -C codegen-units=${v##*CGU=} tests/fastcc/main.rs -o $out/fastcc$i$exe || return 1
+    [[ -n "$exe" ]] && continue
+    diff <($out/fastcc-stock$exe) <($out/fastcc$i$exe) || { echo "fastcc: output differs ($v)" >&2; return 1; }
+  done
+  case "$(rustc -vV | sed -n 's/host: //p')" in aarch64-*) ;; *) return 0 ;; esac
+  PLIRON_FASTCC=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/fastcc/main.rs -o $out/fastcc-off.o || return 1
+  PLIRON_FASTCC=1 PLIRON_FASTCC_NORET=0 PLIRON_TRACE=pliron::fastcc=debug rustc $BE --edition 2021 -O -C codegen-units=1 \
+    --emit=obj tests/fastcc/main.rs -o $out/fastcc-on.o 2> $out/fastcc-on.log || return 1
+  local n0 n1
+  n0=$("$llvmod" -d --no-show-raw-insn $out/fastcc-off.o | awk '/across_leaf>:$/{f=1;next} /^$/{f=0} f' | wc -l)
+  n1=$("$llvmod" -d --no-show-raw-insn $out/fastcc-on.o | awk '/across_leaf>:$/{f=1;next} /^$/{f=0} f' | wc -l)
+  (( n0 > 0 && n1 < n0 )) || { echo "fastcc: across_leaf $n0 -> $n1 instructions, nothing narrowed" >&2; return 1; }
+  harness/fastcc_check.py $out/fastcc-on.log $out/fastcc-on.o
+}
+
+t_neonpair() {
+  # NEON pairwise ops (`vpmaxq_u8` ...) and lane narrowing (`vshrn_n_u16`,
+  # `vmovn_*`) are lowered inline on aarch64 (PLIRON_NEON_PAIRWISE,
+  # PLIRON_VTRUNC_UZP): the program checks every op against a scalar model
+  # and its output matches stock rustc's, with the lowerings on and off; with
+  # them on no call to a `__pliron_llvm_aarch64_neon_*` stub is left.
+  case "$(rustc -vV | sed -n 's/host: //p')" in aarch64-*) ;; *) return 0 ;; esac
+  rustc --edition 2021 -O tests/neonpair/main.rs -o $out/neonpair-stock$exe || return 1
+  PLIRON_VTRUNC_UZP=1 rustc $BE --edition 2021 -O tests/neonpair/main.rs -o $out/neonpair$exe || return 1
+  PLIRON_NEON_PAIRWISE=0 PLIRON_VTRUNC_UZP=0 rustc $BE --edition 2021 -O tests/neonpair/main.rs -o $out/neonpair-off$exe || return 1
+  diff <($out/neonpair-stock$exe) <($out/neonpair$exe) || { echo "neonpair: output differs" >&2; return 1; }
+  diff <($out/neonpair-stock$exe) <($out/neonpair-off$exe) || { echo "neonpair: output differs (lowerings off)" >&2; return 1; }
+  if $out/neonpair$exe | grep -qv "mismatches 0 "; then echo "neonpair: differs from the scalar model" >&2; return 1; fi
+  local n
+  n=$("$llvmod" -d --no-show-raw-insn $out/neonpair$exe | grep -c 'bl.*__pliron_llvm_aarch64_neon' || true)
+  (( n == 0 )) || { echo "neonpair: $n stub calls left" >&2; return 1; }
+}
+
+t_scopedna() {
+  # PLIRON_SCOPED_NOALIAS=1 (opt-in): an inlined callee's `&mut` param is a
+  # second name for the caller's memory inside the inlined body. A `&self`
+  # method inlined into a `&mut self` loop that grows the same Vec, an
+  # in-place collect, callee stores read back by the caller and the
+  # reverse: output matches stock rustc's, with rustc's MIR inliner and
+  # with ours doing all the inlining (-Zinline-mir=no, where the first
+  # version that let the fact reach the passes printed garbage).
+  rustc --edition 2021 -O tests/scopedna/main.rs -o $out/scopedna-stock$exe || return 1
+  local f i=0
+  for f in "" "-Zinline-mir=no"; do
+    i=$((i + 1))
+    PLIRON_SCOPED_NOALIAS=1 rustc $BE --edition 2021 -O $f -C codegen-units=1 tests/scopedna/main.rs -o $out/scopedna$i$exe || return 1
+    [[ -n "$exe" ]] && continue
+    diff <($out/scopedna-stock$exe) <($out/scopedna$i$exe) || { echo "scopedna: output differs ($f)" >&2; return 1; }
+  done
+  # Keeping a clone-entry arg as a name of its own must not hide a constant
+  # from the IR passes (tests/scopedna/hold.rs): `append_text` is the same
+  # size with the knob off and on (it was 90 against 173 instructions).
+  [[ -x "$llvmod" ]] || return 0
+  local n0 n1 k
+  for k in 0 1; do
+    PLIRON_SCOPED_NOALIAS=$k rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/scopedna/hold.rs -o $out/scopedna-hold$k.o || return 1
+  done
+  n0=$("$llvmod" -d --no-show-raw-insn $out/scopedna-hold0.o | awk '/append_text>:$/{f=1;next} /^$/{f=0} f' | wc -l)
+  n1=$("$llvmod" -d --no-show-raw-insn $out/scopedna-hold1.o | awk '/append_text>:$/{f=1;next} /^$/{f=0} f' | wc -l)
+  (( n0 > 0 && n1 <= n0 )) || { echo "scopedna: append_text is $n0 instructions without the knob, $n1 with it" >&2; return 1; }
+}
+
 t_bcheck() {
   # bcheck may only fold a bound check whose unsafe edge dies — a cold
   # not-found exit is cold yet live; folding the scan loop's own bound test
@@ -220,6 +304,23 @@ t_slotmerge() {
         echo "slotmerge: dispatch frame is $((frame))B (expected <1024)" >&2; exit 1
     fi
   fi
+}
+
+# r[verify front.ir.lifetime]
+t_o0std() {
+  # std's generic code at opt-level 0: optimized MIR from std's metadata
+  # (inlined, storage markers kept) through the opt-level-0 pipeline. A
+  # start marker anchored on a `stack_addr` the egraph moved made slotmerge
+  # reuse a live slot (`HashSet::symmetric_difference` gave {4} for
+  # {1,2,3} ^ {2,3,4}). The gate reruns this under PLIRON_SM_POISON
+  # (`poison:o0std`), which fails on a wrong interval whether or not a
+  # merge reuses the bytes.
+  rustc --edition 2021 -Copt-level=0 tests/o0std/main.rs -o $out/o0std-stock$exe || return 1
+  $out/o0std-stock$exe > $out/o0std-stock.out || return 1
+  for o in 0 1; do
+    rustc $BE --edition 2021 -Copt-level=$o tests/o0std/main.rs -o $out/o0std$o$exe || return 1
+    diff $out/o0std-stock.out <($out/o0std$o$exe) || { echo "o0std: output differs from stock rustc's (opt-level $o)" >&2; return 1; }
+  done
 }
 
 t_bittab() {
@@ -313,10 +414,16 @@ t_slotpromlt() {
   # the same store-backs, so both are measured against a baseline without
   # it, and it must shrink the code on its own too. `bump_hoist` and
   # `edgesel` already delete these moves pre-regalloc, so the comparison
-  # pins them off to keep measuring what RA2_XBLOCK contributes.
-  PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
-  PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=1 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
-  PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl4.o
+  # pins them off to keep measuring what RA2_XBLOCK contributes; so does
+  # `MEMFAST_SMALL` (default `loop` since 2026-11-13), which inlines the
+  # short copies whose calls these moves surrounded, and `LICM_DOMCOND`
+  # (default on since 2026-11-13), which lets LICM promote the fields
+  # those reloads fetched (1546 -> 1500 instructions on its own), and
+  # `LF_TRIVPHI` (default on since 2026-11-13), which no longer creates
+  # the single-value block params whose edge moves these were.
+  PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl0.o
+  PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=1 PLIRON_SPILLCSE=0 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl3.o
+  PLIRON_LF_TRIVPHI=0 PLIRON_LICM_DOMCOND=0 PLIRON_MEMFAST_SMALL=0 PLIRON_BUMPHOIST=0 PLIRON_EDGESEL=0 PLIRON_RA2_XBLOCK=0 PLIRON_SPILLCSE=1 rustc $BE --edition 2021 -O -C codegen-units=1 --emit=obj tests/slotprom_lt/main.rs -o $out/spl4.o
   local z0 z3 z4
   if [[ -x "$llvmod" ]]; then
     z0=$("$llvmod" -d --no-show-raw-insn $out/spl0.o | grep -E '^ *[0-9a-f]+:' | grep -vcw nop)
@@ -1100,7 +1207,7 @@ t_pgo() {
   if command -v node > /dev/null 2>&1 && command -v cargo > /dev/null 2>&1; then
     # Keyed on the backend: cargo doesn't track the dylib, so a reused
     # dir would keep core from an older backend.
-    local wdir=$PWD/$out/wasm-pgo-$(cksum < target/debug/$lib | cut -d' ' -f1)
+    local wdir=$PWD/$out/wasm-pgo-$(cksum < target/$PROF/$lib | cut -d' ' -f1)
     mkdir -p "$wdir" && touch "$wdir"
     # Prune only keys idle for an hour: a concurrent run may own a younger one.
     find "$PWD/$out" -mindepth 1 -maxdepth 1 -type d -name 'wasm-pgo*' -mmin +60 \
@@ -1112,7 +1219,7 @@ t_pgo() {
     case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) wroot=$(cygpath -m "$wroot") ;; esac
     cargo build -q --release --manifest-path tools/pliron-wasm-ld/Cargo.toml &&
     (cd tests/wasm &&
-      RUSTFLAGS="-Zcodegen-backend=$wroot/target/debug/$lib -Clinker=$wroot/tools/pliron-wasm-ld/target/release/pliron-wasm-ld$exe" \
+      RUSTFLAGS="-Zcodegen-backend=$wroot/target/$PROF/$lib -Clinker=$wroot/tools/pliron-wasm-ld/target/release/pliron-wasm-ld$exe" \
         CARGO_TARGET_DIR=$wdir PLIRON_PGO=1 \
         cargo build -q --release --target wasm32-unknown-unknown \
         -Zbuild-std=core,compiler_builtins \
@@ -1246,9 +1353,13 @@ want icmpfold && t_icmpfold
 want rangefold && t_rangefold
 want coldargs && t_coldargs
 want coldcopy && t_coldcopy
+want fastcc && t_fastcc
+want scopedna && t_scopedna
+want neonpair && t_neonpair
 want bcheck && t_bcheck
 want unswitch && t_unswitch
 want slotmerge && t_slotmerge
+want o0std && t_o0std
 want bittab && t_bittab
 want polsw && t_polsw
 want tailrec && t_tailrec

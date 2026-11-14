@@ -2454,6 +2454,67 @@ pub fn brif_not(func: &mut Function, inst: Inst) -> bool {
     true
 }
 
+/// `brif c, T(targs), E(eargs)` where T and E each hold only a `return`
+/// whose operands — substituted through each arm's block params with its
+/// edge args — are pairwise identical: both edges compute the same
+/// result, so the branch collapses to `jump`. Catches the emulated-EH
+/// `eh_check` shape `brif flag, return, return` where an early-exit arm
+/// and the normal path are the same `return`, freeing the TLS chain +
+/// flag load feeding the condition. `PLIRON_COMMONRET`.
+pub fn brif_commondest(func: &mut Function, inst: Inst) -> bool {
+    let InstructionData::Brif { blocks, .. } = func.dfg.insts[inst] else {
+        return false;
+    };
+    let mut rets: [Vec<Value>; 2] = [Vec::new(), Vec::new()];
+    for k in 0..2 {
+        let b = blocks[k].block(&func.dfg.value_lists);
+        let mut args = Vec::new();
+        for a in blocks[k].args(&func.dfg.value_lists) {
+            let BlockArg::Value(v) = a else { return false };
+            args.push(v);
+        }
+        let insts: Vec<Inst> = func.layout.block_insts(b).collect();
+        if insts.len() != 1 || func.dfg.insts[insts[0]].opcode() != Opcode::Return {
+            return false;
+        }
+        let params = func.dfg.block_params(b);
+        for &a in func.dfg.inst_args(insts[0]) {
+            let a = func.dfg.resolve_aliases(a);
+            let v = params
+                .iter()
+                .position(|&p| p == a)
+                .map(|i| args[i])
+                .unwrap_or(a);
+            rets[k].push(func.dfg.resolve_aliases(v));
+        }
+    }
+    if rets[0] != rets[1] {
+        return false;
+    }
+    // Jump to the warmer arm.
+    let (t, e) = (
+        blocks[0].block(&func.dfg.value_lists),
+        blocks[1].block(&func.dfg.value_lists),
+    );
+    let pick = if func.layout.is_cold(t) && !func.layout.is_cold(e) {
+        1
+    } else {
+        0
+    };
+    let mut args = Vec::new();
+    for a in blocks[pick].args(&func.dfg.value_lists) {
+        let BlockArg::Value(v) = a else { return false };
+        args.push(BlockArg::Value(v));
+    }
+    let b = if pick == 0 { t } else { e };
+    let bc = BlockCall::new(b, args, &mut func.dfg.value_lists);
+    func.dfg.insts[inst] = InstructionData::Jump {
+        opcode: Opcode::Jump,
+        destination: bc,
+    };
+    true
+}
+
 /// `brif c, T(.., select c', t, e, ..), E(..)` — an edge arg built on a
 /// condition the `un_not` chain equates with the branch's own is decided
 /// per edge: `c'` is known-true on the taken arm's edge, known-false on
@@ -2592,10 +2653,15 @@ pub fn brif_fold(func: &mut Function) -> usize {
     let mut n = 0;
     let argspec = crate::pass_enabled("PLIRON_ARGSPEC");
     let brifnot = crate::pass_enabled("PLIRON_BRIFNOT");
+    let commonret = crate::env_is("PLIRON_COMMONRET", "1");
     let mut pos = FuncCursor::new(func);
     while pos.next_block().is_some() {
         while let Some(inst) = pos.next_inst() {
             if pos.func.dfg.insts[inst].opcode() != Opcode::Brif {
+                continue;
+            }
+            if commonret && brif_commondest(pos.func, inst) {
+                n += 1;
                 continue;
             }
             if argspec {
@@ -3626,6 +3692,7 @@ pub fn sameargs(func: &mut Function) -> (usize, FxHashMap<Value, Value>) {
     // (cfg/dom/edges) is round-invariant, so it is built once here
     // rather than per call.
     let mut wctx = WmCtx::new(func);
+    wctx.keep_count = pliron_cfg::pass_enabled("PLIRON_WM_KEEPCOUNT");
     // A round's merges rebind only values inside the merged blocks'
     // dominated regions — the next round's scan is confined to those
     // regions plus their out-edge targets (`merge_dirty`).
@@ -4106,6 +4173,11 @@ pub struct WmCtx {
     cfg: cranelift_codegen::flowgraph::ControlFlowGraph,
     dom: cranelift_codegen::dominator_tree::DominatorTree,
     edges: FxHashMap<Block, Vec<(Inst, usize)>>,
+    /// In a pointer/counter pair that step in lockstep, drop the
+    /// pointer (`webmerge_ctx`'s candidate order). Set by `sameargs`,
+    /// which runs after the loop transforms; `cparm` runs before them
+    /// and keeps the pointer walk `bytescan`/`punroll` match.
+    pub keep_count: bool,
 }
 
 impl WmCtx {
@@ -4127,7 +4199,7 @@ impl WmCtx {
                 }
             }
         }
-        WmCtx { cfg, dom, edges }
+        WmCtx { cfg, dom, edges, keep_count: false }
     }
 
     /// Rebuild in place after structural edits — `compute` keeps the
@@ -4159,7 +4231,7 @@ impl WmCtx {
 /// only fires between keys sharing a subtree.
 fn subtree_hashes(
     k: &crate::proots::Key,
-    hm: &mut FxHashMap<*const crate::proots::Key, u64>,
+    hm: &mut crate::proots::KHash,
     seen: &mut FxHashSet<*const crate::proots::Key>,
     out: &mut FxHashSet<u64>,
 ) {
@@ -4262,7 +4334,9 @@ pub fn webmerge_ctx(
     let wmprof = pliron_cfg::tracing_on()
         && tracing::enabled!(target: "pliron::clifpeep", tracing::Level::INFO);
     let t0 = wmprof.then(std::time::Instant::now);
-    let WmCtx { cfg, dom, edges } = ctx;
+    let WmCtx { cfg, dom, edges, keep_count } = ctx;
+    let keep_count = *keep_count;
+    let wide = crate::pass_enabled("PLIRON_WM_WIDE");
     // One edge-fact scan feeds both the web normal forms and the
     // canonical-class proots — nothing mutates between them.
     let facts = crate::proots::facts_cfg(func, cfg);
@@ -4327,6 +4401,17 @@ pub fn webmerge_ctx(
         }
         let ps = func.dfg.block_params(b).to_vec();
         if ps.is_empty() {
+            tpre_sum += el(tb0);
+            continue;
+        }
+        // An unreachable block has no entry edge: on a dead self-loop
+        // `b(p): v = band p, K; jump b(v)` the only edge's key mentions
+        // `p` itself, the slot looks uniform, and materializing it at
+        // the head defines `p' = band p', K` — an instruction that uses
+        // its own result (cranelift-codegen `Vec::extend_trusted`: a
+        // later `mask01` then left a use of a removed definition).
+        // Dominance, which `mat_ok` leans on, means nothing there.
+        if !dom.is_reachable(b) {
             tpre_sum += el(tb0);
             continue;
         }
@@ -4493,7 +4578,7 @@ pub fn webmerge_ctx(
         // per-node key hashes (`Rc` sharing → O(1) amortized). Built
         // lazily: an `E×P` hash table is a real cost on megablocks and
         // `paramize` is its only consumer.
-        let hmemo: FxHashMap<*const Key, u64> = FxHashMap::default();
+        let hmemo = crate::proots::KHash::default();
         let hmaps: std::cell::OnceCell<Vec<FxHashMap<u64, u32>>> = std::cell::OnceCell::new();
         // Each cell carries the key's hash alongside — the scan
         // compares keys `O(slots × edges)` times and a failed
@@ -5052,6 +5137,68 @@ pub fn webmerge_ctx(
                     )
                 };
             }
+        }
+        // A pointer and a counter that step in lockstep each explain the
+        // other (`p = c + base`, `c = p - base`); the cycle check below
+        // lets the first of such a pair survive and drops the second.
+        // Keep the counter: a slot some edge seeds with a constant goes
+        // first. `base + c` folds into the load's address mode,
+        // `cmpcancel` turns the exit test into `c + 1 != len`, and the
+        // count is ready at every exit — LLVM's shape for
+        // `iter().take_while(..).count()` (pulldown-cmark's `scan_ch`,
+        // `tests/parity/closing.rs`). Retiring the counter instead left
+        // `p - base` to compute for each exit and a cursor copy at
+        // entry: three more instructions per run of a loop that
+        // typically makes one or two trips. Only in `sameargs`
+        // (`PLIRON_WM_KEEPCOUNT=0` off): the early `cparm` rounds keep
+        // the pointer, which `bytescan` and `punroll` read (escape's
+        // `position` over a byte table lost its 16-byte scan otherwise:
+        // pulldown-cmark +4% instructions).
+        // A slot that is a narrower sibling extended (`p_j = uextend
+        // p_i`) is kept, and the narrow one becomes `ireduce p_j`
+        // (`PLIRON_WM_WIDE=0` off). Both hold: the reduction of an
+        // extension is the value. Dropping the wide slot leaves an
+        // extension at the head of the block — of a block param, which
+        // the backend cannot know to be extended already, so a `mov w,
+        // w` on every entry; `ireduce` is no instruction. regex's
+        // `follow_epsilons` carries its instruction pointer as `u32`
+        // and indexes with it: once the loop had one latch
+        // (`PLIRON_LOOPROT_MERGE`), the header received both forms from
+        // it, kept the `u32`, and re-extended it on each of 439k trips.
+        if wide {
+            for c in 0..cands.len() {
+                let (j, i) = match &cands[c].1 {
+                    crate::proots::Key::N(Opcode::Uextend | Opcode::Sextend, _, args, _) => match &args[..] {
+                        [crate::proots::Key::P(i)] => (cands[c].0, *i as usize),
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                let (ti, tj) = (func.dfg.value_type(ps[i]), func.dfg.value_type(ps[j]));
+                if i == j
+                    || !ti.is_int()
+                    || !tj.is_int()
+                    || ti.bits() >= tj.bits()
+                    || pmap.contains_key(&ps[i])
+                    || cands.iter().any(|&(x, _)| x == i)
+                {
+                    continue;
+                }
+                cands[c] = (
+                    i,
+                    crate::proots::Key::N(
+                        Opcode::Ireduce,
+                        ti,
+                        std::rc::Rc::from(vec![crate::proots::Key::P(j as u32)]),
+                        crate::proots::tag::UNARY,
+                    ),
+                );
+            }
+        }
+        if keep_count && cands.len() > 1 {
+            cands.sort_by_key(|&(ix, _)| {
+                !(0..es.len()).any(|e| matches!(skey_of(e, ix), crate::proots::Key::K(..)))
+            });
         }
         for &(ix, ref rk) in &cands {
             pend.insert(ix, rk.clone());
@@ -5632,8 +5779,12 @@ pub fn mask01(func: &mut Function) -> usize {
             // The mask is a no-op when `cover` proves every set bit of `x`
             // is already in `m` (value bound is not enough: 7 <= 8 but
             // `7 & 8 != 7`); `is01` covers the non-const bit-cover case.
-            if cover(func, x, 4) & !m == 0 || (m == 1 && is01(func, x, 4)) {
-                hits.push((i, res, func.dfg.resolve_aliases(x)));
+            // `x == res` is dead code that uses its own result (an
+            // unreachable self-loop another pass rebound): leave it, an
+            // alias to itself would orphan every use of `res`.
+            let x = func.dfg.resolve_aliases(x);
+            if x != res && (cover(func, x, 4) & !m == 0 || (m == 1 && is01(func, x, 4))) {
+                hits.push((i, res, x));
             }
         }
     }
@@ -12029,9 +12180,13 @@ mod tests {
         cur.ins().jump(a, &[pb.into()]);
 
         sameargs(&mut func);
-        assert_eq!(
-            func.dfg.block_params(a).len() + func.dfg.block_params(b).len(),
-            1,
+        // The two blocks only reach each other, so they are unreachable,
+        // and `webmerge` now leaves unreachable blocks alone
+        // (`webmerge_skips_unreachable_self_loop`): both params stay.
+        // What this test still pins is that nothing is detached under
+        // its uses.
+        assert!(
+            (1..=2).contains(&(func.dfg.block_params(a).len() + func.dfg.block_params(b).len())),
             "{}",
             func.display()
         );
@@ -12748,6 +12903,54 @@ mod tests {
         let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
         if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
             panic!("webmerge produced invalid IR: {e}\n{}", func.display());
+        }
+    }
+
+    /// A dead self-loop `dead(p): v = band p, K; jump dead(v)`: the only
+    /// edge into `dead` passes a value computed from `p`, so the slot is
+    /// "uniform" and its key mentions `p`. Materializing it at the head
+    /// made `p' = band p', K` (cranelift-codegen `Vec::extend_trusted`
+    /// under self-hosting; `mask01` then removed the definition and left
+    /// its uses). Unreachable blocks are left alone.
+    #[test]
+    fn webmerge_skips_unreachable_self_loop() {
+        let mut sig = Signature::new(CallConv::Fast);
+        sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let entry = func.dfg.make_block();
+        let dead = func.dfg.make_block();
+        for blk in [entry, dead] {
+            func.layout.append_block(blk);
+        }
+        let x = func.dfg.append_block_param(entry, types::I64);
+        let p = func.dfg.append_block_param(dead, types::I64);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(entry);
+        cur.ins().return_(&[x]);
+        let mut cur = FuncCursor::new(&mut func).at_bottom(dead);
+        let k = cur.ins().iconst(types::I64, -4294967296);
+        let v = cur.ins().band(p, k);
+        cur.ins().jump(dead, &[v.into()]);
+
+        sameargs(&mut func);
+        for b in func.layout.blocks() {
+            for i in func.layout.block_insts(b) {
+                let res = func.dfg.inst_results(i);
+                for a in func.dfg.inst_values(i) {
+                    let a = func.dfg.resolve_aliases(a);
+                    assert!(
+                        !res.contains(&a),
+                        "{} uses its own result\n{}",
+                        func.dfg.display_inst(i),
+                        func.display()
+                    );
+                }
+            }
+        }
+        assert_eq!(mask01(&mut func), 0);
+        let flags = cranelift_codegen::settings::Flags::new(cranelift_codegen::settings::builder());
+        if let Err(e) = cranelift_codegen::verify_function(&func, &flags) {
+            panic!("invalid IR: {e}\n{}", func.display());
         }
     }
 

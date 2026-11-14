@@ -67,16 +67,125 @@ pub(crate) fn freqsplit_on() -> bool {
     false
 }
 
-/// PLIRON: `PLIRON_RA2_LOOPSPLIT=1` (opt-in): split a bundle at the
-/// boundaries of the loop around its conflict (see `process_bundle`).
+/// PLIRON: `PLIRON_RA2_LOOPSPLIT` (default 16): split a bundle at the
+/// boundaries of the small loop around its hottest use (see
+/// `process_bundle`).
 pub(crate) fn loopsplit_on() -> bool {
+    loopsplit_max() > 0
+}
+
+/// PLIRON: `PLIRON_RA2_LOOPSPLIT=<n>`: 0 off, 1 any cycle, larger
+/// values the biggest cycle (in instructions) a bundle is isolated to. A
+/// piece that keeps its register across a 300-instruction loop for one
+/// cold use starves the values that loop really runs on; across an
+/// 8-instruction scan loop it is the whole point.
+pub(crate) fn loopsplit_max() -> usize {
     #[cfg(feature = "std")]
     {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("PLIRON_RA2_LOOPSPLIT").as_deref() == Ok("1"))
+        static ON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| match std::env::var("PLIRON_RA2_LOOPSPLIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+            Some(1) => usize::MAX,
+            Some(n) => n,
+            // Default 16 (2026-11-13): pulldown-cmark -1.9% instructions,
+            // the other seven held-out programs within 0.3%; 40 and
+            // above cost rust-protobuf and rust-compression up to 1%.
+            None => 16,
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    0
+}
+
+/// PLIRON: `PLIRON_RA2_COLDSPLIT=1` (opt-in): carve the cold blocks whose
+/// call clobbers block a caller-saved register out of a hot bundle (see
+/// `Env::try_cold_split` in `ion/process.rs`).
+pub(crate) fn coldsplit_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        coldsplit_mode() != 0
     }
     #[cfg(not(feature = "std"))]
     false
+}
+
+/// PLIRON: `PLIRON_RA2_COLDSPLIT=<mode>`: 0/unset off, 1 both triggers
+/// of `Env::try_cold_split`, 2 only the callee-saved trigger, 3 only the
+/// no-register trigger (2 and 3 are for taking the effect apart).
+pub(crate) fn coldsplit_mode() -> u8 {
+    #[cfg(feature = "std")]
+    {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            std::env::var("PLIRON_RA2_COLDSPLIT")
+                .ok()
+                .and_then(|v| v.parse::<u8>().ok())
+                .filter(|m| *m <= 3)
+                .unwrap_or(0)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    0
+}
+
+/// PLIRON: `PLIRON_RA2_COLDSPLIT_RATIO=<K>` (default 16, at least 2): a
+/// block is cold for a bundle when its frequency (`CFGInfo::hot_bonus`)
+/// is at most `1/K` of the hottest block the bundle has a use or def in.
+pub(crate) fn coldsplit_ratio() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *K.get_or_init(|| {
+            std::env::var("PLIRON_RA2_COLDSPLIT_RATIO")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|k| k.is_finite())
+                .map_or(16.0, |k| k.max(2.0))
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    16.0
+}
+
+/// PLIRON: `PLIRON_RA2_COLDSPLIT_BIAS=<f>` (default 1.0): multiplier on
+/// the cold split's cost when it is compared with the cost of opening a
+/// callee-saved register (see `Env::try_cold_split`); below 1 splits
+/// more, above 1 less.
+pub(crate) fn coldsplit_bias() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        static B: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *B.get_or_init(|| {
+            std::env::var("PLIRON_RA2_COLDSPLIT_BIAS")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|b| b.is_finite() && *b >= 0.0)
+                .unwrap_or(1.0)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    1.0
+}
+
+/// PLIRON: `PLIRON_RA2_COLDSPLIT_COLDDIV=<d>` (default 64, at least 1):
+/// for the cold split, a block the frontend marked cold
+/// (`Function::block_is_cold`) counts at `1/d` of its block frequency.
+/// The static frequencies give a cold-marked arm 1/33 of its
+/// predecessor (a layout weight), which inside a loop is still about
+/// twice the entry block's frequency.
+pub(crate) fn coldsplit_colddiv() -> f32 {
+    #[cfg(feature = "std")]
+    {
+        static D: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+        *D.get_or_init(|| {
+            std::env::var("PLIRON_RA2_COLDSPLIT_COLDDIV")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|d| d.is_finite())
+                .map_or(64.0, |d| d.max(1.0))
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    64.0
 }
 
 /// PLIRON: `PLIRON_RA2_NOPINMERGE` (default on, `=0` off): refuse
@@ -95,6 +204,64 @@ pub(crate) fn nopinmerge_on() -> bool {
     }
     #[cfg(not(feature = "std"))]
     true
+}
+
+/// PLIRON (`PLIRON_RA2_POSTOPT=<bits>`, default 0): post-allocation
+/// spill-traffic cleanup, see `ion/postopt.rs`. 1 = redundant reloads,
+/// 2 = reloads served from another register, 4 = redundant spill stores,
+/// 8 = dead spill stores.
+pub(crate) fn postopt_bits() -> u32 {
+    #[cfg(feature = "std")]
+    {
+        static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *BITS.get_or_init(|| {
+            std::env::var("PLIRON_RA2_POSTOPT").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    0
+}
+
+/// PLIRON (`PLIRON_RA2_SRCVREG=1`, default off): a block-parameter move's
+/// `edit_vregs` entry names the branch argument's vreg instead of the
+/// parameter's. See `ion/moves.rs`.
+pub(crate) fn srcvreg_on() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_SRCVREG").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+/// PLIRON (`PLIRON_RA2_POSTOPT_STATS=1`): one `ra2post:` line on stderr
+/// per function the post-pass changed.
+pub(crate) fn postopt_stats() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("PLIRON_RA2_POSTOPT_STATS").as_deref() == Ok("1"))
+    }
+    #[cfg(not(feature = "std"))]
+    false
+}
+
+/// PLIRON (`PLIRON_RA2_REHOME`, default `2`; `0` off, `1` loop latches
+/// only, `2` every join block): after allocation, a value live through a
+/// block that only joins paths takes the register it has on the cheaper
+/// side of the block's edges, when that register is free there. See
+/// `ion/rehome.rs`.
+pub(crate) fn rehome_mode() -> u8 {
+    #[cfg(feature = "std")]
+    {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| {
+            std::env::var("PLIRON_RA2_REHOME").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    2
 }
 
 /// PLIRON (`PLIRON_RA2_SLOTPAIR`, default on, `=0` off): repack
@@ -1427,6 +1594,14 @@ pub trait Function {
     /// estimate for the block.
     fn block_hotness(&self, _block: Block) -> Option<f32> {
         None
+    }
+
+    /// PLIRON: did the frontend mark this block cold (a panic path, a
+    /// call of a `#[cold]` function, the unlikely arm of a hint, a block
+    /// the profile never saw)? `PLIRON_RA2_COLDSPLIT` divides such a
+    /// block's frequency by `PLIRON_RA2_COLDSPLIT_COLDDIV`.
+    fn block_is_cold(&self, _block: Block) -> bool {
+        false
     }
 
     // --------------

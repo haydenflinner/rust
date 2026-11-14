@@ -49,6 +49,7 @@ pub fn run_with(
     // path that never runs hot.
     let cold = pliron_cfg::env_is("PLIRON_LOOPROT_COLD", "1");
     let reducible = crate::jumpthread::keep_reducible();
+    let merge = pliron_cfg::env_is("PLIRON_LOOPROT_MERGE", "1");
     let mut n = 0;
     let blocks: Vec<Block> = func.layout.blocks().collect();
     for h in blocks {
@@ -65,6 +66,9 @@ pub fn run_with(
         let Some((t, s1, s2)) = rotatable_pre(func, h) else {
             continue;
         };
+        if merge && merge_latches(func, an, h) {
+            an.invalidate(func);
+        }
         let ok = {
             let (cfg, domtree) = an.cfg_dt(func);
             rotatable(func, cfg, domtree, h, t, s1, s2)
@@ -108,6 +112,101 @@ pub fn run_with(
         }
     }
     n
+}
+
+/// Give a loop with several back edges one latch (LLVM's loop-simplify
+/// does the same): a fresh block takes every back edge and jumps to
+/// the header (`PLIRON_LOOPROT_MERGE=1`, opt-in).
+///
+/// Shape: a header that only tests the exit, and a body that reaches
+/// it from several places — a `match` whose arms each `continue`:
+///
+/// ```text
+/// h(p):  brif p == end, exit, body
+/// arm1:  ... jump h(p + 8)
+/// arm2:  ... jump h(p + 8)
+/// ```
+///
+/// Rotation wants one latch to copy the test into and refused these,
+/// so every trip ended in `b h` and ran the top test: regex's
+/// `Fsm::exec_byte` walks the current NFA states that way
+/// (`dfa.rs:959`, `tests/parity/prog_loop.rs`: 16 instructions for an
+/// instruction that is skipped, 12 in LLVM's rotated loop). With one
+/// latch the rotated test sits there once.
+///
+/// Opt-in: exact counts are mixed (2026-11-13, second round:
+/// rust-html-rewriter -0.39M, rust-json -0.17M, rust-protobuf -0.03M,
+/// but pulldown-cmark +0.78M, regex +0.25M, blind-sig +0.29M). The two
+/// effects first blamed are fixed and the repro runs 11 instructions
+/// for a skipped state: the end pointer stays ahead of the loop
+/// (`PLIRON_ELABKEEP`, vendored elaborator) and the cursor is stepped
+/// next to its load (`bumpedge`); `webmerge` no longer re-extends a
+/// `u32` loop variable in the header (`PLIRON_WM_WIDE`, regex's
+/// `follow_epsilons` +0.44M). What is left is the allocator: values
+/// live through the merged latch get a different register in it than
+/// in the body, and the back edge becomes a rotation
+/// (pulldown-cmark's `scanners::unescape`: `mov x23, x28; mov x25,
+/// x22; mov x1, x19; mov x22, x25; mov x28, x23` every trip, +17%).
+/// `PLIRON_RA2_XBLOCK=1` does not remove the pairs.
+///
+/// Only when every back edge is a `jump`, or one arm of a `brif`, at
+/// the end of its block with plain value arguments. Returns whether
+/// the CFG changed.
+fn merge_latches(func: &mut Function, an: &mut crate::pipeline::Analysis, h: Block) -> bool {
+    let latches: Vec<(Block, Inst)> = {
+        let (cfg, domtree) = an.cfg_dt(func);
+        if !domtree.is_reachable(h) {
+            return false;
+        }
+        cfg.pred_iter(h)
+            .filter(|p| domtree.block_dominates(h, p.block))
+            .map(|p| (p.block, p.inst))
+            .collect()
+    };
+    if latches.len() < 2 || latches.len() > 16 {
+        return false;
+    }
+    let pool = &func.dfg.value_lists;
+    for &(b, i) in &latches {
+        if func.layout.last_inst(b) != Some(i) {
+            return false;
+        }
+        let arms: Vec<&BlockCall> = match &func.dfg.insts[i] {
+            InstructionData::Jump { destination, .. } => vec![destination],
+            InstructionData::Brif { blocks, .. } => blocks.iter().filter(|bc| bc.block(pool) == h).collect(),
+            _ => return false,
+        };
+        if arms.len() != 1 || arms[0].args(pool).any(|a| !matches!(a, BlockArg::Value(_))) {
+            return false;
+        }
+    }
+    if !pliron_cfg::bisect("looprot") {
+        return false;
+    }
+    let l = func.dfg.make_block();
+    // After the last latch in layout order, so the loop stays contiguous.
+    let last = func
+        .layout
+        .blocks()
+        .filter(|b| latches.iter().any(|(lb, _)| lb == b))
+        .last()
+        .unwrap();
+    func.layout.insert_block_after(l, last);
+    let tys: Vec<_> = func.dfg.block_params(h).iter().map(|&p| func.dfg.value_type(p)).collect();
+    let lp: Vec<BlockArg> = tys.iter().map(|&ty| BlockArg::Value(func.dfg.append_block_param(l, ty))).collect();
+    for &(_, i) in &latches {
+        let dfg = &mut func.dfg;
+        for bc in dfg.insts[i].branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables) {
+            if bc.block(&dfg.value_lists) == h {
+                let args: Vec<BlockArg> = bc.args(&dfg.value_lists).collect();
+                *bc = BlockCall::new(l, args.into_iter(), &mut dfg.value_lists);
+            }
+        }
+    }
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::InstBuilder;
+    FuncCursor::new(func).at_bottom(l).ins().jump(h, &lp);
+    true
 }
 
 /// Header instructions whose results are used only by the latch's

@@ -604,6 +604,16 @@ struct FnJob {
     dump: bool,
     /// `st.dead_unopt` member: minimal (`Gate::Always`) pipeline.
     unopt: bool,
+    /// `PLIRON_FASTCC` second phase (`fastcc_compile`): `run_job` only
+    /// compiles the parked CLIF, with these callee sets installed.
+    fcc: Option<FccJob>,
+}
+
+/// One function's `PLIRON_FASTCC` compile: in, the clobber sets of its
+/// direct callees; out, the registers its own code may write.
+struct FccJob {
+    callees: Vec<((u32, u32), cranelift_codegen::PlironRegSet)>,
+    written: Option<cranelift_codegen::PlironRegSet>,
 }
 
 impl FnJob {
@@ -676,6 +686,7 @@ impl FnJob {
             code: None,
             dump: false,
             unopt: true,
+            fcc: None,
         }
     }
 }
@@ -724,6 +735,9 @@ struct JobShared {
     shed: bool,
     /// See `Pipe::const_tables`.
     const_tables: FxHashMap<u32, Arc<[u8]>>,
+    /// `PLIRON_FASTCC=1`: `run_job` stops after the CLIF pipeline; the
+    /// Cranelift compile runs callee-first in [`fastcc_compile`].
+    fastcc: bool,
 }
 
 /// One queued function job: the declaration index (phase (C) re-orders
@@ -930,6 +944,26 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         c.push_str(&j.name);
     });
     clctx.func = std::mem::replace(&mut j.func, ir::Function::new());
+    if let Some(mut fcc) = j.fcc.take() {
+        // `PLIRON_FASTCC` second phase: the pipeline already ran. The
+        // callee table is thread state of the vendored Cranelift, set
+        // only around this one compile; the guard clears it if the
+        // compile panics, so a stale table never meets another CGU's
+        // function ids.
+        struct End;
+        impl Drop for End {
+            fn drop(&mut self) {
+                let _ = cranelift_codegen::pliron_fastcc_end();
+            }
+        }
+        cranelift_codegen::pliron_fastcc_begin(std::mem::take(&mut fcc.callees));
+        let end = End;
+        compile_job(j, clctx, sh);
+        std::mem::forget(end);
+        fcc.written = cranelift_codegen::pliron_fastcc_end();
+        j.fcc = Some(fcc);
+        return;
+    }
     let n = j.name.as_str();
     if j.dump {
         if pliron_cfg::tracing_on() {
@@ -1038,6 +1072,18 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         }
         break 'retry;
     }
+    // PGO: hand the blocks' profile counts to the backend (placement
+    // and spill-weight frequencies read them under `PLIRON_PGO_FREQ=1`).
+    // Blocks the CLIF passes created carry none; the estimator falls back
+    // to its static rules around them.
+    if !j.prof.is_empty() {
+        for (&b, &c) in &j.prof {
+            if clctx.func.layout.is_block_inserted(b) {
+                clctx.func.layout.set_prof_count(b, c);
+            }
+        }
+        prof_infer(&mut clctx.func);
+    }
     drop(_spipe);
     // `*pipeline*`/`*compile*` pseudo-steps in `timing` split the
     // per-function total for the tier-1 cache sizing question.
@@ -1067,6 +1113,25 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         }
         return;
     }
+    if sh.fastcc {
+        // `PLIRON_FASTCC`: park the optimized CLIF; `fastcc_compile`
+        // compiles it once its callees' clobber sets are known. Only the
+        // CLIF waits: the lowering facts were the pipeline's inputs.
+        j.func = std::mem::replace(&mut clctx.func, ir::Function::new());
+        clctx.clear();
+        if sh.shed {
+            j.shed_facts();
+        }
+        return;
+    }
+    compile_job(j, clctx, sh);
+}
+
+/// The Cranelift half of [`run_job`]: compile `clctx.func` (the job's
+/// optimized CLIF) and store the code in `j`.
+fn compile_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared) {
+    let n = j.name.as_str();
+    let tron = pliron_cfg::tracing_on();
     // Panics inside Cranelift (verifier, egraph, regalloc asserts)
     // bypass the Err path below — catch and rethrow so the message
     // carries the function name and final CLIF for reproduction.
@@ -1112,6 +1177,24 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
         let msg = match &defr {
             Ok(Err(e)) => format!("{e}"),
             Ok(_) => {
+                // `PLIRON_LAYOUT_STATS`: name the function whose `layout:`
+                // line the emitter just printed (pair them up under
+                // `PLIRON_PAR=0`).
+                if crate::env_set("PLIRON_LAYOUT_STATS") {
+                    eprintln!("layoutfn: {n}");
+                }
+                // `PLIRON_REMARKS`: the frame's regions, so a tool can tell
+                // regalloc spill traffic from explicit-slot traffic by
+                // `[sp, #off]` (bench/heldout/asmvs.py).
+                if pliron_cfg::remarks_on()
+                    && let Some([e, j, br, bl, fl, bj, bb]) = cranelift_codegen::pliron_last_layout()
+                {
+                    pliron_cfg::remark!("layout", n, "order"; "entries={e:.0} jumps={j:.0} branches={br:.0} blocks={bl:.0} floor={fl:.0} backjumps={bj:.0} backbranches={bb:.0}");
+                }
+                if pliron_cfg::remarks_on() {
+                    let [slots, spills, clobber, out, fixed] = cranelift_codegen::pliron_last_frame();
+                    pliron_cfg::remark!("frame", n, "layout"; "slots={slots} spills={spills} clobber={clobber} outgoing={out} fixed={fixed}");
+                }
                 // `PLIRON_FRAME_INFO=<symbol substring>`: where the frame
                 // goes (stack slots, spills, callee saves, outgoing args).
                 if let Some(f) = crate::env_get("PLIRON_FRAME_INFO")
@@ -1203,6 +1286,354 @@ fn run_job(j: &mut FnJob, clctx: &mut cranelift_codegen::Context, sh: &JobShared
     // func — drop them like `clear_context` did so the next job's
     // compile doesn't verify against a stale cfg.
     clctx.clear();
+}
+
+/// `PLIRON_FASTCC=1`: a private calling convention for local functions,
+/// as per-callee clobber sets (interprocedural register allocation).
+///
+/// Rust's ABI is unspecified, so a direct call that can only reach one
+/// body compiled in this object need not assume the platform's whole
+/// caller-saved set destroyed — only what that body (and everything it
+/// calls) really writes before it returns. Phase (B) ran only the CLIF
+/// pipeline (`JobShared::fastcc`); this is the second phase:
+///
+/// 1. Build the direct call graph of the CGU from the final CLIF
+///    (`call`/`try_call` to a function with a job here).
+/// 2. Find its strongly connected components (Tarjan; roots and
+///    successors in declaration order).
+/// 3. Compile callees first: a component starts when every component it
+///    calls is done, and whatever is ready runs in parallel on the fn
+///    pool (`FnJob::fcc`, `run_job`). After each compile take the set
+///    of registers the machine code may write
+///    (`cranelift_codegen::pliron_fastcc_end`, computed from the regalloc
+///    result in `VCode::pliron_written_regs`) and *record* it if the
+///    function is in `ok` (a local or hidden strong definition, not
+///    variadic) and not part of a cycle (recursion gets no reduced set).
+/// 4. Each compile has the recorded sets of the function's direct callees
+///    installed (`pliron_fastcc_begin`); the aarch64 call lowering
+///    *consumes* them, intersecting a plain direct `call`'s ABI clobber
+///    set with the callee's set (never for `try_call`).
+///
+/// Soundness: the caller's assumption only shrinks to a superset of what
+/// the bound body destroys on a path that returns. A callee without a
+/// recorded set (other CGU, import, cycle member, tail-calling body)
+/// keeps the full ABI set, and a recorded set already contains the
+/// clobbers of every call its body makes, so the property is transitive.
+/// What a function is given depends only on the call graph, so the
+/// output does not depend on scheduling.
+///
+/// `PLIRON_TRACE=pliron::fastcc` prints one `fastcc-sites` line per CGU
+/// (what happened to every direct call site), `=debug` one `fastcc-site`
+/// line per site.
+fn fastcc_compile(jobs: Vec<FnJob>, ok: &FxHashSet<u32>, name: &str, nthreads: usize) -> Vec<FnJob> {
+    let t0 = std::time::Instant::now();
+    let n = jobs.len();
+    let idx: FxHashMap<u32, usize> =
+        jobs.iter().enumerate().map(|(i, j)| (j.id.as_u32(), i)).collect();
+    // Direct callees with a job in this CGU, per job, sorted and deduped.
+    let succ: Vec<Vec<usize>> = jobs
+        .iter()
+        .map(|j| {
+            let f = &j.func;
+            let mut out: Vec<usize> = Vec::new();
+            for b in f.layout.blocks() {
+                for inst in f.layout.block_insts(b) {
+                    let fr = match f.dfg.insts[inst] {
+                        ir::InstructionData::Call { func_ref, .. }
+                        | ir::InstructionData::TryCall { func_ref, .. } => func_ref,
+                        _ => continue,
+                    };
+                    let ir::ExternalName::User(nr) = f.dfg.ext_funcs[fr].name else {
+                        continue;
+                    };
+                    let Some(un) = f.params.user_named_funcs().get(nr) else {
+                        continue;
+                    };
+                    if un.namespace == 0
+                        && let Some(&c) = idx.get(&un.index)
+                    {
+                        out.push(c);
+                    }
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        })
+        .collect();
+    // Iterative Tarjan: SCCs come out callee-first.
+    const UNSEEN: usize = usize::MAX;
+    let mut num = vec![UNSEEN; n];
+    let mut low = vec![0usize; n];
+    let mut on = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut sccs: Vec<Vec<usize>> = Vec::new();
+    let mut next = 0usize;
+    for root in 0..n {
+        if num[root] != UNSEEN {
+            continue;
+        }
+        let mut work: Vec<(usize, usize)> = vec![(root, 0)];
+        num[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on[root] = true;
+        while let Some(&mut (v, ref mut k)) = work.last_mut() {
+            if let Some(&w) = succ[v].get(*k) {
+                *k += 1;
+                if num[w] == UNSEEN {
+                    num[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on[w] = true;
+                    work.push((w, 0));
+                } else if on[w] {
+                    low[v] = low[v].min(num[w]);
+                }
+            } else {
+                work.pop();
+                if let Some(&(p, _)) = work.last() {
+                    low[p] = low[p].min(low[v]);
+                }
+                if low[v] == num[v] {
+                    let mut scc = Vec::new();
+                    loop {
+                        let w = stack.pop().unwrap();
+                        on[w] = false;
+                        scc.push(w);
+                        if w == v {
+                            break;
+                        }
+                    }
+                    scc.sort_unstable();
+                    sccs.push(scc);
+                }
+            }
+        }
+    }
+    let mut sets: FxHashMap<u32, cranelift_codegen::PlironRegSet> = FxHashMap::default();
+    // `PLIRON_TRACE=pliron::fastcc`: what happened to every direct call
+    // site of the CGU (one line per CGU, summed by a script).
+    let stats_on = pliron_cfg::tracing_on() && tracing::enabled!(target: "pliron::fastcc", tracing::Level::INFO);
+    // [plain calls, callee outside the CGU, callee not eligible (linkage,
+    //  variadic), eligible without a set (cycle, tail call), set == whole
+    //  ABI set, narrowed, caller-saved registers left alone at narrowed
+    //  sites, try_calls to a callee with a useful set]
+    let mut site = [0u64; 8];
+    // Caller-saved registers of the AAPCS64 a set leaves alone: x0-x15
+    // and v0-v31 (x16/x17 are always added back at the call).
+    let free = |s: &cranelift_codegen::PlironRegSet| -> u64 {
+        (0..16).filter(|&e| !s.contains_enc(e, false)).count() as u64
+            + (0..32).filter(|&e| !s.contains_enc(e, true)).count() as u64
+    };
+    // A component is ready once every component it calls is compiled, so
+    // every set a function can consume is recorded before it starts.
+    // Ready functions go to the fn pool as their callees' results come
+    // back (members of one cycle together: they get no set from each
+    // other); what a function is given depends only on the call graph,
+    // not on the order results arrive in.
+    let mut scc_of = vec![0usize; n];
+    for (k, scc) in sccs.iter().enumerate() {
+        for &i in scc {
+            scc_of[i] = k;
+        }
+    }
+    let mut cyclic = vec![false; n];
+    // Components this one waits for, and the components waiting for it.
+    let mut need = vec![0usize; sccs.len()];
+    let mut waiters: Vec<Vec<usize>> = vec![Vec::new(); sccs.len()];
+    let mut left: Vec<usize> = sccs.iter().map(|s| s.len()).collect();
+    for (k, scc) in sccs.iter().enumerate() {
+        let cyc = scc.len() > 1 || succ[scc[0]].contains(&scc[0]);
+        let mut deps: Vec<usize> = Vec::new();
+        for &i in scc {
+            cyclic[i] = cyc;
+            deps.extend(succ[i].iter().map(|&c| scc_of[c]).filter(|&d| d != k));
+        }
+        deps.sort_unstable();
+        deps.dedup();
+        need[k] = deps.len();
+        for d in deps {
+            waiters[d].push(k);
+        }
+    }
+    let ids: Vec<u32> = jobs.iter().map(|j| j.id.as_u32()).collect();
+    let mut slots: Vec<Option<FnJob>> = jobs.into_iter().map(Some).collect();
+    let mut wcl = cranelift_codegen::Context::new();
+    let serial = nthreads <= 1;
+    let (dtx, drx) = std::sync::mpsc::channel::<(usize, std::thread::Result<FnJob>)>();
+    let pool = (!serial).then(fn_pool);
+    // Components whose callees are all compiled, not yet started.
+    let mut ready: Vec<usize> = (0..sccs.len()).filter(|&k| need[k] == 0).collect();
+    ready.reverse();
+    let mut done = 0usize;
+    let mut out = 0usize;
+    while done < n {
+        // Start everything that is ready.
+        while let Some(k) = ready.pop() {
+            for &i in &sccs[k] {
+            if stats_on {
+                let f = &slots[i].as_ref().unwrap().func;
+                let sites_on = tracing::enabled!(target: "pliron::fastcc", tracing::Level::DEBUG);
+                for b in f.layout.blocks() {
+                    for inst in f.layout.block_insts(b) {
+                        let (fr, tc) = match f.dfg.insts[inst] {
+                            ir::InstructionData::Call { func_ref, .. } => (func_ref, false),
+                            ir::InstructionData::TryCall { func_ref, .. } => (func_ref, true),
+                            ir::InstructionData::CallIndirect { .. }
+                            | ir::InstructionData::TryCallIndirect { .. } => {
+                                if sites_on {
+                                    tracing::debug!(target: "pliron::fastcc", "fastcc-site\t{}\t*\tindirect", slots[i].as_ref().unwrap().name);
+                                }
+                                continue;
+                            }
+                            _ => continue,
+                        };
+                        let un = match f.dfg.ext_funcs[fr].name {
+                            ir::ExternalName::User(nr) => {
+                                f.params.user_named_funcs().get(nr).filter(|un| un.namespace == 0)
+                            }
+                            _ => None,
+                        };
+                        let callee = un.and_then(|un| idx.get(&un.index).map(|_| un.index));
+                        let set = callee.and_then(|id| sets.get(&id));
+                        let class = match (tc, callee, set) {
+                            (true, _, Some(s)) if free(s) > 0 => {
+                                site[7] += 1;
+                                "trycall"
+                            }
+                            (true, ..) => "trycall-other",
+                            (false, None, _) => {
+                                site[1] += 1;
+                                "extern"
+                            }
+                            (false, Some(id), None) if !ok.contains(&id) => {
+                                site[2] += 1;
+                                "ineligible"
+                            }
+                            (false, Some(_), None) => {
+                                site[3] += 1;
+                                "noset"
+                            }
+                            (false, Some(_), Some(s)) => {
+                                let n = free(s);
+                                if n == 0 {
+                                    site[4] += 1;
+                                    "full"
+                                } else {
+                                    site[5] += 1;
+                                    site[6] += n;
+                                    "narrowed"
+                                }
+                            }
+                        };
+                        if !tc {
+                            site[0] += 1;
+                        }
+                        if sites_on {
+                            let cn = un
+                                .and_then(|un| slots[i].as_ref().unwrap().sh.fn_names.get(un.index as usize))
+                                .map_or("?", |s| s.as_str());
+                            tracing::debug!(target: "pliron::fastcc", "fastcc-site\t{}\t{cn}\t{class}", slots[i].as_ref().unwrap().name);
+                        }
+                    }
+                }
+            }
+                let callees: Vec<((u32, u32), cranelift_codegen::PlironRegSet)> = succ[i]
+                    .iter()
+                    .filter_map(|&c| sets.get(&ids[c]).map(|&s| ((0, ids[c]), s)))
+                    .collect();
+                let mut j = slots[i].take().unwrap();
+                j.fcc = Some(FccJob { callees, written: None });
+                match pool {
+                    Some(pool) => fn_pool_push(pool, GMsg { i, j, done: dtx.clone() }),
+                    None => {
+                        let sh = j.sh.clone();
+                        run_job(&mut j, &mut wcl, &sh);
+                        let _ = dtx.send((i, Ok(j)));
+                    }
+                }
+                out += 1;
+            }
+        }
+        assert!(out > done, "fastcc: call graph components left with nothing running");
+        // One result — or, while none is waiting, one queued job of any
+        // CGU (the same work-while-you-wait as `finish_jobs`).
+        let r = match drx.try_recv() {
+            Ok(r) => Some(r),
+            Err(_) => match pool.and_then(fn_pool_pop) {
+                Some(GMsg { i, mut j, done: d }) => {
+                    let sh = j.sh.clone();
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_job(&mut j, &mut wcl, &sh);
+                        j
+                    }));
+                    let _ = d.send((i, r));
+                    None
+                }
+                None => {
+                    if cgu_steal() {
+                        None
+                    } else {
+                        Some(drx.recv().unwrap_or_else(|e| panic!("fn pool disconnected: {e}")))
+                    }
+                }
+            },
+        };
+        let (i, mut j) = match r {
+            Some((i, Ok(j))) => (i, j),
+            Some((_, Err(p))) => std::panic::resume_unwind(p),
+            None => continue,
+        };
+        let written = j.fcc.take().and_then(|f| f.written);
+        if let Some(w) = written
+            && !cyclic[i]
+            && j.code.is_some()
+            && ok.contains(&ids[i])
+        {
+            if pliron_cfg::tracing_on()
+                && tracing::enabled!(target: "pliron::fastcc", tracing::Level::DEBUG)
+            {
+                // Bit n: x<n> / v<n> (`harness/fastcc_check.py`).
+                let mask = |float: bool| (0..32).fold(0u32, |m, e| m | (u32::from(w.contains_enc(e, float)) << e));
+                tracing::debug!(target: "pliron::fastcc", "fastcc-set\t{}\t{:x}\t{:x}", j.name, mask(false), mask(true));
+            }
+            sets.insert(ids[i], w);
+        }
+        slots[i] = Some(j);
+        done += 1;
+        let k = scc_of[i];
+        left[k] -= 1;
+        if left[k] == 0 {
+            // Smallest index first, whatever order the results came in.
+            let mut woke: Vec<usize> = Vec::new();
+            for &w in &waiters[k] {
+                need[w] -= 1;
+                if need[w] == 0 {
+                    woke.push(w);
+                }
+            }
+            woke.sort_unstable_by(|a, b| b.cmp(a));
+            ready.extend(woke);
+        }
+    }
+    drop(dtx);
+    let jobs: Vec<FnJob> = slots.into_iter().map(|j| j.unwrap()).collect();
+    if pliron_cfg::tracing_on() {
+        let useful = sets.values().filter(|s| free(s) > 0).count();
+        tracing::info!(target: "pliron::fastcc", "{name}: {} of {n} fns have a clobber set, {} sccs", sets.len(), sccs.len());
+        tracing::info!(
+            target: "pliron::fastcc",
+            "fastcc-sites {name}: fns={n} eligible={} sets={} useful={useful} calls={} extern={} ineligible={} noset={} full={} narrowed={} freed={} trycall={}",
+            jobs.iter().filter(|j| ok.contains(&j.id.as_u32())).count(),
+            sets.len(),
+            site[0], site[1], site[2], site[3], site[4], site[5], site[6], site[7]
+        );
+    }
+    pliron_cfg::trace("*fastcc*", t0.elapsed().as_secs_f64() * 1e3, name);
+    jobs
 }
 
 /// Phase (B) over the jobs `produce` lowers (each emitted with its
@@ -1607,6 +2038,45 @@ pub fn lower_module<'a>(
     // `PLIRON_LOWERFREE`: everything below phase (A) that reads `ctx` or a
     // job's CLIF body is `-g`-only.
     let free_ctx = lowerfree() && st.dbg.is_none();
+    // `PLIRON_FASTCC` (aarch64, default on via `DEFAULT_ON`; `=0` off):
+    // per-callee clobber sets, see [`fastcc_compile`]. Off under hot
+    // reload (calls go through patchable thunks) and in instrumented PGO
+    // builds.
+    let fastcc = crate::env_is("PLIRON_FASTCC", "1")
+        && matches!(isa.triple().architecture, target_lexicon::Architecture::Aarch64(_))
+        // Validated on Mach-O and ELF only.
+        && isa.triple().operating_system != target_lexicon::OperatingSystem::Windows
+        && !hot
+        && !crate::env_set("PLIRON_HOT")
+        && !crate::env_set("PLIRON_PGO");
+    // Callees that may get a reduced set: a direct call in this object
+    // can only bind to the body compiled here. That is internal linkage,
+    // and a strong hidden definition (`Linkage::Hidden`: a function
+    // shared between this crate's CGUs; the symbol cannot be interposed
+    // and is never reached through a PLT resolver —
+    // `PLIRON_FASTCC_HIDDEN=0` leaves these out). Not `Export` (an ELF
+    // dylib may bind it lazily through the PLT, whose resolver preserves
+    // only the argument registers) and not `Preemptible`. Not variadic.
+    // Whether the address is taken does not matter: only direct calls
+    // consume a set and the callee's own code is unchanged.
+    let fastcc_ok: FxHashSet<u32> = if fastcc {
+        let hidden = !crate::env_is("PLIRON_FASTCC_HIDDEN", "0");
+        st.funcs
+            .iter()
+            .filter(|(n, f)| {
+                (f.linkage == Linkage::Local || (hidden && f.linkage == Linkage::Hidden))
+                    && has_body(ctx, f.op)
+                    && !matches!(classify(ctx, f.ty), TyK::Func(_, _, true))
+                    && !st.dead_fns.contains(n.as_str())
+            })
+            .filter_map(|(n, _)| match ids.get(n.as_str()) {
+                Some(Sym::F(id, _)) => Some(id.as_u32()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        FxHashSet::default()
+    };
     // Read-only job inputs, owned so `FnJob`s are `'static` and can ride
     // the process-wide pool.
     let shared = Arc::new(JobShared {
@@ -1626,6 +2096,7 @@ pub fn lower_module<'a>(
         wasm: false,
         shed: free_ctx,
         const_tables: const_tables(ctx, st, &ids),
+        fastcc,
     });
     // `PLIRON_DEFERDEAD` (`=0` disables): emit-only `xcgu` copies (`dead_unopt`: no
     // caller `direct_callee` or `address_taken` can see) lower last, and
@@ -1741,6 +2212,7 @@ pub fn lower_module<'a>(
                     ltundef: crate::env_is("PLIRON_LTUNDEF", "1"),
                     ltzero: FxHashSet::default(),
                     ltloops: FxHashSet::default(),
+                cycles: FxHashSet::default(),
                     ltdom: None,
                     dbg_slots: Default::default(),
                 };
@@ -1883,6 +2355,7 @@ pub fn lower_module<'a>(
                     code: None,
                     dump: crate::env_get("PLIRON_CLIF").is_some_and(|f| n.contains(f)),
                     unopt: st.dead_unopt.contains(n),
+                    fcc: None,
                 },
             );
             m.clear_context(&mut clctx);
@@ -1968,7 +2441,11 @@ pub fn lower_module<'a>(
             tracing::info!(target: "pliron::stats", "lowerfree {name}: pliron Context released after phase (A)");
         }
     }
-    let jobs = finish_jobs(pending, name, None);
+    let mut jobs = finish_jobs(pending, name, None);
+    if fastcc {
+        jobs = fastcc_compile(jobs, &fastcc_ok, name, nthreads);
+    }
+    let jobs = jobs;
     let tpc = std::time::Instant::now();
     // Phase (C): apply compiled code to the object in the original
     // function order — identical to what `define_function` did after
@@ -1985,19 +2462,52 @@ pub fn lower_module<'a>(
     // code of a CGU sits together in the text section (ld64 and the ELF
     // linkers keep an object's function order). Placement otherwise
     // follows declaration order, which mixes hot loops with cold paths.
+    // `PLIRON_FNORDER=pgo` (opt-in): same idea with measured hotness —
+    // functions sort by descending profiled entry count (BOLT's
+    // reordering, at the granularity codegen controls).
     let mut emit: Vec<usize> = (0..jobs.len()).collect();
-    if crate::env_is("PLIRON_FNORDER", "1") {
-        let class = |j: &FnJob| -> u8 {
-            if st.funcs.get(j.name.as_str()).is_some_and(|f| f.cold) {
-                2
-            } else if has_back_edge(&j.func) {
-                0
-            } else {
-                1
-            }
-        };
-        let keys: Vec<u8> = jobs.iter().map(class).collect();
-        emit.sort_by_key(|&i| keys[i]);
+    match crate::env_get("PLIRON_FNORDER") {
+        Some("pgo") => {
+            let keys: Vec<_> = jobs
+                .iter()
+                .map(|j| crate::pgo::fnorder_key(st, j.name.as_str()))
+                .collect();
+            emit.sort_by_key(|&i| keys[i]);
+        }
+        Some("1") => {
+            let class = |j: &FnJob| -> u8 {
+                if st.funcs.get(j.name.as_str()).is_some_and(|f| f.cold) {
+                    2
+                } else if has_back_edge(&j.func) {
+                    0
+                } else {
+                    1
+                }
+            };
+            let keys: Vec<u8> = jobs.iter().map(class).collect();
+            emit.sort_by_key(|&i| keys[i]);
+        }
+        _ => {}
+    }
+    // `PLIRON_FNORDER_FILE=<path>`: append `sym<TAB>entry_count` for
+    // each emitted function. `pliron-prof fnorder` merges the files
+    // from every object into a linker order file (`ld64 -order_file`,
+    // `lld --symbol-ordering-file`) — whole-binary hot-first layout,
+    // which per-object ordering alone can't reach.
+    if let Some(path) = crate::env_get("PLIRON_FNORDER_FILE") {
+        use std::io::Write;
+        let mut buf = String::new();
+        for &i in &emit {
+            let j = &jobs[i];
+            let (_, std::cmp::Reverse(c)) = crate::pgo::fnorder_key(st, j.name.as_str());
+            buf.push_str(&j.name);
+            buf.push('\t');
+            buf.push_str(&c.to_string());
+            buf.push('\n');
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+            let _ = f.write_all(buf.as_bytes());
+        }
     }
     for j in emit.iter().map(|&i| &jobs[i]) {
         stats.merge(&j.stats);
@@ -2180,7 +2690,11 @@ pub fn lower_module<'a>(
         verbatim_syms,
         custom_secs,
         asm_stubs,
-        hot_asm,
+        hot_asm: crate::hot::thunks_wrap(
+            &hot_asm,
+            macho,
+            isa.triple().architecture == target_lexicon::Architecture::X86_64,
+        ),
         dbg_fns,
     }
 }
@@ -2734,6 +3248,7 @@ pub fn lower_clif_wasm(
         wasm: true,
         shed: free_ctx,
         const_tables: FxHashMap::default(),
+        fastcc: false,
     });
     let mut scratch = FlScratch::default();
     let mut produce = |emit: &mut dyn FnMut(usize, FnJob)| {
@@ -2815,6 +3330,7 @@ pub fn lower_clif_wasm(
                 ltundef: crate::env_is("PLIRON_LTUNDEF", "1"),
                 ltzero: FxHashSet::default(),
                 ltloops: FxHashSet::default(),
+                cycles: FxHashSet::default(),
                 ltdom: None,
                 dbg_slots: Default::default(),
             };
@@ -2902,6 +3418,7 @@ pub fn lower_clif_wasm(
                 code: None,
                 dump: crate::env_get("PLIRON_CLIF").is_some_and(|s| n.contains(&s)),
                 unopt: st.dead_unopt.contains(n),
+                fcc: None,
             },
         );
         m.clear_context(&mut clctx);
@@ -3172,15 +3689,16 @@ fn atomic_stub_asm(name: &str, macho: bool) -> String {
     }
 }
 
-/// Immutable, relocation-free data objects of 16..=4096 bytes, by `DataId`
-/// index (see `Pipe::const_tables`).
+/// Immutable, relocation-free data objects of 2..=4096 bytes, by `DataId`
+/// index (see `Pipe::const_tables`). (From 2 bytes, not 16, since
+/// `memcmpk` reads short literals: `starts_with(b"\xFF\xFE")`.)
 fn const_tables(ctx: &Context, st: &State, ids: &FxHashMap<String, Sym>) -> FxHashMap<u32, Arc<[u8]>> {
     let mut out = FxHashMap::default();
     for (n, g) in st.globals.iter() {
         let (Some(init), false, false) = (g.init, g.mutable, g.tls) else { continue };
         let Some(Sym::D(id, _)) = ids.get(n).copied() else { continue };
         let (size, _) = size_align(ctx, init.get_type(ctx));
-        if !(16..=4096).contains(&size) {
+        if !(2..=4096).contains(&size) {
             continue;
         }
         let mut bytes = vec![0u8; size as usize];
@@ -3273,6 +3791,30 @@ fn va_tramp_ind_asm(reg: &str, macho: bool) -> String {
             ".att_syntax\n.section .text.{t},\"ax\",@progbits\n.weak {t}\n.hidden {t}\n.type {t},@function\n{t}:\nmov $8, %eax\njmp *%{reg}\n.size {t}, .-{t}\n.text\n"
         )
     }
+}
+
+/// May a lifetime marker's anchor step back over `i`? Yes for what touches
+/// no memory and can be moved by a later pass: everything
+/// `inst_predicates::is_pure_for_egraph` (private upstream) lets the egraph
+/// re-place, i.e. side-effect-free non-loads and read-only loads.
+fn marker_can_step_over(func: &ir::Function, i: ir::Inst) -> bool {
+    let op = func.dfg.insts[i].opcode();
+    if op.can_load() {
+        return match func.dfg.insts[i] {
+            ir::InstructionData::Load { opcode: ir::Opcode::Load, flags, .. } => {
+                let f = func.dfg.mem_flags[flags];
+                f.readonly() && f.notrap() && f.can_move()
+            }
+            _ => false,
+        };
+    }
+    !(op.is_call()
+        || op.is_branch()
+        || op.is_terminator()
+        || op.is_return()
+        || op.can_trap()
+        || op.other_side_effects()
+        || op.can_store())
 }
 
 // r[impl clif.lower.leaves]
@@ -3393,6 +3935,9 @@ struct FnLower<'a, 'b> {
     ltundef: bool,
     /// The blocks where `ltundef` emits its zeros (`lt_loop_blocks`).
     ltloops: FxHashSet<Ptr<BasicBlock>>,
+    /// `PLIRON_MEMFAST_SMALL=loop`: the blocks on a CFG cycle
+    /// (`cycle_blocks`); empty unless that mode is on.
+    cycles: FxHashSet<Ptr<BasicBlock>>,
     /// The zeros `ltundef` emits at markers. They are skipped when a later
     /// marker picks its anchor: a zero no read uses dies in the pipeline,
     /// and a marker anchored on a dead inst falls back to its whole block,
@@ -3520,7 +4065,22 @@ impl<'a, 'b> FnLower<'a, 'b> {
                                 )
                             };
                         }
-                        self.noalias.insert(v);
+                        // `PLIRON_SCOPED_NOALIAS=1`: a param that is not also
+                        // `readonly` is written through, and the memory it
+                        // points at has a second name, the caller's. As a
+                        // `noalias` root it would be a distinct object to
+                        // every pass (licm hoisted a load of the caller's
+                        // name past the callee's store). It is a scoped
+                        // name only: loadfwd makes it a dual-named root
+                        // (`loadfwd::ScopedNa`), nobody else sees a root.
+                        let readonly = self
+                            .st
+                            .region_frozen
+                            .get(a)
+                            .is_some_and(|rs| rs.iter().any(|&(s, _, _)| s == sub));
+                        if readonly || !crate::env_is("PLIRON_SCOPED_NOALIAS", "1") {
+                            self.noalias.insert(v);
+                        }
                         self.scoped_na.insert(v);
                     }
                 }
@@ -3540,6 +4100,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     .collect();
                 self.vars.insert(a, vs);
             }
+        }
+        if matches!(pliron_cfg::pgo_knob("PLIRON_MEMFAST_SMALL", "hotloop").unwrap_or("loop"), "loop" | "hotloop") {
+            self.cycles = cycle_blocks(ctx, &pblocks);
         }
         if self.ltundef && !crate::env_is("PLIRON_LTUNDEF_ALL", "1") {
             self.ltloops = lt_loop_blocks(ctx, self.st, &pblocks, &self.vars);
@@ -3768,7 +4331,10 @@ impl<'a, 'b> FnLower<'a, 'b> {
     // r[impl wasm.eh.check]
     fn eh_check(&mut self, catch: Option<Ptr<BasicBlock>>) {
         let tls = self.eh_tls();
-        let f = self.b.ins().load(clt::I32, MemFlagsData::new(), tls, 0);
+        // `trusted` (notrap+aligned): the slot is an always-live global,
+        // and a check folded to a same-`return` branch (`commonret`)
+        // leaves the load dead — it must be removable.
+        let f = self.b.ins().load(clt::I32, MemFlagsData::trusted(), tls, 0);
         let cont = self.b.create_block();
         let bad = match catch {
             Some(pb) => self.blocks[&pb],
@@ -5190,6 +5756,55 @@ impl<'a, 'b> FnLower<'a, 'b> {
         self.b.ins().iconcat(lo, hi)
     }
 
+    /// `llvm.aarch64.neon.{umaxp,uminp,smaxp,sminp,addp}` on 128-bit
+    /// integer vectors, inline: the even and the odd lanes of `a ++ b`
+    /// (two `shuffle`s, `uzp1`/`uzp2` on aarch64) combined lane by lane.
+    /// As a call to its stub the op clobbered every caller-saved
+    /// register: memchr's search loop tests four compare results with
+    /// `vpmaxq_u8(x, x)`, and lol_html's `TagScanner::data_state` saved
+    /// eight registers and spilled four vectors around it on every call
+    /// (`tests/parity/umaxp.rs`). `PLIRON_NEON_PAIRWISE=0` keeps the call.
+    fn neon_pairwise(&mut self, sym: &str, args: &[ir::Value]) -> Option<ir::Value> {
+        let (opn, ty) = sym.strip_prefix("__pliron_llvm_aarch64_neon_")?.split_once('_')?;
+        let (lane_ty, lb) = match ty {
+            "v16i8" => (clt::I8X16, 1usize),
+            "v8i16" => (clt::I16X8, 2),
+            "v4i32" => (clt::I32X4, 4),
+            _ => return None,
+        };
+        if !matches!(opn, "umaxp" | "uminp" | "smaxp" | "sminp" | "addp")
+            || self.wasm
+            || pliron_cfg::env_is("PLIRON_NEON_PAIRWISE", "0")
+        {
+            return None;
+        }
+        let &[a, b] = args else { return None };
+        if self.b.func.dfg.value_type(a) != lane_ty || self.b.func.dfg.value_type(b) != lane_ty {
+            return None;
+        }
+        let mf = MemFlagsData::new().with_endianness(ir::Endianness::Little);
+        let bytes = |b: &mut FunctionBuilder, v: ir::Value| {
+            if lane_ty == clt::I8X16 { v } else { b.ins().bitcast(clt::I8X16, mf, v) }
+        };
+        let (a8, b8) = (bytes(&mut self.b, a), bytes(&mut self.b, b));
+        let mut half = |b: &mut FunctionBuilder, odd: usize| {
+            let mask: Vec<u8> = (0..16 / lb)
+                .flat_map(|j| (0..lb).map(move |k| ((2 * j + odd) * lb + k) as u8))
+                .collect();
+            let m = b.func.dfg.immediates.push(ir::ConstantData::from(&mask[..]));
+            let h = b.ins().shuffle(a8, b8, m);
+            if lane_ty == clt::I8X16 { h } else { b.ins().bitcast(lane_ty, mf, h) }
+        };
+        let (e, o) = (half(&mut self.b, 0), half(&mut self.b, 1));
+        Some(match opn {
+            "umaxp" => self.b.ins().umax(e, o),
+            "uminp" => self.b.ins().umin(e, o),
+            "smaxp" => self.b.ins().smax(e, o),
+            "sminp" => self.b.ins().smin(e, o),
+            _ => self.b.ins().iadd(e, o),
+        })
+    }
+
     fn set(&mut self, op: Ptr<Operation>, vals: Vals) {
         let r = op.deref(self.ctx).get_result(self.ctx, 0);
         self.vals.insert(r, vals);
@@ -6377,6 +6992,30 @@ impl<'a, 'b> FnLower<'a, 'b> {
             "pliron.vtrunc" => {
                 let st = self.b.func.dfg.value_type(a[0]);
                 let lane = st.lane_type();
+                // aarch64: the low half of every lane is one `uzp1` of the
+                // vector with itself (`vshrn_n_u16`'s narrow in memchr's
+                // match mask was `movi; and; sqxtun`).
+                // Opt-in (`PLIRON_VTRUNC_UZP=1`): on by default it fails
+                // the `simdshift` stanza ("movemask not vectorized"; a
+                // later match expects the mask-and-narrow form).
+                if st.bits() == 128
+                    && matches!(
+                        self.m.isa().triple().architecture,
+                        target_lexicon::Architecture::Aarch64(_)
+                    )
+                    && pliron_cfg::env_is("PLIRON_VTRUNC_UZP", "1")
+                {
+                    let mf = MemFlagsData::new().with_endianness(ir::Endianness::Little);
+                    let half = (lane.bits() / 16) as usize;
+                    let b8 = if st == clt::I8X16 { a[0] } else { self.b.ins().bitcast(clt::I8X16, mf, a[0]) };
+                    let mask: Vec<u8> =
+                        (0..16 / half).flat_map(|j| (0..half).map(move |k| (2 * j * half + k) as u8)).collect();
+                    let m = self.b.func.dfg.immediates.push(ir::ConstantData::from(&mask[..]));
+                    let n = self.b.ins().shuffle(b8, b8, m);
+                    let q = self.b.ins().bitcast(clt::I64X2, mf, n);
+                    let lo = self.b.ins().extractlane(q, 0);
+                    return self.b.ins().bitcast(rt, mf, lo);
+                }
                 let mask = (1u64 << (lane.bits() / 2)) - 1;
                 let k = self.b.ins().iconst(lane, mask as i64);
                 let m = self.b.ins().splat(st, k);
@@ -6714,6 +7353,20 @@ impl<'a, 'b> FnLower<'a, 'b> {
             }
             return;
         }
+        // NEON pairwise ops arrive as calls to one-instruction asm stubs
+        // (`asm.rs` `llvm_intrinsic_stub`); see `neon_pairwise`.
+        if let CallOpCallable::Direct(id) = call.callee(ctx)
+            && let Some(r) = self
+                .st
+                .ident_to_sym
+                .get(&id.to_string())
+                .filter(|s| s.starts_with("__pliron_llvm_aarch64_neon_"))
+                .cloned()
+                .and_then(|s| self.neon_pairwise(&s, &cargs))
+        {
+            self.set1(op, r);
+            return;
+        }
         // C variadic: fn_ty only has the fixed params. Foreign callees get the
         // real SysV ABI (extra args passed like ordinary arguments); callees
         // compiled by this backend get the args packed in a buffer whose
@@ -6871,6 +7524,9 @@ impl<'a, 'b> FnLower<'a, 'b> {
                 let sym = &self.st.ident_to_sym[&ident.to_string()].clone();
                 callee_sym = Some(sym.clone());
                 maythrow = !self.st.funcs.get(sym).is_some_and(|f| f.nounwind)
+                    // An emulated raise is a store to the `__pliron_eh` TLS
+                    // slot; a strict-nowrite callee can contain none.
+                    && self.st.nowrite.get(sym).copied() != Some(true)
                     && !(sym.starts_with("__pliron_asm_")
                         || sym.starts_with("__pliron_llvm_")
                         || sym.starts_with("__pliron_a64_"));
@@ -7185,7 +7841,16 @@ impl<'a, 'b> FnLower<'a, 'b> {
     /// Runtime-size copy: sizes in [k, 2k] (k = 16, or 8 without SIMD) are two
     /// overlapping k-byte moves, loads first so it is also a valid memmove; other
     /// sizes call libc. `PLIRON_MEMFAST=0` always calls libc.
-    fn small_copy_or_call(&mut self, memcpy: bool, dst: ir::Value, src: ir::Value, n: ir::Value) {
+    ///
+    /// `small` (`PLIRON_MEMFAST_SMALL`): sizes below `k` are inline too —
+    /// two overlapping 8- or 4-byte moves, or three byte moves for 1..3
+    /// (first, middle, last), nothing for 0. Short strings (`push_str` of
+    /// a tag, a word) never reach `[k, 2k]`, and the libc call costs more
+    /// than the copy: its own size dispatch, and every value live across
+    /// it pushed into a callee-saved register or a spill slot. LLVM gets
+    /// the same effect from value-profiling the size (`MemOPSizeOpt`,
+    /// -6% cycles on pulldown-cmark under its profile).
+    fn small_copy_or_call(&mut self, memcpy: bool, dst: ir::Value, src: ir::Value, n: ir::Value, small: bool) {
         let t = if crate::pass_enabled("PLIRON_SIMD") {
             clt::I8X16
         } else {
@@ -7202,7 +7867,53 @@ impl<'a, 'b> FnLower<'a, 'b> {
             .b
             .ins()
             .icmp_imm_u(IntCC::UnsignedLessThanOrEqual, m, k);
-        self.b.ins().brif(c, fast, &[], slow, &[]);
+        if small {
+            let f = if self.st.notrap { MemFlagsData::new().with_notrap() } else { MemFlagsData::new() };
+            let (tiny, big) = (self.b.create_block(), self.b.create_block());
+            self.b.ins().brif(c, fast, &[], tiny, &[]);
+            self.b.switch_to_block(tiny);
+            // Not in [k, 2k]: below k is ours, above 2k is libc's.
+            let lt = self.b.ins().icmp_imm_u(IntCC::UnsignedLessThan, n, k);
+            self.b.ins().brif(lt, big, &[], slow, &[]);
+            self.b.switch_to_block(big);
+            // Two overlapping `w`-byte moves cover [w, 2w).
+            let mut widths: Vec<(i64, ir::Type)> = Vec::new();
+            if k == 16 {
+                widths.push((8, clt::I64));
+            }
+            widths.push((4, clt::I32));
+            for (w, wt) in widths {
+                let (hit, miss) = (self.b.create_block(), self.b.create_block());
+                let ge = self.b.ins().icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, n, w);
+                self.b.ins().brif(ge, hit, &[], miss, &[]);
+                self.b.switch_to_block(hit);
+                let off = self.b.ins().iadd_imm_s(n, -w);
+                let (se, de) = (self.b.ins().iadd(src, off), self.b.ins().iadd(dst, off));
+                let v0 = self.b.ins().load(wt, f, src, 0);
+                let v1 = self.b.ins().load(wt, f, se, 0);
+                self.b.ins().store(f, v0, dst, 0);
+                self.b.ins().store(f, v1, de, 0);
+                self.b.ins().jump(done, &[]);
+                self.b.switch_to_block(miss);
+            }
+            // 0..3 bytes: first, middle and last byte cover 1, 2 and 3.
+            let some = self.b.create_block();
+            self.b.ins().brif(n, some, &[], done, &[]);
+            self.b.switch_to_block(some);
+            let half = self.b.ins().ushr_imm_u(n, 1);
+            let last = self.b.ins().iadd_imm_s(n, -1);
+            let (sm, dm) = (self.b.ins().iadd(src, half), self.b.ins().iadd(dst, half));
+            let (sl, dl) = (self.b.ins().iadd(src, last), self.b.ins().iadd(dst, last));
+            let b0 = self.b.ins().load(clt::I8, f, src, 0);
+            let b1 = self.b.ins().load(clt::I8, f, sm, 0);
+            let b2 = self.b.ins().load(clt::I8, f, sl, 0);
+            self.b.ins().store(f, b0, dst, 0);
+            self.b.ins().store(f, b1, dm, 0);
+            self.b.ins().store(f, b2, dl, 0);
+            self.b.ins().jump(done, &[]);
+        } else {
+            self.b.ins().brif(c, fast, &[], slow, &[]);
+        }
         self.b.switch_to_block(fast);
         let (se, de) = (self.b.ins().iadd(src, m), self.b.ins().iadd(dst, m));
         // Same UB-on-invalid rule as `plain_mf`: a copy to/from invalid
@@ -7635,7 +8346,24 @@ impl<'a, 'b> FnLower<'a, 'b> {
             // here would panic.
             if let Some(b) = self.b.current_block() {
                 let mut anchor = self.b.func.layout.last_inst(b);
-                while let Some(i) = anchor.filter(|i| self.ltzero.contains(i)) {
+                // The anchor has to stay where it is: an instruction the
+                // egraph treats as pure (a `stack_addr`, an `iadd`, a
+                // read-only load; `marker_can_step_over`) is taken out of
+                // the layout and put back at its first use, and the marker
+                // would move with it. A
+                // start marker whose anchor sank below the slot's first
+                // writes declared them dead (`HashSet::symmetric_difference`
+                // at opt-level 0: the entry block's markers were anchored
+                // on the last alloca's `stack_addr`, which sank to the call
+                // 28 instructions later, and slotmerge gave the live slot
+                // to another value). Pure instructions touch no memory, so
+                // stepping back over them leaves the marker at the same
+                // place among the slot's accesses. `PLIRON_LT_PINANCHOR=0`
+                // restores the old anchors.
+                let pin = crate::pass_enabled("PLIRON_LT_PINANCHOR");
+                while let Some(i) = anchor.filter(|&i| {
+                    self.ltzero.contains(&i) || (pin && marker_can_step_over(self.b.func, i))
+                }) {
                     anchor = self.b.func.layout.prev_inst(i);
                 }
                 let size = self.const_int(opnds[0]);
@@ -7727,7 +8455,49 @@ impl<'a, 'b> FnLower<'a, 'b> {
                     && !self.st.volatile.contains(op)
                     && self.b.func.dfg.value_type(a[2]) == clt::I64
                 {
-                    self.small_copy_or_call(name == "llvm.memcpy", a[0], a[1], a[2]);
+                    // `PLIRON_MEMFAST_SMALL=1`: every runtime-size copy;
+                    // `=hot`: only where the profile's count for this
+                    // block reaches its hot count.
+                    // Default without a profile: `loop` (2026-11-13: 0.980
+                    // time on the held-out programs for +0.5% code);
+                    // `=0` turns it off.
+                    let small = match pliron_cfg::pgo_knob("PLIRON_MEMFAST_SMALL", "hotloop").or(Some("loop")) {
+                        // The bundle's value: what `hot` takes, and what
+                        // the no-profile default (`loop`) takes unless
+                        // the profile saw the block never run. A profiled
+                        // build must not inline fewer of these than a
+                        // plain one (rust-protobuf, rust-json).
+                        Some("hotloop") => {
+                            let b = op.deref(self.ctx).get_parent_block();
+                            let c = b.and_then(|b| crate::pgo::block_count(self.st, b));
+                            c.zip(self.st.prof_hot).is_some_and(|(c, h)| c >= h)
+                                || (b.is_some_and(|b| self.cycles.contains(&b)) && c != Some(0))
+                        }
+                        Some("1") => true,
+                        Some("hot") => op
+                            .deref(self.ctx)
+                            .get_parent_block()
+                            .and_then(|b| crate::pgo::block_count(self.st, b))
+                            .zip(self.st.prof_hot)
+                            .is_some_and(|(c, h)| c >= h),
+                        // `=warm`: every block the profile saw run (a
+                        // block without a count is treated as run): the
+                        // speed of `=1` without growing code that never
+                        // executes.
+                        Some("warm") => op
+                            .deref(self.ctx)
+                            .get_parent_block()
+                            .and_then(|b| crate::pgo::block_count(self.st, b))
+                            .is_none_or(|c| c > 0),
+                        // `=loop`: no profile needed — copies on a CFG
+                        // cycle of this function (after inlining). Most
+                        // of `=1`'s speed for a fraction of its size.
+                        Some("loop") => {
+                            op.deref(self.ctx).get_parent_block().is_some_and(|b| self.cycles.contains(&b))
+                        }
+                        _ => false,
+                    };
+                    self.small_copy_or_call(name == "llvm.memcpy", a[0], a[1], a[2], small);
                     return;
                 }
                 let cfg = self.tcfg;
@@ -8037,6 +8807,48 @@ impl<'a, 'b> FnLower<'a, 'b> {
     }
 }
 
+/// Blocks that lie on a CFG cycle (successor edges only): those that can
+/// reach themselves. Quadratic; functions over 4,000 blocks get nothing.
+fn cycle_blocks(ctx: &Context, pblocks: &[Ptr<BasicBlock>]) -> rustc_hash::FxHashSet<Ptr<BasicBlock>> {
+    let mut out = rustc_hash::FxHashSet::default();
+    let n = pblocks.len();
+    if n > 4000 {
+        return out;
+    }
+    let idx: FxHashMap<Ptr<BasicBlock>, usize> = pblocks.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let succ: Vec<Vec<usize>> = pblocks
+        .iter()
+        .map(|b| match b.deref(ctx).iter(ctx).last() {
+            Some(t) => t.deref(ctx).successors(ctx).filter_map(|d| idx.get(&d).copied()).collect(),
+            None => Vec::new(),
+        })
+        .collect();
+    // Only blocks with a retreating edge somewhere below can cycle; the
+    // plain per-block search is fine at these sizes.
+    let mut seen = vec![usize::MAX; n];
+    let mut stack = Vec::new();
+    for i in 0..n {
+        stack.clear();
+        stack.extend(succ[i].iter().copied());
+        let mut hit = false;
+        while let Some(x) = stack.pop() {
+            if x == i {
+                hit = true;
+                break;
+            }
+            if seen[x] == i {
+                continue;
+            }
+            seen[x] = i;
+            stack.extend(succ[x].iter().copied());
+        }
+        if hit {
+            out.insert(pblocks[i]);
+        }
+    }
+    out
+}
+
 /// `lt_loop_blocks`' default: distinct restarted variables that make a
 /// call-free loop worth the zeros. Below about the allocatable integer
 /// registers (28 on aarch64) the carried values sit in registers anyway;
@@ -8173,7 +8985,8 @@ fn cold_blocks(
             Operation::is_op::<UnreachableOp>(op, ctx)
                 || crate::inline::direct_callee(ctx, st, op)
                     .is_some_and(|s| st.funcs.get(s).is_some_and(|f| f.cold))
-        }) || crate::pgo::block_count(st, b).is_some_and(|c| c == 0);
+        }) || (!pliron_cfg::env_is("PLIRON_PGO_COLD", "0")
+            && crate::pgo::block_count(st, b).is_some_and(|c| c == 0));
         if hit {
             cold.insert(b);
         }
@@ -8384,3 +9197,72 @@ fn magicu128(d: u128) -> (u128, u32, bool) {
     (q2.wrapping_add(1), p - 128 - u32::from(add), add)
 }
 
+
+/// PGO: give blocks the CLIF passes created a profile count where the
+/// CFG leaves no doubt (`PLIRON_PROF_INFER=0` disables). About half the
+/// blocks reach the backend without one — preheaders, rotated guards,
+/// unrolled copies, cold adapters, split edges — and block placement
+/// then falls back to static guesses around them. Rules, to a fixpoint
+/// (4 sweeps): a block marked cold never ran; a block between a
+/// single-successor predecessor and it alone (or a single-predecessor
+/// successor and it alone) ran as often as that neighbour; a block all
+/// of whose predecessors only jump to it ran as often as they did
+/// together; the other arm of a two-way branch whose first arm is known
+/// and private ran the remainder.
+fn prof_infer(func: &mut ir::Function) {
+    if pliron_cfg::env_is("PLIRON_PROF_INFER", "0") {
+        return;
+    }
+    let cfg = cranelift_codegen::flowgraph::ControlFlowGraph::with_function(func);
+    let blocks: Vec<ir::Block> = func.layout.blocks().collect();
+    let npred = |b: ir::Block| cfg.pred_iter(b).count();
+    let succs = |b: ir::Block| -> smallvec::SmallVec<[ir::Block; 4]> {
+        let mut v: smallvec::SmallVec<[ir::Block; 4]> = cfg.succ_iter(b).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    for _ in 0..4 {
+        let mut changed = false;
+        for &b in &blocks {
+            if func.layout.prof_count(b).is_some() {
+                continue;
+            }
+            let known = |x: ir::Block| func.layout.prof_count(x);
+            let ss = succs(b);
+            let preds: smallvec::SmallVec<[ir::Block; 4]> = cfg.pred_iter(b).map(|p| p.block).collect();
+            let c = if func.layout.is_cold(b) {
+                Some(0)
+            } else if let [p] = preds[..]
+                && succs(p).len() == 1
+                && let Some(c) = known(p)
+            {
+                Some(c)
+            } else if let [s] = ss[..]
+                && npred(s) == 1
+                && let Some(c) = known(s)
+            {
+                Some(c)
+            } else if !preds.is_empty() && preds.iter().all(|&p| succs(p).len() == 1 && known(p).is_some()) {
+                Some(preds.iter().map(|&p| known(p).unwrap()).fold(0u64, u64::saturating_add))
+            } else if let [p] = preds[..]
+                && let Some(cp) = known(p)
+                && let [x, y] = succs(p)[..]
+                && let other = if x == b { y } else { x }
+                && npred(other) == 1
+                && let Some(co) = known(other)
+            {
+                Some(cp.saturating_sub(co))
+            } else {
+                None
+            };
+            if let Some(c) = c {
+                func.layout.set_prof_count(b, c);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}

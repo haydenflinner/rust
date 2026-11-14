@@ -49,6 +49,16 @@ pub struct CFGInfo {
     /// under `PLIRON_RA2_FREQ` the frontend's block frequency scaled; see
     /// `init`).
     pub hot_bonus: Vec<f32>,
+    /// PLIRON (`PLIRON_RA2_COLDSPLIT`): `clobber_prefix[i]` is the number
+    /// of instructions before `i` that have clobbers (length
+    /// `num_insts + 1`), so "does `[a, b)` contain a clobber" is one
+    /// subtraction. Empty unless the knob is on.
+    pub clobber_prefix: Vec<u32>,
+    /// PLIRON (`PLIRON_RA2_COLDSPLIT`): per block, `hot_bonus` with the
+    /// frontend's cold marks applied (`coldsplit_colddiv`): the
+    /// frequencies the cold split tests and costs with. Empty unless the
+    /// knob is on.
+    pub cold_freq: Vec<f32>,
 }
 
 impl CFGInfo {
@@ -89,6 +99,20 @@ impl CFGInfo {
         let (backedge_in, backedge_out) = ctx.backedge.repopulate(nb * 2, 0).split_at_mut(nb);
         let mut back_edges = core::mem::take(&mut self.back_edges);
         back_edges.clear();
+
+        // PLIRON (`PLIRON_RA2_COLDSPLIT`): where the clobbers are.
+        self.clobber_prefix.clear();
+        if crate::coldsplit_on() {
+            self.clobber_prefix.reserve(f.num_insts() + 1);
+            let mut n = 0u32;
+            self.clobber_prefix.push(0);
+            for inst in 0..f.num_insts() {
+                if f.inst_clobbers(Inst::new(inst)) != crate::PRegSet::empty() {
+                    n += 1;
+                }
+                self.clobber_prefix.push(n);
+            }
+        }
 
         for block in 0..f.num_blocks() {
             let block = Block::new(block);
@@ -253,6 +277,14 @@ impl CFGInfo {
                 _ => by_depth,
             };
             hot_bonus.push(bonus);
+        }
+        self.cold_freq.clear();
+        if crate::coldsplit_on() {
+            let div = crate::coldsplit_colddiv();
+            for block in 0..nb {
+                let h = self.hot_bonus[block];
+                self.cold_freq.push(if f.block_is_cold(Block::new(block)) { h / div } else { h });
+            }
         }
 
         Ok(())

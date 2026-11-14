@@ -77,6 +77,11 @@ Pinned toolchain `nightly-2026-10-22` (`rust-toolchain.toml`; needs
   ~3–5 s incremental. Our crates build at O1, deps and vendored
   Cranelift at O3. Measure compile time with the **release** dylib
   (`cargo build --release`); the debug one is ~1.3x slower.
+- Inner loop after a pass edit: `harness/dev.py` (`clif`, `corpus`, `rs`,
+  `test`, `check`, `bench`, `watch ...`) builds with the `fast` profile
+  (`target/fast`, 2-4x quicker to rebuild than `dev`) and prints
+  before/after; `PLIRON_PROFILE=fast` points gate/quick/test.sh/run.py at
+  the same build. Numbers and details: [`docs/dev-loop.md`](docs/dev-loop.md).
 - One file: `rustc -O -Zcodegen-backend=$PWD/target/debug/librustc_codegen_pliron.dylib file.rs`
 - cargo does not track the backend dylib or `PLIRON_*` vars: after
   changing either, use a fresh `CARGO_TARGET_DIR` or `cargo clean -p`.
@@ -96,6 +101,42 @@ time, memory, code size, stack frames) in ~20 min and writes
   Medians append to `bench/history.tsv` (commit it when a number moves).
   ~8 min for all; `BENCHTIME`/`COUNT` env vars tune it.
 - `bench/wasm/run.sh [filter]` — same kernels on wasm32 in node.
+- `bench/heldout/ab.py PROG SIDE...` — the fast A/B for one held-out
+  program. Sides: `llvm`, `llvm-pgo`, `llvm:FLAGS` (ablate LLVM's own
+  passes), `pliron`, `NAME:K=V,..`, `pgo`, `pgo-NAME:K=V,..`
+  (profiled), `@FLAGS` for extra RUSTFLAGS. Builds are cached per
+  side; each side is timed interleaved under `/usr/bin/time -l` and
+  reported with retired instructions (repeatable to ~0.3%), cycles and
+  IPC — so one run says whether a change removes work or only moves
+  it. `--prof` adds inclusive/self per-function cycle deltas. Start
+  here for any "is X faster" question on real programs.
+- `bench/heldout/run.py --pgo` — the profile loop for all eight
+  programs, ours and LLVM's, with build-time totals; `tune.py PROG`
+  searches the profile knobs for one program. `harness/pgofuzz.py`
+  fuzzes the generate/run/use loop. `PLIRON_REMARKS` +
+  `harness/layout_score.py` score a profiled build's block layout.
+  State of the profile work: `docs/pgo.md`,
+  `docs/history/2026-11-12-pgo-baseline.md`.
+- `bench/heldout/irdiff.py PROG [--env K=V] [--tag T] [--fn S | --line
+  FILE:LINE] [--backend DYLIB]` — exact executed-instruction counts
+  (callgrind, aarch64-linux-musl in docker), ours against LLVM's, per
+  function and source line; all eight held-out programs run. `--tag`
+  gives our side its own build dir so several run at once (delete
+  `target/heldout/ir-pliron-<tag>` afterwards: ~0.5 GB each). The
+  function table is by innermost inlined function (DWARF), not by ELF
+  symbol.
+- `bench/heldout/asmvs.py [--only prog] [--fn F | --line FILE:LINE]` —
+  our code next to LLVM's for a held-out program, keyed by source line
+  (so inlining differences don't break the pairing) with every
+  instruction classified (stack load/store, register copy, extend,
+  ...) and weighted by self samples: a class table of what the gap is
+  made of, the lines that lose most, and side-by-side listings. `--fn`
+  ends with the function's optimization remarks.
+- `PLIRON_REMARKS=<prefix>` + `harness/remarks.py <prefix> [--fn F]
+  [--callee C]` — one fixed-shape record per decision *not* to
+  optimize: each call the inliner kept (reason, cost vs threshold, cap,
+  growth) and each loop `loopvec` left scalar. New passes report
+  refusals with `pliron_cfg::remark!`.
 - To see why a kernel is slow: `PLIRON_CLIF=<fn substr>` dumps CLIF
   after every step; `rustc --emit obj` + `llvm-objdump -d` (or
   `wasm2wat`) for final code; compare with stock rustc's output for the
@@ -119,6 +160,11 @@ time, memory, code size, stack frames) in ~20 min and writes
   over ~15k real functions, per-step time table, no rustc. The fastest
   loop for pass compile-time work; the live dashboard shows the same
   per-step times against a baseline on every save.
+- `harness/headstart.py record --heldout PROG [--pliron]` (or `-- cargo
+  build ...`) — a cargo build's schedule: per rustc, when interfaces
+  were checked, metadata written, code generated; the critical path;
+  and the same build replayed under early-metadata pipelining
+  (`docs/headstart.md`, a prediction).
 - `PLIRON_TIMING=1` — per-CGU per-step wall time for one real compile.
   `-Zself-profile` records `pliron_*` activities next to rustc's.
 - `harness/prof.py -- rustc ...` (or `-p PID`, `-a FILE`) — wraps
@@ -147,6 +193,12 @@ time, memory, code size, stack frames) in ~20 min and writes
   `clif-check report target/corpus/std out.json --check` runs the whole
   pipeline + an interpreter diff on every function in parallel (~7 s
   for std). Re-record after lowering or IR-opt changes.
+  `PLIRON_VERIFY=full` adds the verifier after every step (a failing
+  step is a `panic` row naming it; the gate and quick set it), `--every
+  N` replays a sample. `harness/corpus.sh clcg` records our vendored
+  cranelift-codegen and its dependencies (~38k functions, ~1.5 min):
+  compiling our own crates found bugs std does not show. The gate
+  replays every 8th function of it (~20 s), `gate.py --full` all of it.
 - **Real crates**: `harness/crates.py [--tier 1|2|3] [--only a,b]
   [--deps stock|pliron]` runs pinned crates' own test suites
   (`--release`) under stock and pliron and reports pliron-only failures,
@@ -279,6 +331,109 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_BUNROLL_BODY=<insts>` — `bunroll` per-body inst cap
   (default 48). ~200 exposes memcpy'd chunk loops to `loadfwd`'s
   source-copy rule; costs .text on big crates.
+- `PLIRON_PUNROLL_SEARCH=1` (opt-in) — `punroll` also group-unrolls
+  search loops (a data exit into warm code: `position`, `any`,
+  `take_while(..).count()`). Off by default without a measured trip
+  count: pulldown-cmark's scanners make a trip or two and paid the
+  guard (exact counts: pulldown -0.4%, html-rewriter -0.2% with the
+  rule). Counted loops and loops whose other exits are cold unroll
+  either way.
+- `PLIRON_ELABHOT=1` (opt-in, vendored elaborator) — restore a popped
+  loop-stack entry for blocks that dominate the latches of a call-free
+  loop; hoists out of one-trip loops (pulldown-cmark +0.5%).
+- `PLIRON_WM_KEEPCOUNT=0`, `PLIRON_EXITSINK=0`, `PLIRON_CMPCANCEL_INV=0`,
+  `PLIRON_SELKNOWN=0`, `PLIRON_RETEST=0`, `PLIRON_DEADSLOT=0` — the
+  byte-scan loop work of 2026-11-13
+  (`docs/history/2026-11-13-six-features.md`, "Fourth item"), each
+  default on.
+- `PLIRON_PUNROLL_COUNTED=1` (opt-in) — `punroll` also group-unrolls
+  plain counted loops whose trip count is neither measured nor a
+  constant (the default until 2026-11-13; off: rust-protobuf -0.7%,
+  html-rewriter -0.4% exact). Under a profile the floor is
+  `PLIRON_PUNROLL_MINTRIP` (default 4 average trips);
+  `PLIRON_PEEL_MINTRIP` (default 0) is the same for peeling.
+- `PLIRON_LOOPROT_MERGE=1` (opt-in) — one latch for a loop with several
+  back edges so `looprot` can rotate it. The repro
+  (`tests/parity/prog_loop.rs`) is at 11 instructions a skipped state
+  (LLVM 12) since `PLIRON_ELABKEEP`, `PLIRON_BUMPEDGE` and
+  `PLIRON_WM_WIDE`; exact counts are still mixed (html-rewriter -0.39M,
+  rust-json -0.17M, pulldown-cmark +0.78M, regex +0.25M, blind-sig
+  +0.29M): regalloc2 rotates registers at the merged latch (see
+  `looprot::merge_latches`).
+- 2026-11-13 afternoon round (`docs/history/2026-11-13-six-features.md`,
+  "Handoff: parity"): `PLIRON_RA2_REHOME` (vendored regalloc2, default
+  `2`, `0` off: a value's register in a join-only block follows the
+  cheaper side of its edges), `PLIRON_MEMCMPK_EQ=0` /
+  `PLIRON_MEMCMPK_CONST=0`, `PLIRON_NEON_PAIRWISE=0` (aarch64 NEON pairwise ops inline), `PLIRON_XCGU_GLUEDEPTH=0` (drop glue free of copy descent
+  depth), `PLIRON_SELXOR_SIGN=0`, `PLIRON_PHISIMP_DEADPRED=0`,
+  `PLIRON_SROA_FRAGCOPY=<k>` (default 8, `0` off: whole-copied
+  aggregates cut into sub-word pieces stay whole) — off switches for
+  what is default on. Opt-in: `PLIRON_INLINE_LEAN=<k>` (wrapper
+  callees pass the inline score; 32 measured, pulldown-cmark +0.21M
+  open), `PLIRON_VTRUNC_UZP=1` (aarch64 lane narrowing as `uzp1`; fails
+  the `simdshift` stanza when on), `PLIRON_PADJUMP=<n>` (vendored Cranelift: jump over alignment
+  pads of `n`+ instructions; unmeasured).
+- `PLIRON_LICM_INNERPRESS` (default `2`; `=1` the old rule, `=0` off),
+  `PLIRON_UNSWITCH_LOOP=0`, `PLIRON_LF_TRIVPHI=0`, `PLIRON_ELABKEEP=0`
+  (vendored elaborator), `PLIRON_BUMPEDGE=0`, `PLIRON_WM_WIDE=0`,
+  `PLIRON_PROBE_SP=0` (vendored aarch64 emitter) — the 2026-11-13
+  parity round (`docs/history/2026-11-13-six-features.md`, "Sixth
+  item"): pressure-aware hoisting of outer-loop loads, loop-only
+  unswitching, no single-value block params from `loadfwd`'s PRE,
+  elaboration keeps the pipeline's hoists, a cursor stepped on the
+  edges into the block that only steps it, `webmerge` keeps the wide
+  slot of an extended pair, and a stack-probe loop that moves `sp`
+  (valgrind).
+- `PLIRON_ALLOC_JMP=0`, `PLIRON_VEC_SHORT=0`, `PLIRON_SELXOR=0`,
+  `PLIRON_LICM_DOMCOND=0` — off switches for the allocator shim as one
+  jump (aarch64), `loopvec`'s short-trip dispatch, the zigzag select
+  fold, and the dominated-branch fold ahead of LICM
+  (`docs/history/2026-11-13-six-features.md`, "Fifth item").
+- `PLIRON_FASTCC=0` — off switch for per-callee clobber sets (aarch64
+  ELF/Mach-O, default on): a direct call to a function compiled in the
+  same object destroys only the registers that function's code writes
+  on a path that returns, so the caller keeps values in caller-saved
+  registers across it. `PLIRON_FASTCC_NORET=0` counts paths that never
+  return too, `PLIRON_FASTCC_HIDDEN=0` limits callees to internal
+  linkage. `PLIRON_TRACE=pliron::fastcc` prints one `fastcc-sites` line
+  per CGU (what happened to every direct call site); with `=debug` and
+  `PLIRON_FASTCC_NORET=0`, `harness/fastcc_check.py LOG OBJECTS...`
+  checks every recorded set against the disassembled code. Exact
+  counts: pulldown-cmark -0.55%, the other held-out programs unchanged
+  (`docs/history/2026-11-13-six-features.md`).
+- `PLIRON_PANICSTUB=0` — off switch for shared panic tails (default on,
+  native only): the cold `call f(..); trap` tails of one callee in a
+  function become one block (.text -0.1..-0.2% on regex and
+  rust-html-rewriter, less elsewhere; executed instructions unchanged). `PLIRON_PANICSTUB_STRIP=0` keeps
+  each site's `coldargs` wrapper, `PLIRON_PANICSTUB_FWD=0` keeps
+  forwarder blocks. Sites on different source lines stay apart when the
+  build has line tables.
+- `PLIRON_SCOPED_NOALIAS=1` (opt-in; measured ready for default-on but
+  the 2000-seed fuzz sweep it needs first did not complete, see the
+  handoff section of `docs/history/2026-11-13-six-features.md`): an
+  inlined callee's `&mut` param keeps its `noalias` fact for
+  the span of the inlined body: a first pipeline step (`scopedfwd`)
+  runs `loadfwd` on the function as lowered, where locs reached through
+  the param survive stores and calls proven not based on it. The step
+  runs only in functions where a probe finds such a loc
+  (`PLIRON_SCOPEDFWD_PROBE=0`: wherever there is a candidate), and
+  `phisimp` keeps a clone-entry arg only where the fact can be used
+  (`PLIRON_SCOPED_PHI_ALL=1`: every `noalias` arg, `PLIRON_SCOPED_PHI_RO=1`:
+  `readonly` ones too, `PLIRON_SCOPED_PHI_KEEP=<bits>`: one class).
+  Exact counts: rust-protobuf -1.44%, rust-json -0.77%,
+  rust-html-rewriter -0.04%, the other five held-out programs within
+  0.01% or their noise (`docs/history/2026-11-13-six-features.md`).
+  `PLIRON_TRACE=pliron::scopedna` says why candidates drop out;
+  `PLIRON_SCOPEDFWD=0` skips the step, `PLIRON_SCOPEDFWD_PRE=0` its load
+  PRE, `PLIRON_SCOPED_NCC=0` the `nocapture` relaxation. Corpora
+  recorded with the knob on carry the candidates
+  (`; diffcheck-facts: scopedna=`), so `clif-check report --check`
+  replays the step.
+- `PLIRON_LT_PINANCHOR=0` — a lifetime marker is anchored on the last
+  instruction lowered before it again, pure ones included (default: the
+  anchor steps back over instructions the egraph may move; a
+  `stack_addr` anchor that sank below a slot's first writes made
+  slotmerge reuse the slot at opt-level 0, stanza `o0std`).
 - `PLIRON_INLINE_PAIR=<k>` (opt-in) — callees called from at most `k`
   functions get 2x their callsite limit (the body dies when all sites
   inline, LLVM's last-callsite bonus generalised). Reaches
@@ -297,6 +452,25 @@ time, memory, code size, stack frames) in ~20 min and writes
 - `PLIRON_SLOTPROM_EXT=0` — slotprom whole-slot call coverage, i.e.
   revert extent-limited syncs (`nocap` carries per-operand byte
   extents from `arg_extent`).
+- `PLIRON_RA2_POSTOPT=<bits>` (opt-in) — regalloc2 post-allocation
+  cleanup over the whole CFG: 1 redundant reloads, 2 reloads served
+  from a register that already mirrors the slot, 4 redundant spill
+  stores, 8 dead spill stores (`vendor/regalloc2/src/ion/postopt.rs`;
+  `PLIRON_RA2_POSTOPT_STATS=1` counts). Check with `PLIRON_RA_CHECK=1`.
+- `PLIRON_RA2_SRCVREG=1` (opt-in) — a block-parameter move is labelled
+  with the branch argument's vreg, so a constant passed to a spilled
+  parameter is rematerialized instead of loaded from its own spill
+  slot (stack loads -3.5..-4.3% on three held-out binaries).
+- `PLIRON_ELABLOOPS=2` (opt-in) — `=1`'s egraph loop hoisting, but
+  cheap invariants stay inside loops that contain a call.
+- `PLIRON_HOT_LAYOUT=1` — type-layout table in each object for the
+  hot-reload loader's layout guard; `PLIRON_HOT_REACH=1` — thunks mark
+  their function entered (tests on save, `examples/hot-test.sh`);
+  runtime `PLIRON_HOT_DIRECT=1` (direct-jump thunks, arm64 macOS) and
+  `PLIRON_HOT_FREE=protect` (`docs/hot-reload.md`).
+- `clif-check bench <corpus>` (with `PLIRON_MEMCACHE=0`) also prints
+  each step's time on functions it left unchanged and the repeat rounds
+  that ran with nothing changed since the family's last no-effect run.
 - `PLIRON_VERSION=1` — print the source revision the dylib was built
   from (check it before trusting a self-host or bisect result).
 

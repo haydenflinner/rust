@@ -115,6 +115,18 @@ pub struct Stats {
     /// Wall time per step name, summed over functions; printed under
     /// `PLIRON_TIMING`.
     pub timing: FxHashMap<&'static str, std::time::Duration>,
+    /// Per step, only under step timing (`clif-check bench`,
+    /// `PLIRON_TIMING`): functions it ran on, functions it changed, and
+    /// the time it spent on the functions it left unchanged — what a
+    /// tighter gate or a dropped repeat round would save, and for how
+    /// little effect (relax caps its `simplify` at two rounds on the
+    /// same kind of table: later rounds changed <0.1% for ~25% of the
+    /// optimiser's time).
+    pub effect: FxHashMap<&'static str, (u32, u32, std::time::Duration)>,
+    /// Per step: runs that came after a no-effect run of the same family
+    /// with nothing changed in between (a skippable repeat), how many of
+    /// those changed the function anyway, and their time.
+    pub repeat: FxHashMap<&'static str, (u32, u32, std::time::Duration)>,
     /// How often the shared `Analysis` slot rebuilt each structural
     /// analysis — the granularity-split scoreboard.
     pub cfg_builds: usize,
@@ -149,6 +161,18 @@ impl Stats {
         self.la_ns += o.la_ns;
         for (n, d) in &o.timing {
             *self.timing.entry(n).or_default() += *d;
+        }
+        for (n, &(r, f, d)) in &o.effect {
+            let e = self.effect.entry(n).or_default();
+            e.0 += r;
+            e.1 += f;
+            e.2 += d;
+        }
+        for (n, &(r, f, d)) in &o.repeat {
+            let e = self.repeat.entry(n).or_default();
+            e.0 += r;
+            e.1 += f;
+            e.2 += d;
         }
     }
 }
@@ -633,6 +657,12 @@ fn edge_fp(func: &Function) -> u64 {
 // r[impl clif.analysis]
 pub struct Analysis {
     ver: u64,
+    /// Bumped only when a step reported or showed a change (`run_step`'s
+    /// `fired`), unlike `ver`, which every mutating step bumps.
+    pub eff_ver: u64,
+    /// Per step family (the step name without its round suffix: `dse2`
+    /// -> `dse`), the `eff_ver` at which a member last ran without effect.
+    pub idle_at: FxHashMap<&'static str, u64>,
     /// `edge_fp` of the function state `cfg` describes; `Some` iff
     /// `cfg` is `Some`. Replaces the old `num_insts` fingerprint:
     /// inst count changes on value-only rewrites that leave the CFG
@@ -1144,6 +1174,12 @@ pub fn run_pipeline(p: &mut Pipe) {
         }
         p.inst_region = m;
     }
+    // `PLIRON_SCOPED_NOALIAS=1`: the inlined callees' `noalias` params and
+    // their regions as lowered, for loadfwd (`loadfwd::ScopedNa`). Taken
+    // here because later `scoped_na` members are carried facts, not params.
+    let _scoped = loadfwd::scoped_enabled().then(|| {
+        loadfwd::scoped_enter(loadfwd::scoped_seed(&p.clctx.func, p.noalias, p.scoped_na, p.block_region))
+    });
     match crate::diffcheck::mode_for(p.fname) {
         None => {
             run_steps(p, false);
@@ -1254,6 +1290,8 @@ fn corpus_dump(p: &mut Pipe) {
         derived: Some(&*p.derived),
         // Rebuilt from the names header on replay.
         memcmp: Default::default(),
+        // Rebuilt from the nocap header on replay.
+        stub_extent: Default::default(),
     };
     // Extra replay facts `diffcheck-facts` can't express: the per-callee
     // nocapture arg positions (a `(Inst, arg)` set on `Pipe`) re-keyed by
@@ -1636,6 +1674,7 @@ fn facts_of<'a>(p: &'a Pipe) -> crate::diffcheck::Facts<'a> {
         self_name: Some(format!("u0:{}", p.func_id.as_u32())),
         derived: Some(&*p.derived),
         memcmp: memcmp_refs(&p.clctx.func, p.fn_names),
+        stub_extent: crate::diffcheck::stub_extents(&p.clctx.func, |i, k| p.nocap.get(&(i, k)).copied()),
     }
 }
 
@@ -1925,6 +1964,18 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
             };
         }
     }
+    // `PLIRON_PROF_COVERAGE=1` (with a profile): blocks in the layout that
+    // have no count, before and after the step; the difference is what
+    // the step created without handing a count on.
+    static COVER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| env_set("PLIRON_PROF_COVERAGE"));
+    let uncounted = |p: &Pipe| -> usize {
+        p.clctx.func.layout.blocks().filter(|b| !p.prof.contains_key(b)).count()
+    };
+    let cover0 = (*COVER && !p.prof.is_empty()).then(|| uncounted(p));
+    let size0 = t0.map(|_| {
+        let f = &p.clctx.func;
+        (f.dfg.num_insts(), f.dfg.num_values(), f.dfg.num_blocks(), f.layout.blocks().count())
+    });
     let k = if s.cached && p.clctx.func.dfg.values_labels.is_none() {
         match crate::stepcache::lookup(p, s, an) {
             Some(k) => k,
@@ -1942,6 +1993,36 @@ fn run_step(p: &mut Pipe, s: &Step, an: &mut Analysis, slot: &mut std::time::Dur
         let d = t0.elapsed();
         *slot += d;
         trace(s.name, d.as_secs_f64() * 1e3, p.fname);
+        // Some steps report 0 after removing blocks: count a size change
+        // as an effect too.
+        let f = &p.clctx.func;
+        let fired = k > 0
+            || size0 != Some((f.dfg.num_insts(), f.dfg.num_values(), f.dfg.num_blocks(), f.layout.blocks().count()));
+        let e = p.stats.effect.entry(s.name).or_default();
+        e.0 += 1;
+        if fired {
+            e.1 += 1;
+        } else {
+            e.2 += d;
+        }
+        let fam = s.name.trim_end_matches(|c: char| c.is_ascii_digit());
+        if an.idle_at.get(fam) == Some(&an.eff_ver) {
+            let e = p.stats.repeat.entry(s.name).or_default();
+            e.0 += 1;
+            e.1 += fired as u32;
+            e.2 += d;
+        }
+        if fired {
+            an.eff_ver += 1;
+        } else {
+            an.idle_at.insert(fam, an.eff_ver);
+        }
+    }
+    if let Some(c0) = cover0 {
+        let c1 = uncounted(p);
+        if c1 > c0 {
+            eprintln!("profcover: {} +{}", s.name, c1 - c0);
+        }
     }
     lt_probe(p, s.name);
     // `PLIRON_CLIF_STEPS=1` (with `PLIRON_CLIF`): dump after every step that
@@ -2194,6 +2275,26 @@ fn s_mergejump(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// A `brif` on a block param every incoming edge already decided — see
+// `edgeknown`.
+fn s_edgeknown(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::edgeknown::run(&mut p.clctx.func);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("edgeknown");
+    }
+    k
+}
+
+// Common addends cancelled out of `icmp eq/ne` — see `cmpcancel`.
+fn s_cmpcancel(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = crate::cmpcancel::run(&mut p.clctx.func);
+    if k > 0 && p.dump {
+        p.dump("cmpcancel");
+    }
+    k
+}
+
 fn s_jumpthread(p: &mut Pipe, an: &mut Analysis) -> usize {
     let sh = an.shape_bits(&p.clctx.func);
     let rnn = (!p.region_nn.is_empty()).then(|| jumpthread::RegionNN {
@@ -2235,9 +2336,9 @@ fn s_slotprom(p: &mut Pipe, an: &mut Analysis) -> usize {
     } else {
         Vec::new()
     };
-    // `PLIRON_SLOTPROM_SYNCCOST=1`: block-frequency estimate for the
+    // `PLIRON_SLOTPROM_SYNCCOST` (default on since 2026-11-13, `=0` off): block-frequency estimate for the
     // sync cost check, 8x per loop level (to 512x), /8 in cold blocks.
-    let weight = env_is("PLIRON_SLOTPROM_SYNCCOST", "1").then(|| {
+    let weight = (!env_is("PLIRON_SLOTPROM_SYNCCOST", "0")).then(|| {
         let a = an.cfg_dt_la(&p.clctx.func);
         let f = &p.clctx.func;
         f.layout
@@ -3316,6 +3417,25 @@ fn s_loadfwd2(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+// `PLIRON_SCOPED_NOALIAS=1`: `loadfwd` on the function as lowered, while
+// the inlined callees' `&mut` params are still their clones' entry params
+// (`loadfwd::scoped_any`). Functions without a candidate skip it.
+// `PLIRON_SCOPEDFWD=0` skips the step (the facts then never apply).
+// A probe run first asks whether the fact shelters any loc from a store or
+// call in this function; where it does not, the function is left for the
+// regular `loadfwd` step (`PLIRON_SCOPEDFWD_PROBE=0`: run regardless).
+fn s_scopedfwd(p: &mut Pipe, an: &mut Analysis) -> usize {
+    if !loadfwd::scoped_any() || pliron_cfg::env_is("PLIRON_SCOPEDFWD", "0") {
+        return 0;
+    }
+    loadfwd::scoped_prerun(|| {
+        if !pliron_cfg::env_is("PLIRON_SCOPEDFWD_PROBE", "0") && loadfwd::scoped_probe(|| s_loadfwd2(p, an)) == 0 {
+            return 0;
+        }
+        s_loadfwd2(p, an)
+    })
+}
+
 // `band v, 1` on an already-0/1 scalar (rustc's i1 normalization
 // residue around `icmp`/`uextend`/`select` booleans) — one `and`
 // per element in scalar count_if loops. After sameargs: the merged
@@ -3379,6 +3499,33 @@ fn s_stubhoist(p: &mut Pipe, _an: &mut Analysis) -> usize {
     k
 }
 
+/// `brif c, A, B` whose arms are the same `return` — the emulated-EH
+/// `eh_check` shape — collapses to `jump`. Runs on every CONDBR function
+/// (the `mergechain` step's MULTI gate skips single-brif shims).
+fn s_commonret(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    use cranelift_codegen::ir::Opcode;
+    let f = &mut p.clctx.func;
+    let mut n = 0;
+    let brifs: Vec<Inst> = f
+        .layout
+        .blocks()
+        .flat_map(|b| f.layout.block_insts(b))
+        .filter(|&i| f.dfg.insts[i].opcode() == Opcode::Brif)
+        .collect();
+    for i in brifs {
+        if clifpeep::brif_commondest(f, i) {
+            n += 1;
+        }
+    }
+    if n > 0 {
+        n += jumpthread::remove_unreachable_blocks(f);
+        if p.dump {
+            p.dump("commonret");
+        }
+    }
+    n
+}
+
 fn s_edgesink(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = edgesink::run(&mut p.clctx.func);
     if k > 0 && p.dump {
@@ -3401,6 +3548,56 @@ fn s_esplit(p: &mut Pipe, an: &mut Analysis) -> usize {
 // Sparse small-domain membership trees (is_whitespace/is_ascii_*
 // `icmp`+`brif` chains) become one guarded `ushr` bitmask test when
 // the accepted set fits a 64-bit window.
+// Selects whose condition a dominating branch or the loop's edges
+// decided — `edgeknown::selects`, straight after if-conversion made
+// them, so the induction-variable passes see the loop without them.
+fn s_selknown(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::edgeknown::selects(&mut p.clctx.func);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("selknown");
+    }
+    k
+}
+
+// A branch repeating its only predecessor's test — see `edgeknown::retests`.
+fn s_retest(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::edgeknown::retests(&mut p.clctx.func);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("retest");
+    }
+    k
+}
+
+// Slots whose last reference a late pass removed — see `deadslot`.
+fn s_deadslot(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    // `-g -O0`: every variable keeps its own slot for the debugger.
+    if p.flags.keep_dbg_slots {
+        return 0;
+    }
+    crate::deadslot::run(&mut p.clctx.func)
+}
+
+// `select (x & 1), !y, y` as `y ^ -(x & 1)` — see `selxor`.
+fn s_selxor(p: &mut Pipe, _an: &mut Analysis) -> usize {
+    let k = crate::selxor::run(&mut p.clctx.func);
+    if k > 0 {
+        p.dump("selxor");
+    }
+    k
+}
+
+// A membership predicate held in a select chain — see `selset`.
+fn s_selset(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = crate::selset::run(&mut p.clctx.func);
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        p.dump("selset");
+    }
+    k
+}
+
 fn s_bittab(p: &mut Pipe, _an: &mut Analysis) -> usize {
     let k = bittab::run(&mut p.clctx.func);
     if k > 0 && p.dump {
@@ -3711,6 +3908,15 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
             p.site_facts.add_derived(w, b, s);
         }
     }
+    // Read before `w` joins `noalias` below: the scoped carry asks whether
+    // `w` was function-wide `noalias` on its own. Asked afterwards the
+    // answer was always yes, the scope was dropped, and a value that took
+    // an inlined callee's region-scoped `noalias` became a function-wide
+    // (isolated) root: licm hoisted loads of it out of loops that write
+    // the same memory through the caller's name (regex, json, protobuf
+    // and html-rewriter miscompiled under `PLIRON_SCOPED_NOALIAS=1` once
+    // the scoped params lived long enough to be carried).
+    let w_wide = p.noalias.contains(&w) && !p.scoped_na.contains(&w);
     if bits & fact_bits::NOALIAS != 0 && p.noalias.contains(&d) {
         p.noalias.insert(w);
         p.fact_bits[w] |= fact_bits::NOALIAS;
@@ -3721,10 +3927,7 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
     // and still holds. regex's `next_state` lost `qcur`/`qnext` from
     // loadfwd's isolated roots this way once `exec_byte` was inlined, and
     // reloaded the sparse set's four fields per decoded varint.
-    if bits & fact_bits::SCOPED_NA != 0
-        && p.scoped_na.contains(&d)
-        && !(p.noalias.contains(&w) && !p.scoped_na.contains(&w))
-    {
+    if bits & fact_bits::SCOPED_NA != 0 && p.scoped_na.contains(&d) && !w_wide {
         p.scoped_na.insert(w);
         p.fact_bits[w] |= fact_bits::SCOPED_NA;
     }
@@ -3734,8 +3937,17 @@ pub(crate) fn carry_one(p: &mut Pipe, d: Value, w: Value) {
         p.frozen.insert(w, f);
         p.fact_bits[w] |= fact_bits::FROZEN;
     }
+    // A scoped value's `deref` is its region's claim (an inlined `&self`
+    // callee's param: read-only while the clone runs). On a value that
+    // stays function-wide `noalias` (the caller's own `&mut self`, which
+    // the param was folded into) it would read "never written in this
+    // function": licm hoisted a load of a `Vec` field out of the loop that
+    // pushes to it (regex-syntax `HeapVisitor::visit`, a crash). Nor does
+    // a carried fact replace one `w` already has.
     if bits & fact_bits::DEREF != 0
         && let Some(&x) = p.deref.get(&d)
+        && !(p.scoped_na.contains(&d) && w_wide)
+        && !p.deref.contains_key(&w)
     {
         p.deref.insert(w, x);
         p.fact_bits[w] |= fact_bits::DEREF;
@@ -4132,7 +4344,8 @@ fn s_demand(p: &mut Pipe, _an: &mut Analysis) -> usize {
 }
 
 fn s_memcmpk(p: &mut Pipe, _an: &mut Analysis) -> usize {
-    let k = crate::memcmpk::run(&mut p.clctx.func, p.fn_names, p.fname);
+    let little = p.isa.endianness() == cranelift_codegen::ir::Endianness::Little;
+    let k = crate::memcmpk::run_with(&mut p.clctx.func, p.fn_names, p.fname, p.const_tables, little);
     if k > 0 {
         p.dump("memcmpk");
     }
@@ -4218,6 +4431,14 @@ fn s_ivalign(p: &mut Pipe, an: &mut Analysis) -> usize {
     k
 }
 
+fn s_bumpedge(p: &mut Pipe, an: &mut Analysis) -> usize {
+    let k = bumpedge::run(&mut p.clctx.func, an);
+    if k > 0 {
+        p.dump("bumpedge");
+    }
+    k
+}
+
 fn s_ivretro(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = ivretro::run(&mut p.clctx.func, an);
     if k > 0 {
@@ -4238,6 +4459,23 @@ fn s_vrp(p: &mut Pipe, an: &mut Analysis) -> usize {
     let k = crate::vrp::run(&mut p.clctx.func, an);
     if k > 0 {
         p.dump("vrp");
+    }
+    k
+}
+
+// Cold `call f(..); trap` tails of one callee share one block per
+// function (`panicstub`); members keep their argument setup and jump.
+fn s_panicstub(p: &mut Pipe, an: &mut Analysis) -> usize {
+    // Native only: never run or measured on wasm.
+    if p.wasm {
+        return 0;
+    }
+    let k = crate::panicstub::run(&mut p.clctx.func, pliron_cfg::env_is("PLIRON_COLDCOPY", "1"));
+    if k > 0 {
+        an.invalidate(&p.clctx.func);
+        if p.dump {
+            p.dump("panicstub");
+        }
     }
     k
 }
@@ -4297,6 +4535,9 @@ const JT: Gate = Gate::Flag(FlagId::Jumpthread);
 // r[impl clif.step.order]
 pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(|| {
     vec![
+        // Before any block merge: see `s_scopedfwd`.
+        step("scopedfwd", "loadfwd", Gate::OptIn("PLIRON_SCOPED_NOALIAS"), s_scopedfwd)
+            .needs(shape::LOAD),
         // Straight-line `jump` pairs merge first, so jumpthread sees a
         // param block and the `brif` it feeds as one (see `mergejump`).
         step("mergejump", "mergejump", Gate::OptIn("PLIRON_MERGEJUMP"), s_mergejump).needs(shape::MULTI),
@@ -4446,6 +4687,7 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // length by now (`ifconv2`'s const sweep); `loadfwd2`/`dse2`
         // later forward and drop a stack slot holding the compared bytes
         // (`ends_with(char)`).
+        step("selknown", "edgeknown", Gate::Env("PLIRON_SELKNOWN"), s_selknown).needs(shape::CONDBR),
         step("memcmpk", "memcmpk", Gate::Env("PLIRON_MEMCMPK"), s_memcmpk).needs(shape::CALL),
         cstep(
             "unswitch",
@@ -5017,6 +5259,19 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         step("looprot2", "looprot", Gate::Env("PLIRON_LOOPROT2"), s_looprot).needs(shape::LOOPS),
         // Loop-invariant header params onto a preheader (no back-edge
         // param webs for regalloc2 to spill around; serde_json's escape scan).
+        // After the late rotation: a rotated loop's guard sits on both
+        // edges into its header, and the header's own first test of the
+        // carried value is then decided (regex `InstPtrs::next`).
+        step("edgeknown", "edgeknown", Gate::Env("PLIRON_EDGEKNOWN"), s_edgeknown).needs(shape::MULTI),
+        // The late refold expressed walked pointers as `base + idx`;
+        // their exit tests still compare `base + idx + 1` with `base +
+        // len`.
+        // What if-conversion turned from a membership tree into a select
+        // chain. Late: the branch it left in front has shed its edge
+        // arguments by now and can join the set.
+        step("selset", "selset", Gate::Env("PLIRON_SELSET"), s_selset).needs(shape::CONDBR),
+        step("selxor", "selxor", Gate::Env("PLIRON_SELXOR"), s_selxor),
+        step("cmpcancel", "cmpcancel", Gate::Env("PLIRON_CMPCANCEL"), s_cmpcancel),
         step("invparam", "invparam", Gate::OptIn("PLIRON_INVPARAM"), s_invparam).needs(shape::LOOPS),
         // Error/merge payloads computed in `b` but used only by one
         // `brif` edge's args (parse_only's `ParseIntError` pack on every
@@ -5173,6 +5428,33 @@ pub static DEFAULT: std::sync::LazyLock<Vec<Step>> = std::sync::LazyLock::new(||
         // the stubs only exist once edgesink/egraph2 finish merging.
         step("stubhoist", "stubhoist", Gate::Env("PLIRON_STUBHOIST"), s_stubhoist)
             .needs(shape::BLOCKS2),
+        // `brif c, A, B` where A/B are the same `return` (the emulated-EH
+        // `brif flag, return, return` on void-forwarder and drop-free
+        // exits) collapses to `jump`, freeing the whole flag chain. Own
+        // step: mergechain's `brif_fold` never sees single-brif fns.
+        step("commonret", "commonret", Gate::Env("PLIRON_COMMONRET"), s_commonret)
+            .needs(shape::CONDBR),
+        // Shared panic tails: every cold `call f; trap` of one callee
+        // jumps to one copy. After tailmergep/stubhoist — it folds
+        // tailmergep's per-shape shared blocks, and stubhoist would
+        // hoist arg-only stubs back into hot preds.
+        // The last sinks and hoists re-create values a dominating block
+        // already holds (`idx + 1` on a loop's exit edge next to the
+        // counter's own step): one more dominator GVN.
+        step("dgvn3", "dgvn", Gate::Env("PLIRON_LATEGVN"), s_dgvn),
+        // That GVN is also what shows a rotated loop's guard to be the
+        // test the block's only predecessor just made.
+        step("retest", "edgeknown", Gate::Env("PLIRON_RETEST"), s_retest).needs(shape::CONDBR),
+        // A cursor that a rotated loop's top block only steps is stepped
+        // on the edges instead, next to the load of the same pointer
+        // (post-index), so the block carries one cursor. After every
+        // sink: `edgesink` would push the edge's add onto a split edge.
+        step("bumpedge", "", Gate::Env("PLIRON_BUMPEDGE"), s_bumpedge).needs(shape::BPARAM),
+        // A slot whose last store `dse3` deleted (after `slotmerge`)
+        // still has its size, and the function a frame for it.
+        step("deadslot", "deadslot", Gate::Env("PLIRON_DEADSLOT"), s_deadslot).needs(shape::SLOT),
+        step("panicstub", "panicstub", Gate::OptIn("PLIRON_PANICSTUB"), s_panicstub)
+            .needs(shape::CALL),
         // Last: static branch hints for emission-time placement
         // (`PLIRON_PLACE=1`); nothing after this may replace a terminator.
         step("brhint", "", Gate::OptIn("PLIRON_BRHINT"), s_brhint).needs(shape::MULTI),
@@ -5287,6 +5569,70 @@ mod tests {
     };
         p.seed_fact_bits();
         f(&mut p)
+    }
+
+    /// A region-scoped `noalias` (an inlined callee's param) carried onto
+    /// another value must stay scoped there: `noalias` without `scoped_na`
+    /// is the function-wide fact, which makes the value an isolated root
+    /// no foreign store can clobber. The carry inserted `noalias` first
+    /// and then took the value for one that had been function-wide all
+    /// along. A value that really was function-wide before keeps that.
+    #[test]
+    fn carry_keeps_noalias_scope() {
+        let func = cranelift_reader::parse_functions(OPT_PTR)
+            .unwrap()
+            .remove(0);
+        let v = |n: u32| Value::from_u32(n);
+        let (v0, v1, v2) = (v(0), v(1), v(2));
+        with_test_pipe("carry_keeps_noalias_scope", func, FxHashSet::default(), |p| {
+            // `v1`: scoped. `v0`: function-wide (the caller's own param).
+            p.noalias.insert(v1);
+            p.scoped_na.insert(v1);
+            p.noalias.insert(v0);
+            p.seed_fact_bits();
+            carry_one(p, v1, v2);
+            assert!(p.noalias.contains(&v2));
+            assert!(
+                p.scoped_na.contains(&v2),
+                "a scoped noalias fact became function-wide when carried"
+            );
+            carry_one(p, v1, v0);
+            assert!(
+                p.noalias.contains(&v0) && !p.scoped_na.contains(&v0),
+                "a function-wide noalias value was scoped down"
+            );
+        });
+    }
+
+    /// The scoped value's read-only `deref` (an inlined `&self` callee's
+    /// param) must not land on the function-wide value it is folded into
+    /// (the caller's `&mut self`), with or without a `deref` of its own.
+    #[test]
+    fn carry_keeps_scoped_deref_off_wide_values() {
+        let func = cranelift_reader::parse_functions(OPT_PTR)
+            .unwrap()
+            .remove(0);
+        let v = |n: u32| Value::from_u32(n);
+        let (v0, v1, v2, v4) = (v(0), v(1), v(2), v(4));
+        with_test_pipe("carry_keeps_scoped_deref_off_wide_values", func, FxHashSet::default(), |p| {
+            p.noalias.insert(v1);
+            p.scoped_na.insert(v1);
+            p.deref.insert(v1, (48, false));
+            // Function-wide, writable.
+            p.noalias.insert(v0);
+            p.deref.insert(v0, (64, true));
+            // Function-wide, no `deref` of its own.
+            p.noalias.insert(v4);
+            p.seed_fact_bits();
+            carry_one(p, v1, v0);
+            assert_eq!(p.deref.get(&v0), Some(&(64, true)), "a writable pointee became read-only");
+            carry_one(p, v1, v4);
+            assert_eq!(p.deref.get(&v4), None, "a region's read-only claim became function-wide");
+            // A value with no facts takes the scope and the claim together.
+            carry_one(p, v1, v2);
+            assert!(p.scoped_na.contains(&v2));
+            assert_eq!(p.deref.get(&v2), Some(&(48, false)));
+        });
     }
 
     /// A block param's `nonnull` is true only on paths into its block;

@@ -511,6 +511,12 @@ pub struct State {
     /// transforms skip them (`helpers::opt_body`); interprocedural
     /// rewrites and analyses still read them.
     pub opt_skip: rustc_hash::FxHashSet<Ptr<Operation>>,
+    /// `PLIRON_INLINE_LEAN`: per function, the raw ops, calls and warm
+    /// calls that inlined wrappers added beyond the calls they replaced.
+    /// The inliner takes them off the function's counts when it scores
+    /// it as a callee, so inlining a wrapper does not make its caller
+    /// look bigger to the callers above (see `inline.rs`, `lean_k`).
+    pub lean_discount: rustc_hash::FxHashMap<Ptr<Operation>, [usize; 3]>,
     /// xcgu extra-copy symbols (`xcgu::copies` in lib.rs). Rustc never
     /// reports cross-CGU callers of a local-copy instance, so `dead_fns`
     /// must not strip them: a copy's only callers can be other copies
@@ -608,6 +614,31 @@ pub struct State {
     /// to cloned blocks (scaled by callsite/callee-entry ratio), so
     /// inlined code carries the callee's counts into the caller.
     pub prof_bcount: ColMap<Ptr<BasicBlock>, u64>,
+    /// Indirect-call promotion sites (`PLIRON_DEVIRT` in a profile
+    /// build): the virtual (and, opt-in, fn-pointer) call ops the front
+    /// end emitted, with the trait method path for remarks (empty when
+    /// remarks are off). `pgo::instrument` records each site's targets,
+    /// `devirt::promote` guards the hot ones; both number a function's
+    /// sites by position, so only ops still in place count.
+    pub icall_sites: ColMap<Ptr<Operation>, String>,
+    /// The direct calls `devirt::promote` put on guard hit arms (and the
+    /// inliner's clones of them): what `devirt::report` checks after the
+    /// inline rounds to say which promoted calls were inlined.
+    pub icp_calls: rustc_hash::FxHashMap<Ptr<Operation>, crate::devirt::IcpCall>,
+    /// The promoted calls the inliner has taken.
+    pub icp_inlined: Vec<crate::devirt::IcpCall>,
+    /// Home aliases this CGU's guards compare against
+    /// (`devirt::home_alias` names; nothing else refers to them).
+    pub icp_aliases: FxHashSet<String>,
+    /// Bodies that are this crate's instantiation of a function another
+    /// crate was profiled with (a local copy of a dependency's promoted
+    /// target): local symbol -> the symbol the profile knows it by.
+    /// `pgo::load` looks such a body up under that name.
+    pub prof_as: FxHashMap<String, String>,
+    /// The profile's hot count: the smallest block count among the blocks
+    /// that together carry 99% of all counted executions (LLVM's
+    /// `ProfileSummary` hot threshold). A call site at or above it is hot.
+    pub prof_hot: Option<u64>,
     /// Terminator → count per successor slot (from edge counters and
     /// single-pred block counts); drives profile-weighted block layout
     /// and `expect` seeding.
@@ -659,10 +690,13 @@ impl State {
         self.prof.retain(lo);
         self.prof_edges.retain(lo);
         self.opt_skip.retain(lo);
+        self.lean_discount.retain(|k, _| lo(k));
         self.dead_unopt_ops.retain(lo);
         self.region_blocks.retain(lb);
         self.region_parent.retain(lb);
         self.prof_bcount.retain(lb);
+        self.icall_sites.retain(lo);
+        self.icp_calls.retain(|o, _| lo(o));
         if self.last_call.is_some_and(|c| !c.is_live(ctx)) {
             self.last_call = None;
         }

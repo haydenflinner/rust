@@ -293,6 +293,93 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         let ctx = self.cx.pctx.borrow();
         self.block.deref(&ctx).get_parent_op(&ctx).unwrap()
     }
+
+    /// `PLIRON_DEVIRT=1` without a profile: lower the virtual call `virt` through `llfn`
+    /// (the pointer loaded from the vtable) as a chain of
+    /// `llfn == &<Impl as Trait>::method` guards, each with a direct call,
+    /// ending in the original indirect call (see `devirt.rs`). `catch` is
+    /// the unwind destination when the call is an `invoke`; every arm's
+    /// call gets it. Returns `None` (nothing emitted) when the site has no
+    /// usable target. The builder is left in the merge block.
+    fn devirt_call(
+        &mut self,
+        llty: TypeHandle,
+        fn_abi: &FnAbi<'tcx, Ty<'tcx>>,
+        llfn: Value,
+        return_slot: ReturnSlot<Value>,
+        args: &[Value],
+        funclet: Option<&Value>,
+        virt: Instance<'tcx>,
+        catch: Option<Ptr<BasicBlock>>,
+    ) -> Option<Value> {
+        let ty::InstanceKind::Virtual(method, _) = virt.def else {
+            return None;
+        };
+        let targets = crate::devirt::candidates(self.cx, virt, fn_abi).and_then(crate::devirt::plan);
+        let (caller, what) = if pliron_cfg::remarks_on() {
+            (
+                self.fn_sym(self.parent_fn()),
+                ty::print::with_no_trimmed_paths!(self.tcx.def_path_str(method)),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        match &targets {
+            Ok((t, note)) => pliron_cfg::remark!("devirt", caller, what; "guarded {} target(s){} [{note}]: {}",
+                t.len(),
+                if catch.is_some() { " (invoke)" } else { "" },
+                t.iter().map(|i| self.tcx.symbol_name(*i).name).collect::<Vec<_>>().join(" ")),
+            Err(why) => pliron_cfg::remark!("devirt", caller, what; "reject ({why})"),
+        }
+        let targets = targets.ok()?.0;
+        let ret = match self.kind(llty) {
+            TyK::Func(r, ..) => r,
+            _ => return None,
+        };
+        let void = matches!(self.kind(ret), TyK::Void);
+        // The merge block takes the result as a block argument.
+        let merge = {
+            let f = self.parent_fn();
+            let mut ctx = self.cx.pctx.borrow_mut();
+            let region = f.deref(&ctx).get_region(&ctx, 0);
+            let bb = BasicBlock::new(&mut ctx, None, if void { vec![] } else { vec![ret] });
+            bb.insert_at_back(region, &ctx);
+            bb
+        };
+        let arm = |bx: &mut Self, callee: Value, abi: &FnAbi<'tcx, Ty<'tcx>>, inst| {
+            bx.st.borrow_mut().last_call = None;
+            let v = bx.call(llty, None, Some(abi), callee, return_slot, args, funclet, inst);
+            let last = bx.st.borrow_mut().last_call.take();
+            if let (Some(catch), Some(op)) = (catch, last) {
+                bx.st.borrow_mut().invokes.insert(op, (catch, false));
+            }
+            bx.mk_op(|c| BrOp::new(c, merge, if void { vec![] } else { vec![v] }));
+        };
+        let guards: Vec<_> = targets.iter().map(|_| self.append_sibling_block("devirt_guard")).collect();
+        let fallback = self.append_sibling_block("devirt_fallback");
+        self.br(guards[0]);
+        for (k, t) in targets.into_iter().enumerate() {
+            self.switch_to_block(guards[k]);
+            let addr = self.get_fn_addr(t, None);
+            let hit = self.append_sibling_block("devirt_hit");
+            let eq = self.icmp(IntPredicate::IntEQ, llfn, addr);
+            self.cond_br(eq, hit, guards.get(k + 1).copied().unwrap_or(fallback));
+            self.switch_to_block(hit);
+            let abi = self.fn_abi_of_instance(t, ty::List::empty());
+            arm(self, addr, abi, Some(t));
+        }
+        self.switch_to_block(fallback);
+        // `instance: None` — `call` reads it only for `Item` callees, and
+        // it keeps this arm from being transformed again.
+        arm(self, llfn, fn_abi, None);
+        self.switch_to_block(merge);
+        Some(if void {
+            self.const_undef(ret)
+        } else {
+            let ctx = self.cx.pctx.borrow();
+            merge.deref(&ctx).get_argument(&ctx, 0)
+        })
+    }
 }
 
 impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
@@ -309,18 +396,22 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
     }
     fn set_span(&mut self, _span: Span) {}
 
-    fn append_block(cx: &'a CodegenCx<'tcx>, llfn: Ptr<Operation>, _name: &str) -> Ptr<BasicBlock> {
+    fn append_block(cx: &'a CodegenCx<'tcx>, llfn: Ptr<Operation>, name: &str) -> Ptr<BasicBlock> {
         let mut ctx = cx.pctx.borrow_mut();
         let f = Operation::get_op::<FuncOp>(llfn, &ctx).unwrap();
         if f.get_entry_block(&ctx).is_none() {
             // A new body: until rustc sets one, its ops have no location
             // (not the previous function's).
             cx.dbg_cur.set(0);
-            return f.get_or_create_entry_block(&mut ctx);
+            let bb = f.get_or_create_entry_block(&mut ctx);
+            // `PLIRON_FIELD_HEAT`: which backend block is MIR block N.
+            crate::field_order::note_block(llfn, name, bb);
+            return bb;
         }
         let region = llfn.deref(&ctx).get_region(&ctx, 0);
         let bb = BasicBlock::new(&mut ctx, None, vec![]);
         bb.insert_at_back(region, &ctx);
+        crate::field_order::note_block(llfn, name, bb);
         bb
     }
 
@@ -430,6 +521,15 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         funclet: Option<&Value>,
         instance: Option<Instance<'tcx>>,
     ) -> Value {
+        if let (Some(i), Some(abi)) = (instance, fn_abi)
+            && matches!(i.def, ty::InstanceKind::Virtual(..))
+            && crate::devirt::enabled()
+            && let Some(r) =
+                self.devirt_call(llty, abi, llfn, return_slot, args, funclet, i, Some(catch))
+        {
+            self.br(then);
+            return r;
+        }
         self.st.borrow_mut().last_call = None;
         let r = self.call(
             llty,
@@ -1193,6 +1293,14 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         _funclet: Option<&Value>,
         instance: Option<Instance<'tcx>>,
     ) -> Value {
+        if let (Some(i), Some(abi)) = (instance, fn_abi)
+            && matches!(i.def, ty::InstanceKind::Virtual(..))
+            && crate::devirt::enabled()
+            && let Some(r) =
+                self.devirt_call(llty, abi, llfn, return_slot, args, _funclet, i, None)
+        {
+            return r;
+        }
         let mut full = Vec::with_capacity(args.len() + 1);
         if let ReturnSlot::Indirect(p) = return_slot {
             full.push(p);
@@ -1200,6 +1308,30 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
         full.extend_from_slice(args);
         let exts = fn_abi.map(crate::type_of::exts_of).unwrap_or_default();
         let v = self.call_raw(llty, llfn, &full, exts);
+        // Profile builds: mark the call for indirect-call promotion
+        // (`pliron_ir_opt::devirt`): every virtual call, and with
+        // `PLIRON_DEVIRT_FNPTR=1` every call through a fn pointer.
+        if fn_abi.is_some()
+            && pliron_ir_opt::devirt::icp_on()
+            && match instance {
+                Some(i) => matches!(i.def, ty::InstanceKind::Virtual(..)),
+                None => crate::env_is("PLIRON_DEVIRT_FNPTR", "1"),
+            }
+        {
+            let what = match instance {
+                Some(i) if pliron_cfg::remarks_on() => {
+                    ty::print::with_no_trimmed_paths!(self.tcx.def_path_str(i.def_id()))
+                }
+                None if pliron_cfg::remarks_on() => "fn pointer".to_string(),
+                _ => String::new(),
+            };
+            let mut st = self.st.borrow_mut();
+            if let Some(op) = st.last_call
+                && st.calls.get(op).is_some_and(|c| c.callee.is_none())
+            {
+                st.icall_sites.insert(op, what);
+            }
+        }
         // `foreign` callees get variadic args via the real C ABI: extern items,
         // and `#[naked]` definitions, whose hand-written asm reads the native
         // varargs convention (register save area) rather than our buffer.
@@ -1429,13 +1561,18 @@ impl<'a, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'tcx> {
             return_slot,
             args,
             funclet,
-            instance,
+            // A virtual `become` stays one indirect tail call (`call` reads
+            // the instance only for `Item` callees; `Virtual` would let
+            // `PLIRON_DEVIRT` split it).
+            instance.filter(|i| !matches!(i.def, ty::InstanceKind::Virtual(..))),
         );
         // `become`: mark the call as a tail call; the following Return op is
         // skipped by the terminator logic once `return_call` is emitted.
         let lc = self.st.borrow().last_call;
         if let Some(p) = lc {
-            self.st.borrow_mut().calls.get_mut(p).unwrap().tail = true;
+            let mut st = self.st.borrow_mut();
+            st.calls.get_mut(p).unwrap().tail = true;
+            st.icall_sites.remove(p);
         }
         match self.kind(llty) {
             TyK::Func(ret, ..) if matches!(self.kind(ret), TyK::Void) => self.ret_void(),
