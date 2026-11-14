@@ -46,6 +46,24 @@ PLIRON_VERSION=1 build/<host>/stage2/bin/rustc -vV   # which backend rev built t
   `tools/pliron-wasm-ld` for the wasm target), and set `wasi-root` for
   wasm32-wasip1.
 
+## Headstart (parallel metadata scheduling)
+
+This fork also carries a port of
+[PowderworksCode/headstart](https://github.com/PowderworksCode/headstart):
+`-Zearly-metadata` makes this rustc write an `*.early-rmeta` once a
+crate's interfaces are checked, and `-Zheadstart` (in cargo) starts
+dependent crates on that early metadata instead of waiting for the full
+rlib. It's orthogonal to the pliron backend — it cuts dependency-chain
+idle time in the rustc front half, which the backend doesn't touch.
+
+Note the submodule: `src/tools/cargo` points at `haydenflinner/cargo`'s
+headstart branch, not `rust-lang/cargo` — clone with `--recursive` (or
+`git submodule update --init`) to get it. Upstream headstart carries no
+license, so this port is a personal-fork experiment, not something to
+upstream or redistribute; see
+`compiler/rustc_codegen_pliron/docs/headstart.md` for the evaluation and
+`harness/headstart.py` for the scheduling simulator.
+
 ## Using the backend without building rustc
 
 The backend also builds standalone against a pinned nightly
